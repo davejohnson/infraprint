@@ -6,6 +6,8 @@ import { SqliteAdapter } from '../../../adapters/db/sqlite.adapter.js';
 import { ProjectRepository } from '../../../adapters/db/repositories/project.repository.js';
 import { ConnectionRepository } from '../../../adapters/db/repositories/connection.repository.js';
 import { getSecretStore } from '../../../adapters/secrets/secret-store.js';
+import { CloudRunAdapter } from '../../../adapters/providers/gcp/cloudrun.adapter.js';
+import { RailwayAdapter } from '../../../adapters/providers/railway/railway.adapter.js';
 import { buildDeploySourceEnvVars, resolveGitDeploySource, classifyDeployEnvironment } from '../deploy-source.js';
 
 beforeEach(() => {
@@ -15,7 +17,7 @@ beforeEach(() => {
 });
 
 describe('buildDeploySourceEnvVars', () => {
-  it('passes git source metadata and a scoped GitHub token for Cloud Run deploys', () => {
+  it('lets the hosting adapter project only its scoped source credential', () => {
     const project = new ProjectRepository().create({
       name: 'hls-property-care',
       defaultPlatform: 'cloudrun',
@@ -24,27 +26,32 @@ describe('buildDeploySourceEnvVars', () => {
     new ConnectionRepository().create({
       provider: 'github',
       scope: 'davejohnson/hls-property-care',
-      credentialsEncrypted: getSecretStore().encryptObject({ apiToken: 'gh-scoped-token' }),
+      credentialsEncrypted: getSecretStore().encryptObject({
+        apiToken: 'gh-scoped-token',
+        packageReadToken: 'must-not-be-projected',
+      }),
     });
 
-    const vars = buildDeploySourceEnvVars(project, 'cloudrun');
-    expect(vars).toMatchObject({
+    const vars = buildDeploySourceEnvVars(project, new CloudRunAdapter());
+    expect(vars).toEqual({
       HYPERVIBE_SOURCE_REPO_URL: 'https://github.com/davejohnson/hls-property-care.git',
       HYPERVIBE_SOURCE_REVISION: 'main',
       HYPERVIBE_GITHUB_TOKEN: 'gh-scoped-token',
     });
+    expect(JSON.stringify(vars)).not.toContain('must-not-be-projected');
   });
 
-  it('returns no vars without a git remote and no token for non-cloudrun providers', () => {
+  it('returns no vars without a git remote and no token for adapters without the capability', () => {
     const bare = new ProjectRepository().create({ name: 'no-remote' });
-    expect(buildDeploySourceEnvVars(bare, 'cloudrun')).toEqual({});
+    expect(buildDeploySourceEnvVars(bare, new CloudRunAdapter())).toEqual({});
 
     const withRemote = new ProjectRepository().create({
       name: 'railway-app',
       gitRemoteUrl: 'https://github.com/davejohnson/railway-app.git',
     });
-    const vars = buildDeploySourceEnvVars(withRemote, 'railway');
+    const vars = buildDeploySourceEnvVars(withRemote, new RailwayAdapter(), 'release/staging');
     expect(vars.HYPERVIBE_SOURCE_REPO_URL).toBe('https://github.com/davejohnson/railway-app.git');
+    expect(vars.HYPERVIBE_SOURCE_REVISION).toBe('release/staging');
     expect(vars.HYPERVIBE_GITHUB_TOKEN).toBeUndefined();
   });
 });

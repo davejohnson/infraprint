@@ -181,7 +181,8 @@ export async function fetchProviderLogs(
   if (!result.success || !result.adapter) {
     throw new ProviderLogsConnectionError(result.error || `Failed to create ${provider} adapter`);
   }
-  if (!isProviderRuntimeLogsAdapter(result.adapter)) {
+  const runtimeLogsAdapter = result.adapter;
+  if (!isProviderRuntimeLogsAdapter(runtimeLogsAdapter)) {
     throw new NotSupportedError(provider, 'log reads');
   }
 
@@ -192,7 +193,7 @@ export async function fetchProviderLogs(
   const providerResult = await readProviderOperation(
     provider,
     'service log read',
-    () => result.adapter.readProviderLogs({
+    () => runtimeLogsAdapter.readProviderLogs({
       environment,
       serviceName,
       limit: scanLimit,
@@ -221,13 +222,14 @@ export async function fetchProviderDeployments(
   if (!result.success || !result.adapter) {
     throw new ProviderLogsConnectionError(result.error || `Failed to create ${provider} adapter`);
   }
-  if (!isProviderDeploymentsAdapter(result.adapter)) {
+  const deploymentsAdapter = result.adapter;
+  if (!isProviderDeploymentsAdapter(deploymentsAdapter)) {
     throw new NotSupportedError(provider, 'deployment listing', logsDeploymentsUnsupportedMessage(provider));
   }
   const deployments = await readProviderOperation(
     provider,
     'deployment listing',
-    () => result.adapter.listProviderDeployments({
+    () => deploymentsAdapter.listProviderDeployments({
       environment,
       serviceName,
       limit,
@@ -251,13 +253,14 @@ export async function fetchProviderBuildLogs(
   if (!result.success || !result.adapter) {
     throw new ProviderLogsConnectionError(result.error || `Failed to create ${provider} adapter`);
   }
-  if (!isProviderBuildLogsAdapter(result.adapter)) {
+  const buildLogsAdapter = result.adapter;
+  if (!isProviderBuildLogsAdapter(buildLogsAdapter)) {
     throw new NotSupportedError(provider, 'build log reads', logsBuildUnsupportedMessage(provider));
   }
   return readProviderOperation(
     provider,
     'build log read',
-    () => result.adapter.readProviderBuildLogs({
+    () => buildLogsAdapter.readProviderBuildLogs({
       environment,
       serviceName,
       deploymentId,

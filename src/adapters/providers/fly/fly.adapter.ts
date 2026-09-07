@@ -18,7 +18,11 @@ import type {
   Receipt,
   VerifyResult,
 } from '../../../domain/ports/provider.port.js';
-import { providerRegistry, type ProviderInspectionRequest } from '../../../domain/registry/provider.registry.js';
+import {
+  providerRegistry,
+  standardDatabaseRuntimeProjection,
+  type ProviderInspectionRequest,
+} from '../../../domain/registry/provider.registry.js';
 import { environmentForInspection } from '../../../domain/registry/provider-inspection.js';
 import { dnsZoneScopeForDomain } from '../../../domain/services/domain-scope.js';
 import {
@@ -1558,6 +1562,7 @@ providerRegistry.register({
       adapter as FlyAdapter
     ).inspectEnvironmentResources(request),
   },
+  databaseRuntime: standardDatabaseRuntimeProjection,
   derivedAdapters: {
     database: (adapter) => (adapter as FlyAdapter).createDatabaseAdapter(),
   },

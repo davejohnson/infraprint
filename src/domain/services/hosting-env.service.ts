@@ -3,18 +3,11 @@ import { UNCONFIGURED_HOSTING_PROVIDER, type Project } from '../entities/project
 import type { Service } from '../entities/service.entity.js';
 import { parseHostingBindings, type IHostingAdapter } from '../ports/hosting.port.js';
 import type { Receipt } from '../ports/provider.port.js';
+import { isProviderEnvironmentVariablesAdapter } from '../ports/provider-env-vars.port.js';
 import { providerRegistry } from '../registry/provider.registry.js';
 import { adapterFactory } from './adapter.factory.js';
 
 export const HOSTING_ENV_REMOVE_OPERATION = 'hostingEnvRemove';
-
-type EnvReadableHostingAdapter = IHostingAdapter & {
-  getServiceVariables?: (
-    environmentOrProjectId: Environment | string,
-    serviceNameOrServiceId: string,
-    environmentId?: string
-  ) => Promise<Record<string, string>>;
-};
 
 export function hostingProviderForEnvironment(project: Project, environment: Environment): string {
   const bindings = parseHostingBindings(environment);
@@ -185,7 +178,6 @@ export async function readHostingEnvVars(params: {
 > {
   const provider = hostingProviderForEnvironment(params.project, params.environment);
   const displayName = providerDisplayName(provider);
-  const bindings = parseHostingBindings(params.environment);
 
   if (!serviceHasHostingBinding(params.environment, params.service.name)) {
     return {
@@ -205,8 +197,8 @@ export async function readHostingEnvVars(params: {
     };
   }
 
-  const adapter = adapterResult.adapter as unknown as EnvReadableHostingAdapter;
-  if (typeof adapter.getServiceVariables !== 'function') {
+  const adapter = adapterResult.adapter;
+  if (!isProviderEnvironmentVariablesAdapter(adapter)) {
     return {
       success: false,
       provider,
@@ -214,27 +206,11 @@ export async function readHostingEnvVars(params: {
     };
   }
 
-  if (provider === 'railway') {
-    const projectId = bindings.projectId;
-    const environmentId = bindings.environmentId;
-    const serviceId = bindings.services?.[params.service.name]?.serviceId;
-    if (!projectId || !environmentId || !serviceId) {
-      return {
-        success: false,
-        provider,
-        error: `Service ${params.service.name} is missing Railway bindings in ${params.environment.name}`,
-      };
-    }
-    return {
-      success: true,
-      provider,
-      variables: await adapter.getServiceVariables(projectId, serviceId, environmentId),
-    };
-  }
-
-  return {
-    success: true,
-    provider,
-    variables: await adapter.getServiceVariables(params.environment, params.service.name),
-  };
+  const readResult = await adapter.readProviderEnvironmentVariables({
+    environment: params.environment,
+    service: params.service,
+  });
+  return readResult.success
+    ? { success: true, provider, variables: readResult.variables }
+    : { success: false, provider, error: readResult.error };
 }

@@ -1,16 +1,12 @@
 import { EnvironmentRepository } from '../../adapters/db/repositories/environment.repository.js';
 import { ServiceRepository } from '../../adapters/db/repositories/service.repository.js';
-import { ConnectionRepository } from '../../adapters/db/repositories/connection.repository.js';
-import { getSecretStore } from '../../adapters/secrets/secret-store.js';
 import { adapterFactory } from './adapter.factory.js';
 import { getProjectScopeHints } from './project-scope.js';
 import { DeployOrchestrator } from './deploy.orchestrator.js';
-import type { GitHubCredentials } from '../../adapters/providers/github/github.adapter.js';
 import { InfraTransaction } from './infra.transaction.js';
 import { getCloudPrepareProfile, isCloudPrepared } from './cloud-prepare.js';
 import { snapshotEnvironmentBindings } from './local-state.transaction.js';
 import { resolveProject } from './resolve-project.js';
-import { normalizeGitRemoteForBuild } from '../../lib/git-remote.js';
 import { hostingProviderForEnvironment } from './hosting-env.service.js';
 import { buildRailwayGitHubRepoAccessHelp, isRailwayGitHubRepoAccessError } from './railway-help.js';
 import type { WorkloadKind } from '../entities/service.entity.js';
@@ -21,13 +17,11 @@ import {
   type DesiredState,
   workloadKindForServiceName,
 } from './spec.service.js';
-import { resolveGitDeploySource } from './deploy-source.js';
-import { provisionBootstrapDatabase, type DbProvision } from './bootstrap-database.js';
+import { buildDeploySourceEnvVars, resolveGitDeploySource } from './deploy-source.js';
 import { attachBootstrapDomain } from './bootstrap-domain.js';
 
 const envRepo = new EnvironmentRepository();
 const serviceRepo = new ServiceRepository();
-const connectionRepo = new ConnectionRepository();
 
 type SourceConfigurableHostingAdapter = {
   connectServiceToRepo?: (params: { serviceId: string; repo: string; branch: string }) => Promise<Receipt>;
@@ -83,8 +77,6 @@ export async function executeBootstrap(params: {
   services: string[];
   crons?: DesiredState['crons'];
   domain?: string;
-  /** Omit to skip database provisioning entirely. */
-  databaseProvider?: string;
   serviceConfig?: DesiredState['serviceConfig'];
   envVars?: DesiredState['envVars'];
   deploy?: DesiredState['deploy'];
@@ -244,25 +236,6 @@ export async function executeBootstrap(params: {
     };
   }
 
-  let dbEnsureReceipt: Receipt | undefined;
-  let dbProvision: DbProvision | undefined;
-
-  if (params.databaseProvider) {
-    const dbResult = await provisionBootstrapDatabase({
-      projectName: params.projectName,
-      databaseProvider: params.databaseProvider,
-      project,
-      environment,
-      tx,
-    });
-    if (!dbResult.ok) {
-      return dbResult.failure;
-    }
-    environment = dbResult.environment;
-    dbProvision = dbResult.dbProvision;
-    dbEnsureReceipt = dbResult.dbEnsureReceipt;
-  }
-
   const hostingProject = project.defaultPlatform?.toLowerCase() === targetPlatform
     ? project
     : { ...project, defaultPlatform: targetPlatform };
@@ -326,27 +299,16 @@ export async function executeBootstrap(params: {
   const deferProviderDeployment = params.deploy?.strategy === 'branch'
     && deployTrigger === 'ci'
     && hostingAdapter.capabilities.supportsDeferredDeploy === true;
-  const sourceRepoUrl = normalizeGitRemoteForBuild(project.gitRemoteUrl);
-  const secretStore = getSecretStore();
-  const githubConnection = sourceRepoUrl && hostingAdapter.name === 'cloudrun'
-    ? connectionRepo.findBestMatchFromHints('github', scopeHints)
-    : null;
-  const githubCredentials = githubConnection
-    ? secretStore.decryptObject<GitHubCredentials>(githubConnection.credentialsEncrypted)
-    : null;
-  const sourceEnvVars: Record<string, string> = sourceRepoUrl
-    ? {
-        HYPERVIBE_SOURCE_REPO_URL: sourceRepoUrl,
-        HYPERVIBE_SOURCE_REVISION: deploySource.source?.branch
-          ?? params.deploy?.branch
-          ?? params.deploy?.branches?.production
-          ?? 'main',
-        ...(githubCredentials?.apiToken ? { HYPERVIBE_GITHUB_TOKEN: githubCredentials.apiToken } : {}),
-      }
-    : {};
+  const sourceEnvVars = buildDeploySourceEnvVars(
+    project,
+    hostingAdapter,
+    deploySource.source?.branch
+      ?? params.deploy?.branch
+      ?? params.deploy?.branches?.production
+      ?? 'main'
+  );
   const deployEnvVars = {
     ...sourceEnvVars,
-    ...(dbProvision?.envVars ?? {}),
     ...(params.queueEnvVars ?? {}),
     ...(params.envVars ?? {}),
   };
@@ -404,21 +366,6 @@ export async function executeBootstrap(params: {
     deploymentRollback: deploy.rollback,
     transaction: {
       created: tx.listResources(),
-    },
-    debug: {
-      dbProvision: dbProvision
-        ? {
-            provider: params.databaseProvider,
-            receiptData: dbProvision.receipt.data ?? null,
-            databaseEnsureReceipt: dbEnsureReceipt
-              ? {
-                  success: dbEnsureReceipt.success,
-                  message: dbEnsureReceipt.message,
-                  data: dbEnsureReceipt.data ?? null,
-                }
-              : undefined,
-          }
-        : null,
     },
   };
 

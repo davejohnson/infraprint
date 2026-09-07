@@ -31,7 +31,14 @@ describe('database capability truth', () => {
       .toEqual(providerRegistry.namesFor('database').sort());
     for (const [provider, adapter] of adapters) {
       expect(supportsDatabaseLifecycle(adapter), provider).toBe(true);
+      expect(providerRegistry.get(provider)?.databaseRuntime, provider).toBeDefined();
     }
+    expect(
+      providerRegistry.all()
+        .filter((provider) => provider.databaseRuntime)
+        .map((provider) => provider.metadata.name)
+        .sort()
+    ).toEqual(providerRegistry.namesFor('database').sort());
   });
 
   it('advertises declarative resilience only where the lifecycle is implemented', () => {

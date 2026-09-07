@@ -101,8 +101,7 @@ describe('hv_logs', () => {
     vi.spyOn(adapterFactory, 'getProviderAdapter').mockResolvedValue({
       success: true,
       adapter: {
-        getDeployments: vi.fn(async () => { throw fetchError; }),
-        getDeploymentLogs: vi.fn(),
+        readProviderLogs: vi.fn(async () => { throw fetchError; }),
       } as never,
     });
 
@@ -122,14 +121,14 @@ describe('hv_logs', () => {
         code: 'PROVIDER_ERROR',
         details: {
           provider: 'railway',
-          operation: 'latest deployment lookup',
+          operation: 'service log read',
           message: 'fetch failed',
           cause: 'getaddrinfo ENOTFOUND backboard.railway.app',
           causeCode: 'ENOTFOUND',
         },
       },
     });
-    expect(result.error.message).toContain('railway latest deployment lookup failed');
+    expect(result.error.message).toContain('railway service log read failed');
     await t.close();
   });
 
@@ -389,7 +388,7 @@ describe('hv_logs', () => {
     await t.close();
   });
 
-  it('applies errorsOnly to Railway service logs and forwards limit', async () => {
+  it('applies errorsOnly to Railway service logs and enforces the requested output limit', async () => {
     const project = new ProjectRepository().create({
       name: 'filtered-service-log-app',
       defaultPlatform: 'railway',
@@ -432,12 +431,12 @@ describe('hv_logs', () => {
     expect(result.ok).toBe(true);
     expect(readProviderLogs).toHaveBeenCalledWith(expect.objectContaining({
       serviceName: 'web',
-      limit: 2,
+      limit: 500,
       errorsOnly: true,
     }));
     expect(result.data.logs).toEqual([
-      { timestamp: '2026-09-03T00:00:01.000Z', severity: 'error', message: 'request failed' },
       { timestamp: '2026-09-03T00:00:02.000Z', severity: 'warn', message: 'retry failed' },
+      { timestamp: '2026-09-03T00:00:03.000Z', severity: 'error', message: 'provider over-returned' },
     ]);
     await t.close();
   });

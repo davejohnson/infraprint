@@ -18,6 +18,7 @@ import {
 import type { ObservedDatabase } from '../../../domain/ports/observe.port.js';
 import {
   providerRegistry,
+  type DatabaseRuntimeProjection,
   type ProviderInspectionRequest,
 } from '../../../domain/registry/provider.registry.js';
 
@@ -84,6 +85,19 @@ function normalizedSupabaseProjectStatus(
     UNKNOWN: 'unknown',
   };
   return statusMap[status] ?? 'unknown';
+}
+
+function projectSupabaseDatabaseRuntime(
+  _component: Component,
+  standard: DatabaseRuntimeProjection
+): DatabaseRuntimeProjection {
+  return {
+    ...standard,
+    envVars: {
+      ...standard.envVars,
+      DATABASE_SSL: 'true',
+    },
+  };
 }
 
 export class SupabaseAdapter implements IDatabaseAdapter {
@@ -911,6 +925,9 @@ providerRegistry.register({
     inspect: (adapter, request) => (
       adapter as SupabaseAdapter
     ).inspectDatabaseResources(request),
+  },
+  databaseRuntime: {
+    project: projectSupabaseDatabaseRuntime,
   },
   factory: async (credentials) => {
     const adapter = new SupabaseAdapter();

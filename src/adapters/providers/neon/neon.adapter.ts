@@ -16,6 +16,7 @@ import type { ObservedDatabase } from '../../../domain/ports/observe.port.js';
 import type { Receipt, VerifyResult } from '../../../domain/ports/provider.port.js';
 import {
   providerRegistry,
+  standardDatabaseRuntimeProjection,
   type ProviderInspectionRequest,
 } from '../../../domain/registry/provider.registry.js';
 
@@ -1056,6 +1057,7 @@ providerRegistry.register({
       adapter as NeonAdapter
     ).inspectDatabaseResources(request),
   },
+  databaseRuntime: standardDatabaseRuntimeProjection,
   factory: async (credentials) => {
     const validated = NeonCredentialsSchema.parse(credentials);
     const adapter = new NeonAdapter();

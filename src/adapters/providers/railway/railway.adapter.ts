@@ -28,7 +28,10 @@ import { githubPackagePullCredentials } from '../github/package-pull.js';
 import type { Component, ComponentType } from '../../../domain/entities/component.entity.js';
 import { hashEnvValue } from '../../../domain/ports/observe.port.js';
 import type { ObservedCache, ObservedDatabase, ObservedService, ObservedState, ObservedStorage } from '../../../domain/ports/observe.port.js';
-import { providerRegistry } from '../../../domain/registry/provider.registry.js';
+import {
+  providerRegistry,
+  type DatabaseRuntimeProjection,
+} from '../../../domain/registry/provider.registry.js';
 import {
   buildRailwayGitHubActionsSteps,
   diagnoseRailwayWorkflowLog,
@@ -56,6 +59,11 @@ import type {
   ProviderRuntimeLogsRequest,
   ProviderRuntimeLogsResult,
 } from '../../../domain/ports/provider-logs.port.js';
+import type {
+  IProviderEnvironmentVariablesAdapter,
+  ProviderEnvironmentVariablesRequest,
+  ProviderEnvironmentVariablesResult,
+} from '../../../domain/ports/provider-env-vars.port.js';
 
 // Credentials schema for self-registration
 export const RailwayCredentialsSchema = z.object({
@@ -123,6 +131,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function projectRailwayDatabaseRuntime(
+  component: Component,
+  standard: DatabaseRuntimeProjection
+): DatabaseRuntimeProjection {
+  const bindings = component.bindings as Record<string, unknown>;
+  const pluginName = typeof bindings.pluginName === 'string' && bindings.pluginName.length > 0
+    ? bindings.pluginName
+    : undefined;
+  if (!pluginName) return standard;
+
+  return {
+    envVars: {
+      DATABASE_URL: '${{' + pluginName + '.DATABASE_URL}}',
+      DIRECT_URL: '${{' + pluginName + '.DATABASE_PRIVATE_URL}}',
+    },
+    connectionUrl: standard.connectionUrl,
+  };
+}
+
 function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
@@ -173,7 +200,8 @@ export class RailwayAdapter implements
   IWorkloadMaintenanceAdapter,
   IProviderRuntimeLogsAdapter,
   IProviderDeploymentsAdapter,
-  IProviderBuildLogsAdapter {
+  IProviderBuildLogsAdapter,
+  IProviderEnvironmentVariablesAdapter {
   readonly name = 'railway';
 
   readonly capabilities: ProviderCapabilities = {
@@ -4169,6 +4197,25 @@ export class RailwayAdapter implements
     return this.fetchServiceVariables(projectId, serviceId, environmentId);
   }
 
+  async readProviderEnvironmentVariables(
+    request: ProviderEnvironmentVariablesRequest
+  ): Promise<ProviderEnvironmentVariablesResult> {
+    const bindings = parseHostingBindings(request.environment);
+    const projectId = bindings.projectId;
+    const environmentId = bindings.environmentId;
+    const serviceId = bindings.services?.[request.service.name]?.serviceId;
+    if (!projectId || !environmentId || !serviceId) {
+      return {
+        success: false,
+        error: `Service ${request.service.name} is missing Railway bindings in ${request.environment.name}`,
+      };
+    }
+    return {
+      success: true,
+      variables: await this.getServiceVariables(projectId, serviceId, environmentId),
+    };
+  }
+
   private async fetchServiceVariables(
     projectId: string,
     serviceId: string,
@@ -6784,6 +6831,9 @@ providerRegistry.register({
     inspect: (adapter, request) => inspectRailwayResources(adapter as RailwayAdapter, request),
   },
   adoption: { project: true },
+  databaseRuntime: {
+    project: projectRailwayDatabaseRuntime,
+  },
   derivedAdapters: {
     database: async (adapter, context) => {
       const [{ createRailwayDatabaseAdapter }, { EnvironmentRepository }] = await Promise.all([

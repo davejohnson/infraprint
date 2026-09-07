@@ -1,5 +1,7 @@
 export * from './provider.port.js';
 export * from './provider-logs.port.js';
+export * from './provider-env-vars.port.js';
+export * from './deploy-source.port.js';
 export * from './hosting.port.js';
 export * from './database.port.js';
 export * from './database-query.port.js';

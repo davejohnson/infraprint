@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { ProviderRegistry, type RegisteredProvider } from '../provider.registry.js';
+import {
+  ProviderRegistry,
+  standardDatabaseRuntimeProjection,
+  type RegisteredProvider,
+} from '../provider.registry.js';
 
 function provider(
   name: string,
@@ -72,6 +76,7 @@ function provider(
         inspect: async () => ({ observation: 'present', resource: resources[0] }),
       },
     } : {}),
+    ...(supportsDatabase ? { databaseRuntime: standardDatabaseRuntimeProjection } : {}),
     ...(derivedAdapters ? { derivedAdapters } : {}),
   };
 }
@@ -206,6 +211,17 @@ describe('ProviderRegistry lifecycle capabilities', () => {
     delete incomplete.inspection;
 
     expect(() => registry.register(incomplete)).toThrow(/database lifecycle support without/i);
+  });
+
+  it('requires database runtime projection to match registered lifecycle truth', () => {
+    const registry = new ProviderRegistry();
+    const missing = provider('missing-runtime', 'database');
+    delete missing.databaseRuntime;
+    expect(() => registry.register(missing)).toThrow(/without a database runtime projection/i);
+
+    const unrelated = provider('unrelated-runtime', 'ai');
+    unrelated.databaseRuntime = standardDatabaseRuntimeProjection;
+    expect(() => registry.register(unrelated)).toThrow(/without a database lifecycle/i);
   });
 
   it('rejects hosting lifecycle support without provider-owned environment inventory', () => {

@@ -27,7 +27,11 @@ import {
   type ObservedService,
   type ObservedState,
 } from '../../../domain/ports/observe.port.js';
-import { providerRegistry, type ProviderInspectionRequest } from '../../../domain/registry/provider.registry.js';
+import {
+  providerRegistry,
+  standardDatabaseRuntimeProjection,
+  type ProviderInspectionRequest,
+} from '../../../domain/registry/provider.registry.js';
 import { environmentForInspection } from '../../../domain/registry/provider-inspection.js';
 import { DigitalOceanCacheAdapter } from './digitalocean-cache.adapter.js';
 import {
@@ -2204,6 +2208,7 @@ providerRegistry.register({
       adapter as DigitalOceanAdapter
     ).inspectEnvironmentResources(request),
   },
+  databaseRuntime: standardDatabaseRuntimeProjection,
   derivedAdapters: {
     database: (adapter) =>
       (adapter as DigitalOceanAdapter).createDatabaseAdapter(),

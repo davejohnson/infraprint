@@ -33,6 +33,15 @@ import type {
   ProviderRuntimeLogsRequest,
   ProviderRuntimeLogsResult,
 } from '../../../domain/ports/provider-logs.port.js';
+import type {
+  IProviderEnvironmentVariablesAdapter,
+  ProviderEnvironmentVariablesRequest,
+  ProviderEnvironmentVariablesResult,
+} from '../../../domain/ports/provider-env-vars.port.js';
+import type {
+  DeploySourceCredentialProjection,
+  IDeploySourceCredentialAdapter,
+} from '../../../domain/ports/deploy-source.port.js';
 
 // Credentials schema for self-registration
 const CloudRunAuthenticationSchema = z.object({
@@ -373,7 +382,9 @@ export class CloudRunAdapter implements
   IWorkloadMaintenanceAdapter,
   IQueueAdapter,
   IProviderRuntimeLogsAdapter,
-  IProviderDeploymentsAdapter {
+  IProviderDeploymentsAdapter,
+  IProviderEnvironmentVariablesAdapter,
+  IDeploySourceCredentialAdapter {
   readonly name = 'cloudrun';
 
   readonly capabilities: ProviderCapabilities = {
@@ -390,6 +401,18 @@ export class CloudRunAdapter implements
     supportsOneOffTasks: true,
     supportsDeferredDeploy: true,
     supportsMaintenance: true,
+  };
+
+  readonly deploySourceCredentialProjection: DeploySourceCredentialProjection = {
+    connectionProvider: 'github',
+    projectEnvironmentVariables: ({ credentials }): Record<string, string> => {
+      const apiToken = typeof credentials === 'object'
+        && credentials !== null
+        && typeof (credentials as Record<string, unknown>).apiToken === 'string'
+        ? (credentials as Record<string, string>).apiToken
+        : undefined;
+      return apiToken ? { HYPERVIBE_GITHUB_TOKEN: apiToken } : {};
+    },
   };
 
   private credentials: ConnectedCloudRunCredentials | null = null;
@@ -2087,6 +2110,15 @@ export class CloudRunAdapter implements
       }
     }
     return vars;
+  }
+
+  async readProviderEnvironmentVariables(
+    request: ProviderEnvironmentVariablesRequest
+  ): Promise<ProviderEnvironmentVariablesResult> {
+    return {
+      success: true,
+      variables: await this.getServiceVariables(request.environment, request.service.name),
+    };
   }
 
   async listDeployments(

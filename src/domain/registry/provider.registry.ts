@@ -3,6 +3,7 @@ import type { ProviderCiDeployMetadata } from '../ports/ci-deploy.port.js';
 import type { ProviderDatabaseRestoreDrillMetadata } from '../ports/database-restore-drill.port.js';
 import type { Project } from '../entities/project.entity.js';
 import type { Environment } from '../entities/environment.entity.js';
+import type { Component } from '../entities/component.entity.js';
 import type { WorkloadKind } from '../entities/service.entity.js';
 import type { Receipt } from '../ports/provider.port.js';
 
@@ -104,6 +105,28 @@ export interface ProviderRetainedCleanupCapability {
   resources: readonly string[];
   destroy(adapter: unknown, target: ProviderRetainedResourceTarget): Promise<Receipt>;
 }
+
+export interface DatabaseRuntimeProjection {
+  envVars: Record<string, string>;
+  connectionUrl?: string;
+}
+
+export interface ProviderDatabaseRuntimeProjection {
+  /**
+   * Project a persisted database binding into workload environment variables.
+   * The standard projection may contain secrets and must never be persisted or
+   * exposed through provider metadata/output.
+   */
+  project(
+    component: Component,
+    standard: DatabaseRuntimeProjection
+  ): DatabaseRuntimeProjection;
+}
+
+/** Explicit registration for providers whose database bindings use the standard projection. */
+export const standardDatabaseRuntimeProjection: ProviderDatabaseRuntimeProjection = {
+  project: (_component, standard) => standard,
+};
 
 export interface ProviderMetadata {
   name: string;
@@ -248,6 +271,8 @@ export interface RegisteredProvider {
   inspection?: ProviderInspectionCapability;
   /** Provider-owned deletion driver for explicitly retained non-lifecycle resources. */
   retainedCleanup?: ProviderRetainedCleanupCapability;
+  /** Provider-owned projection from database bindings to workload runtime variables. */
+  databaseRuntime?: ProviderDatabaseRuntimeProjection;
   /** Existing infrastructure can be adopted only when a provider declares and tests this capability. */
   adoption?: {
     project: true;
@@ -275,8 +300,23 @@ export class ProviderRegistry {
       throw new Error(`Provider "${provider.metadata.name}" is already registered`);
     }
     this.assertCapabilityMaturity(provider);
+    this.assertDatabaseRuntimeProjection(provider);
     this.assertInspectionContract(provider);
     this.providers.set(provider.metadata.name, provider);
+  }
+
+  private assertDatabaseRuntimeProjection(provider: RegisteredProvider): void {
+    const supportsDatabase = this.declaredLifecycleCapabilities(provider).includes('database');
+    if (supportsDatabase && !provider.databaseRuntime) {
+      throw new Error(
+        `Provider "${provider.metadata.name}" declares database lifecycle support without a database runtime projection.`
+      );
+    }
+    if (!supportsDatabase && provider.databaseRuntime) {
+      throw new Error(
+        `Provider "${provider.metadata.name}" declares a database runtime projection without a database lifecycle.`
+      );
+    }
   }
 
   private declaredLifecycleCapabilities(provider: RegisteredProvider): ProviderLifecycleCapability[] {

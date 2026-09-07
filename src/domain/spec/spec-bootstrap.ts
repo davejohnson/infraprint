@@ -9,7 +9,6 @@ export interface BootstrapParams {
   services: string[];
   crons?: DesiredState['crons'];
   domain?: string;
-  databaseProvider?: string;
   serviceConfig?: DesiredState['serviceConfig'];
   envVars?: DesiredState['envVars'];
   deploy?: DesiredState['deploy'];
@@ -123,7 +122,6 @@ export function specToBootstrapParams(
     services,
     ...(Object.keys(crons).length > 0 ? { crons } : {}),
     ...(env.domain ? { domain: env.domain } : {}),
-    ...(env.database ? { databaseProvider: env.database.provider } : {}),
     ...(Object.keys(serviceConfig).length > 0 ? { serviceConfig } : {}),
     ...(Object.keys(env.envVars).length > 0 ? { envVars: env.envVars } : {}),
     ...(deploy ? { deploy } : {}),
@@ -196,7 +194,6 @@ export function scopeBootstrapParamsToService(
     ...(serviceEnvVars
       ? { envVarsByService: { [serviceName]: serviceEnvVars } }
       : { envVarsByService: undefined }),
-    databaseProvider: undefined,
     domain: undefined,
     ensureHostingProject: false,
   };

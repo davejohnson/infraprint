@@ -943,7 +943,6 @@ export async function executePlanApply(ctx: CommandContext, params: {
       });
       deployBootstrap = await executeBootstrap({
         ...bootstrapParams,
-        databaseProvider: undefined,
         domain: undefined,
         ensureHostingProject: false,
       });

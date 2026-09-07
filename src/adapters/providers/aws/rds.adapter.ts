@@ -37,6 +37,7 @@ import type { Receipt, TemporaryDatabaseAccess, VerifyResult } from '../../../do
 import type { IObservableDatabase, ObservedDatabase } from '../../../domain/ports/observe.port.js';
 import {
   providerRegistry,
+  standardDatabaseRuntimeProjection,
   type ProviderInspectionRequest,
 } from '../../../domain/registry/provider.registry.js';
 import { buildDatabaseEnvVarsFromComponent } from '../../../domain/services/database-env.js';
@@ -1503,6 +1504,7 @@ providerRegistry.register({
       adapter as RdsAdapter
     ).inspectDatabaseResources(request),
   },
+  databaseRuntime: standardDatabaseRuntimeProjection,
   factory: async (credentials) => {
     const adapter = new RdsAdapter();
     await adapter.connect(credentials);

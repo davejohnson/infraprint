@@ -14,6 +14,7 @@ import { parseHostingBindings } from '../../../domain/ports/hosting.port.js';
 import type { Receipt, TemporaryDatabaseAccess, VerifyResult } from '../../../domain/ports/provider.port.js';
 import {
   providerRegistry,
+  standardDatabaseRuntimeProjection,
   type ProviderInspectionRequest,
 } from '../../../domain/registry/provider.registry.js';
 import {
@@ -983,6 +984,7 @@ providerRegistry.register({
       adapter as AzurePostgresAdapter
     ).inspectDatabaseResources(request),
   },
+  databaseRuntime: standardDatabaseRuntimeProjection,
   factory: async (credentials) => {
     const validated = AzurePostgresCredentialsSchema.parse(credentials);
     const adapter = new AzurePostgresAdapter();

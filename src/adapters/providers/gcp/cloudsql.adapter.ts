@@ -26,9 +26,13 @@ import type {
 } from '../../../domain/ports/database-resilience.port.js';
 import {
   providerRegistry,
+  type DatabaseRuntimeProjection,
   type ProviderInspectionRequest,
 } from '../../../domain/registry/provider.registry.js';
-import { buildDatabaseEnvVarsFromComponent } from '../../../domain/services/database-env.js';
+import {
+  buildDatabaseEnvVarsFromComponent,
+  databaseReplicaEnvKey,
+} from '../../../domain/services/database-env.js';
 import { buildCloudSqlRestoreDrillWorkflow } from './cloudsql-restore-drill.workflow.js';
 
 // Credentials schema for self-registration
@@ -113,6 +117,90 @@ interface ServiceAccountCredentials {
   project_id: string;
   private_key: string;
   client_email: string;
+}
+
+function databaseRuntimeString(
+  bindings: Record<string, unknown>,
+  key: string
+): string | undefined {
+  const value = bindings[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function cloudSqlSocketDatabaseUrl(params: {
+  username?: string;
+  password?: string;
+  database?: string;
+  socketHost: string;
+}): string | undefined {
+  if (!params.username || !params.password || !params.database) return undefined;
+  return `postgresql://${encodeURIComponent(params.username)}:${encodeURIComponent(params.password)}@/${encodeURIComponent(params.database)}?host=${encodeURIComponent(params.socketHost)}`;
+}
+
+function cloudSqlReplicaBindings(
+  bindings: Record<string, unknown>
+): Record<string, Record<string, unknown>> {
+  const resilience = bindings.resilience;
+  if (!resilience || typeof resilience !== 'object' || Array.isArray(resilience)) return {};
+  const replicas = (resilience as Record<string, unknown>).replicas;
+  if (!replicas || typeof replicas !== 'object' || Array.isArray(replicas)) return {};
+  return replicas as Record<string, Record<string, unknown>>;
+}
+
+function projectCloudSqlDatabaseRuntime(
+  component: Component,
+  standard: DatabaseRuntimeProjection
+): DatabaseRuntimeProjection {
+  const bindings = component.bindings as Record<string, unknown>;
+  const envVars = { ...standard.envVars };
+  const username = databaseRuntimeString(bindings, 'username');
+  const password = databaseRuntimeString(bindings, 'password');
+  const database = databaseRuntimeString(bindings, 'database');
+  const connectionName = databaseRuntimeString(bindings, 'connectionName');
+  const socketHost = connectionName
+    ? `/cloudsql/${connectionName}`
+    : databaseRuntimeString(bindings, 'host');
+  const socketUrl = socketHost
+    ? cloudSqlSocketDatabaseUrl({ username, password, database, socketHost })
+    : undefined;
+
+  if (socketUrl) {
+    envVars.DATABASE_URL = socketUrl;
+    envVars.DIRECT_URL = socketUrl;
+  }
+
+  const replicas = Object.entries(cloudSqlReplicaBindings(bindings))
+    .sort(([left], [right]) => left.localeCompare(right));
+  const replicaConnectionNames = replicas
+    .map(([, replica]) => databaseRuntimeString(replica, 'connectionName'))
+    .filter((value): value is string => Boolean(value));
+  if (connectionName) {
+    const connectionNames = [connectionName, ...replicaConnectionNames].join(',');
+    envVars.CLOUD_SQL_CONNECTION_NAME = connectionNames;
+    envVars.INSTANCE_CONNECTION_NAME = connectionNames;
+  }
+  if (socketHost) {
+    envVars.DATABASE_HOST = socketHost;
+    envVars.DB_HOST = socketHost;
+    envVars.PGHOST = socketHost;
+  }
+  for (const [name, replica] of replicas) {
+    const replicaConnectionName = databaseRuntimeString(replica, 'connectionName');
+    const replicaUrl = replicaConnectionName
+      ? cloudSqlSocketDatabaseUrl({
+        username,
+        password,
+        database,
+        socketHost: `/cloudsql/${replicaConnectionName}`,
+      })
+      : databaseRuntimeString(replica, 'connectionUrl');
+    if (replicaUrl) {
+      envVars[databaseReplicaEnvKey(name)] = replicaUrl;
+      if (replicas.length === 1) envVars.DATABASE_READ_URL = replicaUrl;
+    }
+  }
+
+  return { envVars, connectionUrl: standard.connectionUrl };
 }
 
 export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, IDatabaseResilienceAdapter {
@@ -1766,6 +1854,9 @@ providerRegistry.register({
   retainedCleanup: {
     resources: ['backup'],
     destroy: (adapter, target) => (adapter as CloudSqlAdapter).destroyRetainedBackup(target),
+  },
+  databaseRuntime: {
+    project: projectCloudSqlDatabaseRuntime,
   },
   factory: async (credentials) => {
     const adapter = new CloudSqlAdapter();
