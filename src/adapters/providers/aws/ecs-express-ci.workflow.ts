@@ -154,6 +154,12 @@ ${buildDockerfileStep(target)}      - uses: docker/setup-buildx-action@v3
               if (!config?.primaryContainer) {
                 throw new Error('ECS Express returned no active primary container for ' + serviceArn);
               }
+              if (!Array.isArray(config.networkConfiguration?.subnets)
+                || config.networkConfiguration.subnets.length < 2
+                || !Array.isArray(config.networkConfiguration?.securityGroups)
+                || config.networkConfiguration.securityGroups.length !== 1) {
+                throw new Error('ECS Express workload-network configuration is missing or malformed for ' + serviceArn);
+              }
               const environment = [...(config.primaryContainer.environment || [])]
                 .filter((item) => !['HYPERVIBE_DEPLOY_SHA', 'HYPERVIBE_IMAGE_DIGEST'].includes(item.name));
               const marker = (name) => environment.find((item) => item.name === name)?.value;
@@ -175,6 +181,7 @@ ${buildDockerfileStep(target)}      - uses: docker/setup-buildx-action@v3
                   environment,
                   command: startCommand ? ['sh', '-lc', startCommand] : undefined,
                 },
+                networkConfiguration: config.networkConfiguration,
                 scalingTarget: config.scalingTarget,
               }));
               let endpoint;

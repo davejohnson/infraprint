@@ -1,5 +1,5 @@
 import { Readable } from 'node:stream';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Environment } from '../../../../domain/entities/environment.entity.js';
 import type {
   AzureBlobDataPlane,
@@ -63,6 +63,10 @@ function dataPlane(overrides: Partial<AzureBlobDataPlane> = {}): AzureBlobDataPl
 }
 
 describe('AzureBlobStorageAdapter', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it('inventories containers across the subscription with durable Azure scope', async () => {
     const storageAccount = account();
     const container = {
@@ -223,8 +227,15 @@ describe('AzureBlobStorageAdapter', () => {
   });
 
   it('empties the owned container before deleting its dedicated account', async () => {
+    vi.stubEnv('HYPERVIBE_AZURE_BLOB_DELETE_ATTEMPTS', '3');
+    vi.stubEnv('HYPERVIBE_AZURE_BLOB_POLL_INTERVAL_MS', '0');
     const managed = account();
-    const control = controlPlane({ getAccount: vi.fn(async () => managed) });
+    const control = controlPlane({
+      getAccount: vi.fn()
+        .mockResolvedValueOnce(managed)
+        .mockResolvedValueOnce(managed)
+        .mockResolvedValueOnce(null),
+    });
     const plane = dataPlane();
     const adapter = new AzureBlobStorageAdapter({ controlPlaneFactory: () => control, dataPlaneFactory: () => plane });
     await adapter.connect(credentials);
@@ -235,5 +246,34 @@ describe('AzureBlobStorageAdapter', () => {
     )).resolves.toMatchObject({ success: true });
     expect(plane.deleteAll).toHaveBeenCalledOnce();
     expect(control.deleteAccount).toHaveBeenCalledWith(managed);
+    expect(control.getAccount).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not report deletion success while the storage account remains observable', async () => {
+    vi.stubEnv('HYPERVIBE_AZURE_BLOB_DELETE_ATTEMPTS', '2');
+    vi.stubEnv('HYPERVIBE_AZURE_BLOB_POLL_INTERVAL_MS', '0');
+    const managed = account();
+    const control = controlPlane({ getAccount: vi.fn(async () => managed) });
+    const plane = dataPlane();
+    const adapter = new AzureBlobStorageAdapter({
+      controlPlaneFactory: () => control,
+      dataPlaneFactory: () => plane,
+    });
+    await adapter.connect(credentials);
+    const context = {
+      subscriptionId: credentials.subscriptionId,
+      resourceGroup: 'friend-app-production',
+    };
+
+    const result = await adapter.destroyBucket(
+      environment(),
+      context,
+      `${managed.id}/blobServices/default/containers/documents`
+    );
+
+    expect(result).toMatchObject({ success: false });
+    expect(result.error).toContain('remained observable after 2 deletion checks');
+    expect(control.deleteAccount).toHaveBeenCalledWith(managed);
+    expect(control.getAccount).toHaveBeenCalledTimes(3);
   });
 });

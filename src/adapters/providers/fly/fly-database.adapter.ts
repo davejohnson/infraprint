@@ -9,6 +9,11 @@ import type {
   ProvisionableType,
   ProvisionResult,
 } from '../../../domain/ports/database.port.js';
+import {
+  createUnresolvedDatabaseMutation,
+  databaseCreateMayHaveCommitted,
+  parseUnresolvedDatabaseMutation,
+} from '../../../domain/ports/database.port.js';
 import type { ObservedDatabase } from '../../../domain/ports/observe.port.js';
 import type {
   Receipt,
@@ -32,7 +37,7 @@ export class FlyDatabaseAdapter implements IDatabaseAdapter {
     supportedDatabases: ['postgres'],
     supportsPooling: true,
     supportsReadReplicas: false,
-    supportsPointInTimeRecovery: true,
+    supportsPointInTimeRecovery: false,
     serverlessOptimized: false,
     supportsTemporaryDatabaseAccess: true,
     prefersTemporaryDatabaseAccess: true,
@@ -132,6 +137,7 @@ export class FlyDatabaseAdapter implements IDatabaseAdapter {
     const databaseName = this.postgresIdentifier(options?.databaseName?.trim() || 'app');
     const username = this.postgresIdentifier(`hypervibe_${databaseName}`);
     const plan = options?.size?.trim() || 'basic';
+    const region = options?.region?.trim() || 'iad';
     if (!POSTGRES_PLANS.has(plan)) {
       return {
         component: this.emptyComponent(environment, type),
@@ -144,6 +150,9 @@ export class FlyDatabaseAdapter implements IDatabaseAdapter {
     }
 
     let created: FlyPostgresCluster | undefined;
+    let acknowledgedForRetention: FlyPostgresCluster | undefined;
+    let createMutationAttempted = false;
+    let unresolvedCreateOutcome = false;
     try {
       let matches: FlyPostgresCluster[];
       try {
@@ -164,15 +173,39 @@ export class FlyDatabaseAdapter implements IDatabaseAdapter {
         ].join(' '));
       }
 
-      created = await this.client.createPostgresCluster({
-        name: resourceName,
-        region: options?.region?.trim() || 'iad',
-        plan,
-        diskSizeGb: 10,
-      });
-      this.assertClusterScope(created);
+      createMutationAttempted = true;
+      let acknowledged: FlyPostgresCluster;
+      try {
+        acknowledged = await this.client.createPostgresCluster({
+          name: resourceName,
+          region,
+          plan,
+          diskSizeGb: 10,
+        });
+      } catch (error) {
+        unresolvedCreateOutcome = databaseCreateMayHaveCommitted(error);
+        throw error;
+      }
+      acknowledgedForRetention = acknowledged;
+      unresolvedCreateOutcome = false;
+      this.assertClusterScope(acknowledged);
+      if (acknowledged.name !== resourceName) {
+        throw new Error(
+          `Fly.io acknowledged creation of ${resourceName} with a different cluster identity (${acknowledged.name || 'unnamed'} / ${acknowledged.id}); refusing to claim or delete it.`
+        );
+      }
+      created = acknowledged;
       const ready = await this.client.waitForPostgresReady(created.id);
       this.assertClusterScope(ready);
+      if (
+        ready.name !== resourceName
+        || ready.region !== region
+        || ready.plan !== plan
+      ) {
+        throw new Error(
+          `Fly.io Managed Postgres cluster ${ready.id} did not converge to the requested identity and placement (name ${resourceName}, region ${region}, plan ${plan}).`
+        );
+      }
       await this.client.ensurePostgresDatabase(ready.id, databaseName);
       await this.client.ensurePostgresUser(ready.id, username);
       const credentials = await this.client.getPostgresUserCredentials(
@@ -227,6 +260,14 @@ export class FlyDatabaseAdapter implements IDatabaseAdapter {
         },
       };
     } catch (error) {
+      let recoveryError: string | undefined;
+      if (!created && !acknowledgedForRetention && unresolvedCreateOutcome) {
+        try {
+          created = await this.recoverCreatedCluster(resourceName) ?? undefined;
+        } catch (recoveryFailure) {
+          recoveryError = this.formatError(recoveryFailure);
+        }
+      }
       let rolledBack = false;
       let rollbackError: string | undefined;
       if (created) {
@@ -237,30 +278,42 @@ export class FlyDatabaseAdapter implements IDatabaseAdapter {
           rollbackError = this.formatError(cleanupError);
         }
       }
+      const retained = created ?? acknowledgedForRetention;
+      const unresolvedComponent = !retained && unresolvedCreateOutcome
+        ? this.unresolvedCreateComponent(environment, resourceName, region, plan, databaseName)
+        : undefined;
       return {
-        component: created && !rolledBack
-          ? this.partialComponent(environment, created, databaseName)
-          : this.emptyComponent(environment, type),
+        component: retained && !rolledBack
+          ? this.partialComponent(environment, retained, databaseName)
+          : unresolvedComponent ?? this.emptyComponent(environment, type),
         receipt: {
           success: false,
-          message: created
+          message: retained
             ? rolledBack
               ? 'Fly.io Managed Postgres provisioning failed and the partial cluster was removed'
               : 'Fly.io created the Managed Postgres cluster, but provisioning and rollback did not complete'
             : 'Failed to provision Fly Managed Postgres cluster',
-          error: `${this.formatError(error)}${rollbackError
+          error: `${this.formatError(error)}${recoveryError
+            ? ` Exact-name recovery also failed: ${recoveryError}`
+            : ''}${rollbackError
             ? ` Cleanup also failed: ${rollbackError}`
             : ''}`,
-          ...(created ? {
+          ...(retained ? {
             data: {
-              clusterId: created.id,
-              organizationSlug: created.organization?.slug
+              clusterId: retained.id,
+              organizationSlug: retained.organization?.slug
                 ?? this.credentials.organizationSlug,
-              region: created.region,
-              plan: created.plan,
-              status: created.status,
+              region: retained.region,
+              plan: retained.plan,
+              status: retained.status,
               rolledBack,
               cleanupRequired: !rolledBack,
+            },
+          } : unresolvedComponent ? {
+            data: {
+              mutationAttempted: createMutationAttempted,
+              resourceCreated: 'unknown',
+              unresolvedCreateRetained: true,
             },
           } : {}),
         },
@@ -283,7 +336,16 @@ export class FlyDatabaseAdapter implements IDatabaseAdapter {
       cluster = await this.client.getPostgresCluster(component.externalId);
     } else {
       observedByScopedList = true;
-      const resourceName = options?.resourceName ?? `${environment.name}-postgres`;
+      const unresolved = parseUnresolvedDatabaseMutation(component?.bindings);
+      if (unresolved
+        && unresolved.providerScope.organizationSlug !== this.credentials?.organizationSlug) {
+        throw new Error(
+          `Fly unresolved database create belongs to organization ${unresolved.providerScope.organizationSlug}, not connected organization ${this.credentials?.organizationSlug}.`
+        );
+      }
+      const resourceName = unresolved?.resourceName
+        ?? options?.resourceName
+        ?? `${environment.name}-postgres`;
       const matches = (await this.client.listPostgresClusters())
         .filter((candidate) => candidate.name === resourceName);
       if (matches.length > 1) {
@@ -333,7 +395,7 @@ export class FlyDatabaseAdapter implements IDatabaseAdapter {
   }
 
   async acquireTemporaryDatabaseAccess(
-    environment: Environment,
+    _environment: Environment,
     component: Component,
     applicationPort: number
   ): Promise<TemporaryDatabaseAccess> {
@@ -377,7 +439,7 @@ export class FlyDatabaseAdapter implements IDatabaseAdapter {
       username
     );
     const organization = await this.client.getOrganizationIdentity();
-    const peerPrefix = this.wireGuardPeerPrefix(environment, component);
+    const peerPrefix = this.wireGuardPeerPrefix(component);
     const conflictingPeers = (await this.client.listWireGuardPeers())
       .filter((peer) => peer.name.startsWith(peerPrefix));
     if (conflictingPeers.length > 0) {
@@ -596,11 +658,45 @@ export class FlyDatabaseAdapter implements IDatabaseAdapter {
     };
   }
 
+  private unresolvedCreateComponent(
+    environment: Environment,
+    resourceName: string,
+    region: string,
+    plan: string,
+    database: string
+  ): Component {
+    const providerScope = {
+      organizationSlug: this.credentials!.organizationSlug,
+    };
+    return {
+      id: '',
+      environmentId: environment.id,
+      type: 'postgres',
+      bindings: {
+        provider: this.name,
+        providerScope,
+        unresolvedMutation: createUnresolvedDatabaseMutation(resourceName, providerScope),
+        database,
+        region,
+        plan,
+        organizationSlug: this.credentials!.organizationSlug,
+      },
+      externalId: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+  }
+
   private partialComponent(
     environment: Environment,
     cluster: FlyPostgresCluster,
     database: string
   ): Component {
+    const observedOrganization = cluster.organization?.slug;
+    const organizationSlug = typeof observedOrganization === 'string'
+      && observedOrganization.trim()
+      ? observedOrganization.trim()
+      : this.credentials!.organizationSlug;
     return {
       id: '',
       environmentId: environment.id,
@@ -608,11 +704,13 @@ export class FlyDatabaseAdapter implements IDatabaseAdapter {
       bindings: {
         provider: this.name,
         instanceId: cluster.id,
+        providerScope: {
+          organizationSlug,
+        },
         database,
         region: cluster.region,
         plan: cluster.plan,
-        organizationSlug: cluster.organization?.slug
-          ?? this.credentials?.organizationSlug,
+        organizationSlug,
       },
       externalId: cluster.id,
       createdAt: new Date(),
@@ -636,6 +734,10 @@ export class FlyDatabaseAdapter implements IDatabaseAdapter {
       bindings: {
         provider: this.name,
         instanceId: cluster.id,
+        providerScope: {
+          organizationSlug: cluster.organization?.slug
+            ?? this.credentials!.organizationSlug,
+        },
         connectionString: pooledUrl,
         directUrl,
         pooledUrl,
@@ -665,8 +767,38 @@ export class FlyDatabaseAdapter implements IDatabaseAdapter {
     return `postgresql://${encodeURIComponent(credentials.username)}:${encodeURIComponent(credentials.password)}@${endpoint.host}:${endpoint.port}/${encodeURIComponent(database)}?sslmode=require`;
   }
 
+  private async recoverCreatedCluster(
+    resourceName: string
+  ): Promise<FlyPostgresCluster | null> {
+    if (!this.client) throw new Error('Fly.io database adapter is not connected.');
+    const attempts = Math.max(
+      1,
+      Number(process.env.HYPERVIBE_FLY_DATABASE_CREATE_RECOVERY_ATTEMPTS ?? 3) || 3
+    );
+    const delayMs = Math.max(
+      0,
+      Number(process.env.HYPERVIBE_FLY_DATABASE_CREATE_RECOVERY_DELAY_MS ?? 1000) || 0
+    );
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const matches = (await this.client.listPostgresClusters())
+        .filter((cluster) => cluster.name === resourceName);
+      if (matches.length > 1) {
+        throw new Error(
+          `Fly.io returned multiple Managed Postgres clusters named ${resourceName} after an uncertain create; no identity was selected.`
+        );
+      }
+      if (matches.length === 1) {
+        this.assertClusterScope(matches[0]!);
+        return matches[0]!;
+      }
+      if (attempt < attempts && delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+    return null;
+  }
+
   private wireGuardPeerPrefix(
-    environment: Environment,
     component: Component
   ): string {
     const identity = `${this.credentials?.organizationSlug}:${component.externalId}`;

@@ -1,4 +1,3 @@
-import { ProjectRepository } from '../../adapters/db/repositories/project.repository.js';
 import { EnvironmentRepository } from '../../adapters/db/repositories/environment.repository.js';
 import { ServiceRepository } from '../../adapters/db/repositories/service.repository.js';
 import { ConnectionRepository } from '../../adapters/db/repositories/connection.repository.js';
@@ -6,7 +5,6 @@ import { getSecretStore } from '../../adapters/secrets/secret-store.js';
 import { adapterFactory } from './adapter.factory.js';
 import { getProjectScopeHints } from './project-scope.js';
 import { DeployOrchestrator } from './deploy.orchestrator.js';
-import { CloudflareAdapter, type CloudflareCredentials } from '../../adapters/providers/cloudflare/cloudflare.adapter.js';
 import type { GitHubCredentials } from '../../adapters/providers/github/github.adapter.js';
 import { InfraTransaction } from './infra.transaction.js';
 import { getCloudPrepareProfile, isCloudPrepared } from './cloud-prepare.js';
@@ -15,7 +13,6 @@ import { resolveProject } from './resolve-project.js';
 import { normalizeGitRemoteForBuild } from '../../lib/git-remote.js';
 import { hostingProviderForEnvironment } from './hosting-env.service.js';
 import { buildRailwayGitHubRepoAccessHelp, isRailwayGitHubRepoAccessError } from './railway-help.js';
-import { formatConnectionGuidance } from './connection-guidance.js';
 import type { WorkloadKind } from '../entities/service.entity.js';
 import type { Receipt } from '../ports/provider.port.js';
 import type { ProjectRuntime } from '../spec/project-runtime.js';
@@ -28,7 +25,6 @@ import { resolveGitDeploySource } from './deploy-source.js';
 import { provisionBootstrapDatabase, type DbProvision } from './bootstrap-database.js';
 import { attachBootstrapDomain } from './bootstrap-domain.js';
 
-const projectRepo = new ProjectRepository();
 const envRepo = new EnvironmentRepository();
 const serviceRepo = new ServiceRepository();
 const connectionRepo = new ConnectionRepository();
@@ -341,7 +337,10 @@ export async function executeBootstrap(params: {
   const sourceEnvVars: Record<string, string> = sourceRepoUrl
     ? {
         HYPERVIBE_SOURCE_REPO_URL: sourceRepoUrl,
-        HYPERVIBE_SOURCE_REVISION: deploySource.source?.branch ?? params.deploy?.branches?.production ?? 'main',
+        HYPERVIBE_SOURCE_REVISION: deploySource.source?.branch
+          ?? params.deploy?.branch
+          ?? params.deploy?.branches?.production
+          ?? 'main',
         ...(githubCredentials?.apiToken ? { HYPERVIBE_GITHUB_TOKEN: githubCredentials.apiToken } : {}),
       }
     : {};
@@ -538,6 +537,7 @@ export async function executeBootstrap(params: {
     };
   } else if (params.deploy?.strategy === 'branch') {
     const branch = deploySource.source?.branch
+      ?? params.deploy.branch
       ?? params.deploy.branches?.production
       ?? params.deploy.branches?.staging
       ?? 'main';

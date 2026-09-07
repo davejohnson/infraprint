@@ -1,12 +1,93 @@
 import { describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import type { Environment } from '../../entities/environment.entity.js';
 import type { Project } from '../../entities/project.entity.js';
-import { mergeRepoPlatformBindings, writeRepoBindingsForEnvironment } from '../repo-bindings-file.js';
+import {
+  mergeRepoPlatformBindings,
+  readRepoBindingsFile,
+  writeRepoBindingsForEnvironment,
+} from '../repo-bindings-file.js';
 
 describe('repo bindings delegated metadata', () => {
+  it('distinguishes a missing bindings file from corrupt or cross-project state', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'hypervibe-bindings-read-safety-'));
+    mkdirSync(path.join(root, '.git'));
+    mkdirSync(path.join(root, '.hypervibe'));
+    const file = path.join(root, '.hypervibe', 'bindings.json');
+    const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+
+    try {
+      process.env.HYPERVIBE_DISABLE_REPO_SPEC = '0';
+      expect(readRepoBindingsFile('safe-app', root)).toBeNull();
+
+      writeFileSync(file, '{"providerToken":"must-not-appear",', 'utf8');
+      expect(() => readRepoBindingsFile('safe-app', root)).toThrow(/is not valid JSON/);
+      try {
+        readRepoBindingsFile('safe-app', root);
+      } catch (error) {
+        expect(String(error)).not.toContain('must-not-appear');
+      }
+
+      writeFileSync(file, JSON.stringify({ version: 1, project: 'safe-app', environments: [] }), 'utf8');
+      expect(() => readRepoBindingsFile('safe-app', root)).toThrow(/does not match the repository bindings schema/);
+
+      writeFileSync(file, JSON.stringify({
+        version: 1,
+        project: 'other-app',
+        environments: {},
+      }), 'utf8');
+      expect(() => readRepoBindingsFile('safe-app', root)).toThrow(/belongs to project "other-app"/);
+    } finally {
+      if (oldDisable === undefined) delete process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+      else process.env.HYPERVIBE_DISABLE_REPO_SPEC = oldDisable;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to overwrite malformed or cross-project bindings files', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'hypervibe-bindings-write-safety-'));
+    mkdirSync(path.join(root, '.git'));
+    mkdirSync(path.join(root, '.hypervibe'));
+    const file = path.join(root, '.hypervibe', 'bindings.json');
+    const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+    const now = new Date('2026-09-05T00:00:00.000Z');
+    const project: Project = {
+      id: 'project-safe',
+      name: 'safe-app',
+      defaultPlatform: 'railway',
+      policies: {},
+      createdAt: now,
+      updatedAt: now,
+    };
+    const environment: Environment = {
+      id: 'environment-safe',
+      projectId: project.id,
+      name: 'production',
+      platformBindings: { provider: 'railway', projectId: 'railway-project' },
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    try {
+      process.env.HYPERVIBE_DISABLE_REPO_SPEC = '0';
+      const malformed = '{"secretValue":"do-not-overwrite",';
+      writeFileSync(file, malformed, 'utf8');
+      expect(() => writeRepoBindingsForEnvironment(project, environment, root)).toThrow(/is not valid JSON/);
+      expect(readFileSync(file, 'utf8')).toBe(malformed);
+
+      const crossProject = JSON.stringify({ version: 1, project: 'other-app', environments: {} });
+      writeFileSync(file, crossProject, 'utf8');
+      expect(() => writeRepoBindingsForEnvironment(project, environment, root)).toThrow(/belongs to project "other-app"/);
+      expect(readFileSync(file, 'utf8')).toBe(crossProject);
+    } finally {
+      if (oldDisable === undefined) delete process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+      else process.env.HYPERVIBE_DISABLE_REPO_SPEC = oldDisable;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('preserves sanitizer-omitted local fields without preserving removed public fields', () => {
     expect(mergeRepoPlatformBindings({
       github: {

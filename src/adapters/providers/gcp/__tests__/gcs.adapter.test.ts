@@ -93,13 +93,24 @@ describe('GcsStorageAdapter', () => {
   });
 
   it('creates a private labeled bucket and returns composite project scope', async () => {
+    let createdName: string | undefined;
     const request = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       if (url.includes('/storage/v1/b/') && (!init?.method || init.method === 'GET')) {
-        return json({ error: { message: 'missing' } }, 404);
+        return createdName
+          ? json({
+              name: createdName,
+              location: 'us-central1',
+              labels: {
+                hypervibe_environment_id: 'environment-1',
+                hypervibe_storage_name: 'documents',
+              },
+            })
+          : json({ error: { message: 'missing' } }, 404);
       }
       if (url.includes('/storage/v1/b?') && init?.method === 'POST') {
         const body = JSON.parse(String(init.body));
+        createdName = body.name;
         expect(body).toMatchObject({
           location: 'us-central1',
           labels: {
@@ -167,7 +178,10 @@ describe('GcsStorageAdapter', () => {
   });
 
   it('refuses to adopt an existing deterministic bucket without ownership labels', async () => {
-    const request = vi.fn(async () => json({ name: 'existing', labels: {} }));
+    const request = vi.fn(async (input: string | URL | Request) => {
+      const name = decodeURIComponent(new URL(String(input)).pathname.split('/').at(-1)!);
+      return json({ name, labels: {} });
+    });
     const adapter = new GcsStorageAdapter({
       fetch: request as typeof fetch,
       tokenProvider: async () => ({ token: 'token', email: 'service@example.com' }),
@@ -180,6 +194,55 @@ describe('GcsStorageAdapter', () => {
     expect(result.receipt.success).toBe(false);
     expect(result.receipt.error).toContain('not owned');
     expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not report creation success until the exact bucket is observable', async () => {
+    let reads = 0;
+    const request = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/storage/v1/b/') && (!init?.method || init.method === 'GET')) {
+        reads += 1;
+        return json({ error: { message: 'missing' } }, 404);
+      }
+      if (url.includes('/storage/v1/b?') && init?.method === 'POST') {
+        return json({});
+      }
+      throw new Error(`unexpected request ${init?.method ?? 'GET'} ${url}`);
+    });
+    const adapter = new GcsStorageAdapter({
+      fetch: request as typeof fetch,
+      tokenProvider: async () => ({ token: 'token', email: 'service@example.com' }),
+    });
+    await adapter.connect({ projectId: 'cloud-project', credentials: serviceAccount });
+    const context = (await adapter.ensureContext('friend-app', environment())).context!;
+
+    const result = await adapter.ensureBucket(environment(), context, 'documents', 'us-central1');
+
+    expect(result.receipt).toMatchObject({ success: false });
+    expect(result.receipt.error).toContain('did not become observable after creation');
+    expect(reads).toBe(2);
+  });
+
+  it('does not treat a malformed successful exact lookup as absence or delete the bucket', async () => {
+    const request = vi.fn(async (
+      _input: string | URL | Request,
+      _init?: RequestInit
+    ) => json({}));
+    const adapter = new GcsStorageAdapter({
+      fetch: request as typeof fetch,
+      tokenProvider: async () => ({ token: 'token', email: 'service@example.com' }),
+    });
+    await adapter.connect({ projectId: 'cloud-project', credentials: serviceAccount });
+
+    const result = await adapter.destroyBucket(
+      environment(),
+      { projectId: 'cloud-project', environmentId: 'environment-1' },
+      'managed'
+    );
+
+    expect(result).toMatchObject({ success: false });
+    expect(result.error).toContain('absence was not confirmed');
+    expect(request.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
   });
 
   it('provides GCS-native runtime and object transfer contracts', async () => {

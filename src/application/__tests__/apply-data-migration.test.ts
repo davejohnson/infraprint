@@ -229,10 +229,11 @@ describe('applyDataMigrationAction', () => {
       projectId: project.id,
       name: 'staging',
       platformBindings: {
-        storageProviders: { gcs: sourceContext },
+        storageProviders: { gcs: { projectId: 'new-gcp-project', location: 'us-east1' } },
         storage: {
           documents: {
             provider: 'gcs', externalId: 'gcp-documents', region: sourceContext.location,
+            instanceScope: sourceContext,
             services: ['web'], envKeys: [], updatedAt: '2026-08-13T00:00:00.000Z',
           },
         },
@@ -283,7 +284,7 @@ describe('applyDataMigrationAction', () => {
       metadata: {
         operation: 'dataMigrationStorageCopy', migrationId: 'initial-launch', storageName: 'documents',
         sourceEnvironment: 'staging', targetEnvironment: 'production', sourceProvider: 'gcs', targetProvider: 's3',
-        sourceExternalId: 'gcp-documents', sourceWritesMustBeStopped: true,
+        sourceExternalId: 'gcp-documents', sourceInstanceScope: sourceContext, sourceWritesMustBeStopped: true,
         sourceMaintenanceFingerprint: maintenanceFingerprint('staging'),
         targetMaintenanceFingerprint: maintenanceFingerprint('production'),
       },

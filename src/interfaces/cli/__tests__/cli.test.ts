@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { CommandRegistry } from '../../../application/commands.js';
 import { commandError, commandSuccess } from '../../../application/results.js';
+import { SqliteAdapter } from '../../../adapters/db/sqlite.adapter.js';
+import { SecretStore } from '../../../adapters/secrets/secret-store.js';
 import { runCli } from '../run.js';
 import type { CliIo } from '../io.js';
 
@@ -68,6 +73,18 @@ function makeRegistry(): CommandRegistry {
       data: { apiToken: 'ghp_abcdefghijklmnopqrstuvwxyz123456' },
     })
   );
+  registry.register(
+    'hv_plan',
+    'Plan with encrypted environment overrides.',
+    { envVars: z.record(z.string()).optional() },
+    async (input) => commandSuccess(input)
+  );
+  registry.register(
+    'hv_db_query',
+    'Run a parameterized database query.',
+    { sql: z.string(), params: z.array(z.unknown()).optional() },
+    async (input) => commandSuccess(input)
+  );
   return registry;
 }
 
@@ -100,6 +117,21 @@ describe('Hypervibe CLI', () => {
 
     expect(exitCode).toBe(0);
     expect(JSON.parse(output.stdout()).data.project).toBe('stdin-project');
+  });
+
+  it('rejects unknown fields in complete JSON input instead of silently dropping typos', async () => {
+    const output = makeIo({ stdin: '{"project":"stdin-project","incldueHistory":true}' });
+    const exitCode = await runCli(
+      ['spec', '--input', '-', '--json'],
+      { registry: makeRegistry(), io: output.io, initialize: false }
+    );
+
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(output.stdout())).toMatchObject({
+      ok: false,
+      error: { code: 'VALIDATION' },
+    });
+    expect(output.stdout()).toContain('incldueHistory');
   });
 
   it('uses the same command-aware human presentation as MCP', async () => {
@@ -150,6 +182,24 @@ describe('Hypervibe CLI', () => {
     expect(output.stderr()).not.toContain('{"apiToken":"secret"}');
   });
 
+  it('rejects secret-bearing env overrides and query parameters in shell flags', async () => {
+    for (const argv of [
+      ['plan', '--env-vars', '{"SESSION_SECRET":"do-not-save"}'],
+      ['db', 'query', '--sql', 'SELECT $1', '--params', '["do-not-save"]'],
+    ]) {
+      const output = makeIo();
+      const exitCode = await runCli(argv, {
+        registry: makeRegistry(),
+        io: output.io,
+        initialize: false,
+      });
+
+      expect(exitCode).toBe(2);
+      expect(output.stderr()).toContain('literal secrets can leak through shell history');
+      expect(output.stderr()).not.toContain('do-not-save');
+    }
+  });
+
   it('redacts handler results in the command runner before CLI rendering', async () => {
     const output = makeIo();
     const exitCode = await runCli(
@@ -179,5 +229,25 @@ describe('Hypervibe CLI', () => {
     expect(commandCode).toBe(0);
     expect(command.stdout()).toContain('--include-history');
     expect(command.stdout()).toContain('--input <path|->');
+  });
+
+  it('does not create local state just to render help', async () => {
+    const dataDir = mkdtempSync(path.join(tmpdir(), 'hypervibe-cli-help-'));
+    const previous = process.env.HYPERVIBE_DATA_DIR;
+    SqliteAdapter.resetInstance();
+    SecretStore.resetInstance();
+    process.env.HYPERVIBE_DATA_DIR = dataDir;
+    try {
+      const output = makeIo();
+      expect(await runCli(['--help'], { io: output.io })).toBe(0);
+      expect(existsSync(path.join(dataDir, 'hypervibe.db'))).toBe(false);
+      expect(existsSync(path.join(dataDir, '.secret-key'))).toBe(false);
+    } finally {
+      SqliteAdapter.resetInstance();
+      SecretStore.resetInstance();
+      if (previous === undefined) delete process.env.HYPERVIBE_DATA_DIR;
+      else process.env.HYPERVIBE_DATA_DIR = previous;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });

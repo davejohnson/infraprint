@@ -39,7 +39,7 @@ function fakeClient(overrides: Record<string, (variables: Record<string, unknown
   const defaults: Record<string, (variables: Record<string, unknown>, call: number) => unknown> = {
     GetProjectServicesConnection: () => ({ project: { services: { edges: [{ node: { id: 'src-svc-1', name: 'web' } }] } } }),
     GetServiceEnvironmentInstance: () => ({
-      service: { serviceInstances: { edges: [{ node: { environmentId: 'railenv-1' } }] } },
+      service: { id: 'src-svc-1', serviceInstances: { edges: [{ node: { environmentId: 'railenv-1' } }] } },
     }),
     TaskSourceInstance: () => ({ serviceInstance: { source: { image: 'ghcr.io/dave/app:sha1' } } }),
     GetVariables: () => ({ variables: { DATABASE_URL: 'postgresql://internal', RAILWAY_TOKEN_INJECTED: 'x', SESSION_SECRET: 's' } }),
@@ -54,7 +54,13 @@ function fakeClient(overrides: Record<string, (variables: Record<string, unknown
     serviceDelete: () => ({ serviceDelete: true }),
     GetService: (variables) => {
       const id = String(variables.id);
-      if (deletedServices.has(id)) throw new Error('Service not found');
+      if (deletedServices.has(id)) {
+        const error = new Error('Service not found') as Error & { response: Record<string, unknown> };
+        error.response = {
+          errors: [{ message: 'Service not found', path: ['service'], extensions: { code: 'NOT_FOUND' } }],
+        };
+        throw error;
+      }
       return { service: { id } };
     },
   };

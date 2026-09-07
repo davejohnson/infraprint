@@ -1774,8 +1774,13 @@ providerRegistry.register({
         ],
       ],
     },
+    maturity: {
+      lifecycle: {
+        hosting: { status: 'ready-for-live' },
+      },
+    },
     lifecycle: {
-      hosting: { customDomains: 'managed', maintenance: 'managed', teardownBoundary: 'services' },
+      hosting: { workloadKinds: ['web'], customDomains: 'managed', maintenance: 'managed', teardownBoundary: 'services' },
     },
     orchestration: {
       project: { shareAcrossEnvironments: true },
@@ -1798,17 +1803,17 @@ providerRegistry.register({
       },
     },
   },
-  factory: (credentials) => {
+  factory: async (credentials) => {
     const validated = VercelCredentialsSchema.parse(credentials);
     const adapter = new VercelAdapter();
-    void adapter.connect(validated);
+    await adapter.connect(validated);
     return adapter;
   },
   inspection: {
     resources: ['environment'],
     defaultResource: 'environment',
     selectors: {
-      environment: { mode: 'environment-forensics', required: ['project', 'env'], optional: ['scope', 'region', 'limit'], list: true },
+      environment: { mode: 'environment-forensics', required: ['project', 'env'], optional: ['scope', 'limit'], list: true },
     },
     inspect: (adapter, request) => (
       adapter as VercelAdapter

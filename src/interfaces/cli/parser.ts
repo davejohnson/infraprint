@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { z, type ZodTypeAny } from 'zod';
+import type { ZodTypeAny } from 'zod';
 import type { CommandDefinition, CommandRegistry } from '../../application/commands.js';
 
 export interface ParsedCliInvocation {
@@ -16,6 +16,8 @@ const SENSITIVE_LITERAL_FIELDS = new Set([
   'adminCredentialsJson',
   'connectionUrl',
   'credentials',
+  'envVars',
+  'params',
   'sourceConnectionUrl',
   'targetConnectionUrl',
   'value',

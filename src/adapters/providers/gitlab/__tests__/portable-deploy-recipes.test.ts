@@ -71,6 +71,8 @@ describe('provider-neutral GitLab deploy recipes', () => {
       'vercel',
     ]);
     for (const recipe of recipes) expectSafeRecipe(recipe);
+    expect(recipes[2]!.runtime.content).toContain('networkConfiguration: config.networkConfiguration');
+    expect(recipes[2]!.runtime.content).toContain('workload-network configuration is missing or malformed');
   });
 
   it('keeps cloud service-account JSON encoded across the GitLab variable boundary', () => {

@@ -37,9 +37,23 @@ function provider(
       displayName: name,
       category,
       credentialsSchema: z.object({ token: z.string() }),
+      maturity: {
+        lifecycle: {
+          ...(supportsHosting ? { hosting: { status: 'ready-for-live' as const } } : {}),
+          ...(supportsDatabase ? { database: { status: 'ready-for-live' as const } } : {}),
+          ...(supportsCache ? { cache: { status: 'ready-for-live' as const } } : {}),
+          ...(supportsStorage ? { storage: { status: 'ready-for-live' as const } } : {}),
+        },
+      },
       lifecycle: {
         ...(category === 'deployment'
-          ? { hosting: { customDomains: 'unsupported' as const, teardownBoundary: 'services' as const } }
+          ? {
+              hosting: {
+                workloadKinds: ['web'] as const,
+                customDomains: 'unsupported' as const,
+                teardownBoundary: 'services' as const,
+              },
+            }
           : {}),
         ...(supportsDatabase
           ? { databaseEngines: ['postgres'] }
@@ -77,9 +91,82 @@ describe('ProviderRegistry lifecycle capabilities', () => {
     expect(registry.namesFor('database')).toEqual(['db', 'multi']);
     expect(registry.namesFor('cache')).toEqual(['multi']);
     expect(registry.namesFor('storage')).toEqual(['multi']);
+    expect(registry.namesForMutation('hosting')).toEqual(['host', 'multi']);
+    expect(registry.supportsWorkloadKind('host', 'web')).toBe(true);
+    expect(registry.supportsWorkloadKind('host', 'worker')).toBe(false);
     expect(registry.supportsEngine('multi', 'database', 'postgres')).toBe(true);
     expect(registry.supportsEngine('multi', 'database', 'mysql')).toBe(false);
     expect(registry.supportsEngine('multi', 'cache', 'redis')).toBe(true);
+  });
+
+  it('keeps planned capabilities inspectable but excludes them from mutation support', () => {
+    const registry = new ProviderRegistry();
+    const planned = provider('planned-db', 'database');
+    planned.metadata.maturity!.lifecycle!.database = {
+      status: 'planned',
+      reason: 'A live lifecycle prerequisite is still missing.',
+    };
+    registry.register(planned);
+
+    expect(registry.supports('planned-db', 'database')).toBe(true);
+    expect(registry.supportsMutation('planned-db', 'database')).toBe(false);
+    expect(registry.namesFor('database')).toEqual(['planned-db']);
+    expect(registry.namesForMutation('database')).toEqual([]);
+  });
+
+  it('rejects malformed datastore-to-host connectivity metadata', () => {
+    const registry = new ProviderRegistry();
+    const missingLifecycle = provider('connectivity-without-lifecycle', 'deployment');
+    missingLifecycle.metadata.lifecycle!.databaseConnectivity = {
+      compatibleHostingProviders: ['railway'],
+    };
+    expect(() => registry.register(missingLifecycle)).toThrow(/without a database lifecycle/i);
+
+    const empty = provider('empty-connectivity', 'database');
+    empty.metadata.lifecycle!.databaseConnectivity = {
+      compatibleHostingProviders: [],
+    };
+    expect(() => registry.register(empty)).toThrow(/one or more unique hosting providers/i);
+
+    const duplicates = provider('duplicate-connectivity', 'cache');
+    duplicates.metadata.lifecycle!.cacheConnectivity = {
+      compatibleHostingProviders: ['cloudrun', 'cloudrun'],
+    };
+    expect(() => registry.register(duplicates)).toThrow(/one or more unique hosting providers/i);
+  });
+
+  it('rejects empty, duplicate, or unknown hosting workload-kind claims', () => {
+    const registry = new ProviderRegistry();
+    const empty = provider('empty-workloads', 'deployment');
+    empty.metadata.lifecycle!.hosting!.workloadKinds = [];
+    expect(() => registry.register(empty)).toThrow(/one or more unique supported workload kinds/i);
+
+    const duplicate = provider('duplicate-workloads', 'deployment');
+    duplicate.metadata.lifecycle!.hosting!.workloadKinds = ['web', 'web'];
+    expect(() => registry.register(duplicate)).toThrow(/one or more unique supported workload kinds/i);
+
+    const unknown = provider('unknown-workload', 'deployment');
+    unknown.metadata.lifecycle!.hosting!.workloadKinds = ['web', 'job' as 'web'];
+    expect(() => registry.register(unknown)).toThrow(/one or more unique supported workload kinds/i);
+  });
+
+  it('requires dated live evidence before a capability can be called supported', () => {
+    const registry = new ProviderRegistry();
+    const unsupportedClaim = provider('unsupported-claim', 'database');
+    unsupportedClaim.metadata.maturity!.lifecycle!.database = { status: 'supported' };
+
+    expect(() => registry.register(unsupportedClaim)).toThrow(/liveEvidence/i);
+
+    const proven = provider('proven', 'database');
+    proven.metadata.maturity!.lifecycle!.database = {
+      status: 'supported',
+      liveEvidence: {
+        verifiedAt: '2026-09-04T12:00:00.000Z',
+        reference: 'docs/live-evidence/proven.json',
+      },
+    };
+    expect(() => registry.register(proven)).not.toThrow();
+    expect(registry.supportsMutation('proven', 'database')).toBe(true);
   });
 
   it('rejects duplicate ids instead of silently replacing an adapter', () => {
@@ -89,10 +176,24 @@ describe('ProviderRegistry lifecycle capabilities', () => {
       .toThrow('already registered');
   });
 
+  it('awaits asynchronous provider factories and propagates initialization failures', async () => {
+    const registry = new ProviderRegistry();
+    const asynchronous = provider('async-provider', 'ai');
+    asynchronous.factory = async () => {
+      await Promise.resolve();
+      throw new Error('connection initialization failed');
+    };
+    registry.register(asynchronous);
+
+    await expect(registry.createAdapter('async-provider', { token: 'test' }))
+      .rejects.toThrow('connection initialization failed');
+  });
+
   it('does not treat every deployment-category integration as a hosting lifecycle', () => {
     const registry = new ProviderRegistry();
     const repository = provider('repository', 'deployment');
     delete repository.metadata.lifecycle?.hosting;
+    delete repository.metadata.maturity?.lifecycle?.hosting;
     registry.register(repository);
 
     expect(registry.supports('repository', 'hosting')).toBe(false);

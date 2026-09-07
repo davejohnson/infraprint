@@ -8,7 +8,15 @@ import {
 import { RailwayAdapter } from './railway.adapter.js';
 
 function virtualEnvironment(environment: Environment, context: StorageContext): Environment {
-  return { ...environment, platformBindings: { projectId: context.projectId, environmentId: context.environmentId, services: {} } };
+  return {
+    ...environment,
+    platformBindings: {
+      ...environment.platformBindings,
+      projectId: context.projectId,
+      environmentId: context.environmentId,
+      services: environment.platformBindings.services ?? {},
+    },
+  };
 }
 
 export function createRailwayStorageAdapter(railway: RailwayAdapter): IStorageAdapter {
@@ -25,6 +33,20 @@ export function createRailwayStorageAdapter(railway: RailwayAdapter): IStorageAd
     connect: (credentials) => railway.connect(credentials),
     verify: () => railway.verify(),
     disconnect: () => railway.disconnect(),
+    async resolveObservationContext(_projectName, environment): Promise<StorageEnsureResult> {
+      const hostingProvider = typeof environment.platformBindings.provider === 'string'
+        ? environment.platformBindings.provider
+        : undefined;
+      return {
+        receipt: {
+          success: false,
+          message: 'Railway storage scope is not available for read-only observation',
+          error: hostingProvider && hostingProvider !== 'railway'
+            ? `Railway buckets require an exact persisted Railway projectId/environmentId. Environment "${environment.name}" is hosted on ${hostingProvider}, so Hypervibe will not guess a Railway project by name or create provider scaffolding during observation. Import an existing Railway storage binding with hv_import, or choose storage hosted by the connected primary cloud.`
+            : `Railway buckets require an exact persisted Railway projectId/environmentId. Hypervibe will not guess a Railway project by name or create provider scaffolding during observation. Apply the Railway hosting environment first, or explicitly import an existing Railway storage binding with hv_import.`,
+        },
+      };
+    },
     async ensureContext(projectName, environment, context): Promise<StorageEnsureResult> {
       const receipt = await railway.ensureStorageContext(projectName, environment, context);
       const projectId = typeof receipt.data?.projectId === 'string' ? receipt.data.projectId : undefined;

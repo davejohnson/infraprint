@@ -537,7 +537,13 @@ export class FlyClient {
     if (!Array.isArray(response.data)) {
       throw new Error('Fly.io Managed Postgres observation returned an invalid cluster list.');
     }
-    if (response.data.some((cluster) => !cluster.id || !cluster.name)) {
+    if (response.data.some((cluster) => (
+      typeof cluster?.id !== 'string'
+      || !cluster.id.trim()
+      || cluster.id !== cluster.id.trim()
+      || typeof cluster.name !== 'string'
+      || !cluster.name.trim()
+    ))) {
       throw new Error('Fly.io Managed Postgres observation omitted a durable cluster identity.');
     }
     if (response.data.some((cluster) => (
@@ -602,7 +608,11 @@ export class FlyClient {
         },
       }
     );
-    if (!response.data?.id) {
+    if (
+      typeof response.data?.id !== 'string'
+      || !response.data.id.trim()
+      || response.data.id !== response.data.id.trim()
+    ) {
       throw new Error('Fly.io did not return a Managed Postgres cluster identity.');
     }
     return response.data;
@@ -700,8 +710,10 @@ export class FlyClient {
       'GET',
       `/v1/postgres/${encodeURIComponent(clusterId)}/users/${encodeURIComponent(username)}/credentials`
     );
-    if (!response.data?.username || !response.data.password) {
-      throw new Error(`Fly.io did not return PostgreSQL credentials for user ${username}.`);
+    if (response.data?.username !== username || !response.data.password) {
+      throw new Error(
+        `Fly.io did not return credentials for the exact PostgreSQL user ${username}.`
+      );
     }
     return { username: response.data.username, password: response.data.password };
   }

@@ -603,6 +603,117 @@ describe('CloudRunAdapter maintenance', () => {
     expect(template.volumes).toContainEqual(expect.objectContaining({ name: 'cloudsql' }));
   });
 
+  it('does not create a service when exact service observation fails', async () => {
+    const adapter = new CloudRunAdapter();
+    await adapter.connect({
+      projectId: 'gcp-project',
+      region: 'us-central1',
+      credentials: JSON.stringify({
+        type: 'service_account', project_id: 'gcp-project', private_key: 'dummy',
+        client_email: 'deploy@gcp-project.iam.gserviceaccount.com',
+      }),
+    });
+    (adapter as unknown as { accessToken: string; tokenExpiry: Date }).accessToken = 'token';
+    (adapter as unknown as { accessToken: string; tokenExpiry: Date }).tokenExpiry = new Date(Date.now() + 60_000);
+
+    const fetchMock = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') {
+        return new Response('permission denied', { status: 403 });
+      }
+      return new Response('unexpected mutation', { status: 500 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const now = new Date();
+    const result = await adapter.deploy({
+      id: 'service-1',
+      projectId: 'project-1',
+      name: 'web',
+      buildConfig: { builder: 'dockerfile', startCommand: 'npm start' },
+      envVarSpec: {},
+      createdAt: now,
+      updatedAt: now,
+    }, {
+      id: 'env-1',
+      projectId: 'project-1',
+      name: 'production',
+      platformBindings: {
+        provider: 'cloudrun',
+        projectId: 'gcp-project',
+        services: { web: { serviceId: 'gcp-project-web' } },
+      },
+      createdAt: now,
+      updatedAt: now,
+    }, {
+      IMAGE_URI: 'us-central1-docker.pkg.dev/gcp-project/infraprint/production-web:new',
+    });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      receipt: { success: false, error: expect.stringMatching(/403.*permission denied/i) },
+    });
+    expect(fetchMock.mock.calls.every(([, init]) => (init?.method ?? 'GET') === 'GET')).toBe(true);
+  });
+
+  it('does not create a scheduled job when its second existence observation fails', async () => {
+    const adapter = new CloudRunAdapter();
+    await adapter.connect({
+      projectId: 'gcp-project',
+      region: 'us-central1',
+      credentials: JSON.stringify({
+        type: 'service_account', project_id: 'gcp-project', private_key: 'dummy',
+        client_email: 'deploy@gcp-project.iam.gserviceaccount.com',
+      }),
+    });
+    (adapter as unknown as { accessToken: string; tokenExpiry: Date }).accessToken = 'token';
+    (adapter as unknown as { accessToken: string; tokenExpiry: Date }).tokenExpiry = new Date(Date.now() + 60_000);
+
+    let jobReads = 0;
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/jobs/gcp-project-cron') && method === 'GET') {
+        jobReads += 1;
+        return jobReads === 1
+          ? new Response('not found', { status: 404 })
+          : new Response('rate limited', { status: 429 });
+      }
+      return new Response('unexpected mutation', { status: 500 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const now = new Date();
+    const result = await adapter.deploy({
+      id: 'service-1',
+      projectId: 'project-1',
+      name: 'cron',
+      buildConfig: {
+        workloadKind: 'cron',
+        builder: 'dockerfile',
+        startCommand: 'npm run cron',
+        cronSchedule: '*/5 * * * *',
+      },
+      envVarSpec: {},
+      createdAt: now,
+      updatedAt: now,
+    }, {
+      id: 'env-1',
+      projectId: 'project-1',
+      name: 'production',
+      platformBindings: { provider: 'cloudrun', projectId: 'gcp-project' },
+      createdAt: now,
+      updatedAt: now,
+    }, {
+      IMAGE_URI_CRON: 'us-central1-docker.pkg.dev/gcp-project/infraprint/production-cron:new',
+    });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      receipt: { success: false, error: expect.stringMatching(/429.*rate limited/i) },
+    });
+    expect(fetchMock.mock.calls.every(([, init]) => (init?.method ?? 'GET') === 'GET')).toBe(true);
+  });
+
   it('keeps exact-SHA CI as the code release boundary for an existing service', async () => {
     const adapter = new CloudRunAdapter();
     await adapter.connect({
@@ -713,7 +824,6 @@ describe('CloudRunAdapter maintenance', () => {
         token_uri: 'https://oauth2.googleapis.com/token',
       }),
     });
-
     const now = new Date();
     const environment: Environment = {
       id: 'env-1',
@@ -1417,6 +1527,13 @@ describe('CloudRunAdapter maintenance', () => {
           uri: 'https://gcp-project-web.run.app',
           terminalCondition: { type: 'Ready', state: 'CONDITION_SUCCEEDED' },
           template: {
+            vpcAccess: {
+              networkInterfaces: [{
+                network: 'projects/gcp-project/global/networks/default',
+                subnetwork: 'projects/gcp-project/regions/us-central1/subnetworks/default',
+              }],
+              egress: 'PRIVATE_RANGES_ONLY',
+            },
             containers: [{
               image: 'us-central1-docker.pkg.dev/gcp-project/infraprint/production-web:compatible',
               env: updated
@@ -1489,7 +1606,148 @@ describe('CloudRunAdapter maintenance', () => {
       { name: 'KEEP_ME', value: 'preserved' },
       { name: 'SECRET_VALUE', valueSource: { secretKeyRef: { secret: 'secret', version: 'latest' } } },
     ]);
+    expect(patchBody.template).not.toHaveProperty('vpcAccess');
+    expect(String(patchCall?.[0])).not.toContain('template.vpcAccess');
     expect(JSON.stringify(result)).not.toContain('must-not-leak');
+  });
+
+  it('attaches the exact cache VPC during a service environment update', async () => {
+    const adapter = new CloudRunAdapter();
+    await adapter.connect({
+      projectId: 'gcp-project',
+      region: 'us-central1',
+      credentials: JSON.stringify({
+        type: 'service_account',
+        project_id: 'gcp-project',
+        private_key: 'dummy',
+        client_email: 'deploy@gcp-project.iam.gserviceaccount.com',
+      }),
+    });
+    (adapter as unknown as { accessToken: string; tokenExpiry: Date }).accessToken = 'token';
+    (adapter as unknown as { accessToken: string; tokenExpiry: Date }).tokenExpiry = new Date(Date.now() + 60_000);
+    const network = 'projects/gcp-project/global/networks/default';
+    const subnetwork = 'projects/gcp-project/regions/us-central1/subnetworks/default';
+    let liveTemplate: Record<string, unknown> = {
+      containers: [{ image: 'image:current', env: [] }],
+    };
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('compute.googleapis.com') && url.endsWith('/global/networks/default')) {
+        return Response.json({ selfLink: `https://www.googleapis.com/compute/v1/${network}` });
+      }
+      if (url.includes('compute.googleapis.com') && url.endsWith('/regions/us-central1/subnetworks/default')) {
+        return Response.json({ network: `https://www.googleapis.com/compute/v1/${network}` });
+      }
+      if (url.includes('/services/gcp-project-web') && method === 'GET') {
+        return Response.json({
+          name: 'projects/gcp-project/locations/us-central1/services/gcp-project-web',
+          uid: 'uid-web',
+          generation: '2',
+          observedGeneration: '2',
+          terminalCondition: { type: 'Ready', state: 'CONDITION_SUCCEEDED' },
+          template: liveTemplate,
+        });
+      }
+      if (url.includes('/services/gcp-project-web') && method === 'PATCH') {
+        liveTemplate = JSON.parse(String(init?.body)).template;
+        return Response.json({ name: 'operations/vpc-env', done: true });
+      }
+      throw new Error(`Unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const now = new Date();
+    const environment: Environment = {
+      id: 'env-1', projectId: 'project-1', name: 'production', createdAt: now, updatedAt: now,
+      platformBindings: {
+        provider: 'cloudrun',
+        projectId: 'gcp-project',
+        services: { web: { serviceId: 'gcp-project-web' } },
+        cacheNetwork: {
+          provider: 'cloudrun', projectId: 'gcp-project', region: 'us-central1',
+          network, subnetwork, egress: 'PRIVATE_RANGES_ONLY',
+        },
+      },
+    };
+    const service: Service = {
+      id: 'service-1', projectId: 'project-1', name: 'web',
+      buildConfig: { builder: 'dockerfile' }, envVarSpec: {}, createdAt: now, updatedAt: now,
+    };
+
+    const result = await adapter.setEnvVars(environment, service, { REDIS_URL: 'redis://private' });
+
+    expect(result.success).toBe(true);
+    const patchCall = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).includes('/services/gcp-project-web') && init?.method === 'PATCH'
+    );
+    expect(String(patchCall?.[0])).toContain('template.vpcAccess');
+    expect(JSON.parse(String(patchCall?.[1]?.body)).template.vpcAccess).toEqual({
+      networkInterfaces: [{ network, subnetwork }],
+      egress: 'PRIVATE_RANGES_ONLY',
+    });
+  });
+
+  it('removes Direct VPC egress even when REDIS_URL is already absent', async () => {
+    const adapter = new CloudRunAdapter();
+    await adapter.connect({
+      projectId: 'gcp-project',
+      region: 'us-central1',
+      credentials: JSON.stringify({
+        type: 'service_account', project_id: 'gcp-project', private_key: 'dummy',
+        client_email: 'deploy@gcp-project.iam.gserviceaccount.com',
+      }),
+    });
+    (adapter as unknown as { accessToken: string; tokenExpiry: Date }).accessToken = 'token';
+    (adapter as unknown as { accessToken: string; tokenExpiry: Date }).tokenExpiry = new Date(Date.now() + 60_000);
+    const network = 'projects/gcp-project/global/networks/default';
+    const subnetwork = 'projects/gcp-project/regions/us-central1/subnetworks/default';
+    let liveTemplate: Record<string, unknown> = {
+      containers: [{ image: 'image:current', env: [{ name: 'KEEP', value: 'yes' }] }],
+      vpcAccess: {
+        networkInterfaces: [{ network, subnetwork }],
+        egress: 'PRIVATE_RANGES_ONLY',
+      },
+    };
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/services/gcp-project-web') && method === 'GET') {
+        return Response.json({
+          name: 'projects/gcp-project/locations/us-central1/services/gcp-project-web',
+          uid: 'uid-web', generation: '3', observedGeneration: '3',
+          terminalCondition: { type: 'Ready', state: 'CONDITION_SUCCEEDED' },
+          template: liveTemplate,
+        });
+      }
+      if (url.includes('/services/gcp-project-web') && method === 'PATCH') {
+        liveTemplate = JSON.parse(String(init?.body)).template;
+        return Response.json({ name: 'operations/remove-vpc', done: true });
+      }
+      throw new Error(`Unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const now = new Date();
+    const environment: Environment = {
+      id: 'env-1', projectId: 'project-1', name: 'production', createdAt: now, updatedAt: now,
+      platformBindings: {
+        provider: 'cloudrun', projectId: 'gcp-project',
+        services: { web: { serviceId: 'gcp-project-web' } },
+        cacheNetwork: null,
+      },
+    };
+    const service: Service = {
+      id: 'service-1', projectId: 'project-1', name: 'web',
+      buildConfig: { builder: 'dockerfile' }, envVarSpec: {}, createdAt: now, updatedAt: now,
+    };
+
+    const result = await adapter.deleteEnvVars!(environment, service, ['REDIS_URL']);
+
+    expect(result.success).toBe(true);
+    const patchCall = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).includes('/services/gcp-project-web') && init?.method === 'PATCH'
+    );
+    expect(String(patchCall?.[0])).toContain('template.vpcAccess');
+    expect(JSON.parse(String(patchCall?.[1]?.body)).template.vpcAccess).toEqual({});
   });
 
   it('removes stale Cloud SQL wiring when syncing Supabase database vars', async () => {
@@ -1718,6 +1976,9 @@ describe('CloudRunAdapter maintenance', () => {
         token_uri: 'https://oauth2.googleapis.com/token',
       }),
     });
+    (adapter as unknown as { accessToken: string; tokenExpiry: Date }).accessToken = 'token';
+    (adapter as unknown as { accessToken: string; tokenExpiry: Date }).tokenExpiry = new Date(Date.now() + 60_000);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('not found', { status: 404 })));
 
     const now = new Date();
     const environment: Environment = {
@@ -1902,9 +2163,18 @@ describe('CloudRunAdapter maintenance', () => {
 
     let jobCreated = false;
     let schedulerCreated = false;
+    const network = 'projects/gcp-project/global/networks/default';
+    const subnetwork = 'projects/gcp-project/regions/us-central1/subnetworks/default';
     const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? 'GET';
+
+      if (url.includes('compute.googleapis.com') && url.endsWith('/global/networks/default')) {
+        return Response.json({ selfLink: `https://www.googleapis.com/compute/v1/${network}` });
+      }
+      if (url.includes('compute.googleapis.com') && url.endsWith('/regions/us-central1/subnetworks/default')) {
+        return Response.json({ network: `https://www.googleapis.com/compute/v1/${network}` });
+      }
 
       if (url.includes('run.googleapis.com') && url.includes('/jobs/gcp-project-cron') && !url.includes(':run') && method === 'GET') {
         if (!jobCreated) {
@@ -1921,6 +2191,10 @@ describe('CloudRunAdapter maintenance', () => {
           },
           template: {
             template: {
+              vpcAccess: {
+                networkInterfaces: [{ network, subnetwork }],
+                egress: 'PRIVATE_RANGES_ONLY',
+              },
               containers: [{
                 image: 'us-central1-docker.pkg.dev/gcp-project/infraprint/production-cron:main',
               }],
@@ -1964,7 +2238,18 @@ describe('CloudRunAdapter maintenance', () => {
       id: 'env-1',
       projectId: 'project-1',
       name: 'production',
-      platformBindings: { provider: 'cloudrun', projectId: 'gcp-project' },
+      platformBindings: {
+        provider: 'cloudrun',
+        projectId: 'gcp-project',
+        cacheNetwork: {
+          provider: 'cloudrun',
+          projectId: 'gcp-project',
+          region: 'us-central1',
+          network,
+          subnetwork,
+          egress: 'PRIVATE_RANGES_ONLY',
+        },
+      },
       createdAt: now,
       updatedAt: now,
     };
@@ -2012,6 +2297,10 @@ describe('CloudRunAdapter maintenance', () => {
       'infraprint-resource': 'scheduled-job',
     });
     expect(jobBody.template.template.serviceAccount).toBe('deploy@gcp-project.iam.gserviceaccount.com');
+    expect(jobBody.template.template.vpcAccess).toEqual({
+      networkInterfaces: [{ network, subnetwork }],
+      egress: 'PRIVATE_RANGES_ONLY',
+    });
     expect(jobBody.template.template).not.toHaveProperty('labels');
     expect(jobBody.template.template.containers[0]).toMatchObject({
       image: 'us-central1-docker.pkg.dev/gcp-project/infraprint/production-cron:main',
@@ -2374,6 +2663,48 @@ describe('CloudRunAdapter maintenance', () => {
       },
     ]);
     });
+  });
+
+  it('preserves deployment-history API errors instead of returning empty history', async () => {
+    const adapter = new CloudRunAdapter();
+    await adapter.connect({
+      projectId: 'gcp-project',
+      region: 'us-central1',
+      credentials: JSON.stringify({
+        type: 'service_account', project_id: 'gcp-project', private_key: 'dummy',
+        client_email: 'deploy@gcp-project.iam.gserviceaccount.com',
+      }),
+    });
+    (adapter as unknown as { accessToken: string; tokenExpiry: Date }).accessToken = 'token';
+    (adapter as unknown as { accessToken: string; tokenExpiry: Date }).tokenExpiry = new Date(Date.now() + 60_000);
+
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes('/services/gcp-project-web/revisions')) {
+        return new Response('revision access denied', { status: 403 });
+      }
+      if (url.includes('/services/gcp-project-web')) {
+        return Response.json({
+          name: 'gcp-project-web',
+          terminalCondition: { type: 'Ready', state: 'CONDITION_SUCCEEDED' },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    const now = new Date();
+    await expect(adapter.listDeployments({
+      id: 'env-1',
+      projectId: 'project-1',
+      name: 'production',
+      platformBindings: {
+        provider: 'cloudrun',
+        projectId: 'gcp-project',
+        services: { web: { serviceId: 'gcp-project-web' } },
+      },
+      createdAt: now,
+      updatedAt: now,
+    }, 'web', 10)).rejects.toThrow(/403.*revision access denied/i);
   });
 
   it('deletes scheduled jobs from Cloud Scheduler and Cloud Run Jobs', async () => {

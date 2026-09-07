@@ -14,7 +14,7 @@ import { EnvironmentRepository } from '../../adapters/db/repositories/environmen
 import { ServiceRepository } from '../../adapters/db/repositories/service.repository.js';
 import { getSecretStore } from '../../adapters/secrets/secret-store.js';
 import { StripeAdapter } from '../../adapters/providers/stripe/stripe.adapter.js';
-import { createToolContext } from '../context.js';
+import { createToolContext } from '../../application/context.js';
 import { registerHvObservabilityTools } from '../hv-observability.tools.js';
 import { SpecStore } from '../../domain/spec/spec.store.js';
 import { projectSpecSchema } from '../../domain/spec/spec.schema.js';
@@ -306,12 +306,13 @@ describe('hv_logs', () => {
         services: { web: { serviceId: 'service-1' } },
       },
     });
+    const readProviderBuildLogs = vi.fn(async () => ({
+      deploymentId: 'deployment-1',
+      buildLogs: 'install\nbuild\ntest\ndeploy',
+    }));
     vi.spyOn(adapterFactory, 'getProviderAdapter').mockResolvedValue({
       success: true,
-      adapter: {
-        getDeployments: vi.fn(async () => []),
-        getBuildLogs: vi.fn(async () => 'install\nbuild\ntest\ndeploy'),
-      } as never,
+      adapter: { readProviderBuildLogs } as never,
     });
 
     const t = await makeClient();
@@ -338,6 +339,144 @@ describe('hv_logs', () => {
     expect(result.warnings).toEqual([
       'Ignored option for hv_logs source="build": errorsOnly. The requested read still completed.',
     ]);
+    expect(readProviderBuildLogs).toHaveBeenCalledWith(expect.objectContaining({
+      serviceName: 'web',
+      deploymentId: 'deployment-1',
+    }));
+    await t.close();
+  });
+
+  it('does not count a build log terminal newline as an empty tail line', async () => {
+    const project = new ProjectRepository().create({
+      name: 'newline-build-log-app',
+      defaultPlatform: 'railway',
+    });
+    new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'staging',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'project-1',
+        environmentId: 'environment-1',
+        services: { web: { serviceId: 'service-1' } },
+      },
+    });
+    vi.spyOn(adapterFactory, 'getProviderAdapter').mockResolvedValue({
+      success: true,
+      adapter: {
+        readProviderBuildLogs: vi.fn(async () => ({
+          deploymentId: 'deployment-1',
+          buildLogs: 'install\nbuild\n',
+        })),
+      } as never,
+    });
+
+    const t = await makeClient();
+    const result = await t.call('hv_logs', {
+      project: project.name,
+      env: 'staging',
+      source: 'build',
+      limit: 1,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({
+      buildLogs: 'build',
+      lineCount: 2,
+      returnedLines: 1,
+      truncated: true,
+    });
+    await t.close();
+  });
+
+  it('applies errorsOnly to Railway service logs and forwards limit', async () => {
+    const project = new ProjectRepository().create({
+      name: 'filtered-service-log-app',
+      defaultPlatform: 'railway',
+    });
+    new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'staging',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'project-1',
+        environmentId: 'environment-1',
+        services: { web: { serviceId: 'service-1' } },
+      },
+    });
+    const readProviderLogs = vi.fn(async () => ({
+      deploymentId: 'deployment-1',
+      deploymentStatus: 'SUCCESS',
+      logs: [
+        { timestamp: '2026-09-03T00:00:00.000Z', severity: 'info', message: 'listening' },
+        { timestamp: '2026-09-03T00:00:01.000Z', severity: 'error', message: 'request failed' },
+        { timestamp: '2026-09-03T00:00:02.000Z', severity: 'warn', message: 'retry failed' },
+        { timestamp: '2026-09-03T00:00:03.000Z', severity: 'error', message: 'provider over-returned' },
+      ],
+    }));
+    vi.spyOn(adapterFactory, 'getProviderAdapter').mockResolvedValue({
+      success: true,
+      adapter: { readProviderLogs } as never,
+    });
+
+    const t = await makeClient();
+    const result = await t.call('hv_logs', {
+      project: project.name,
+      env: 'staging',
+      service: 'web',
+      source: 'service',
+      limit: 2,
+      errorsOnly: true,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(readProviderLogs).toHaveBeenCalledWith(expect.objectContaining({
+      serviceName: 'web',
+      limit: 2,
+      errorsOnly: true,
+    }));
+    expect(result.data.logs).toEqual([
+      { timestamp: '2026-09-03T00:00:01.000Z', severity: 'error', message: 'request failed' },
+      { timestamp: '2026-09-03T00:00:02.000Z', severity: 'warn', message: 'retry failed' },
+    ]);
+    await t.close();
+  });
+
+  it('does not broaden an unknown service selector to all deployments', async () => {
+    const project = new ProjectRepository().create({
+      name: 'deployment-service-selector-app',
+      defaultPlatform: 'railway',
+    });
+    new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'staging',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'project-1',
+        environmentId: 'environment-1',
+        services: { web: { serviceId: 'service-1' } },
+      },
+    });
+    const listProviderDeployments = vi.fn(async () => []);
+    vi.spyOn(adapterFactory, 'getProviderAdapter').mockResolvedValue({
+      success: true,
+      adapter: { listProviderDeployments } as never,
+    });
+
+    const t = await makeClient();
+    const result = await t.call('hv_logs', {
+      project: project.name,
+      env: 'staging',
+      service: 'typo',
+      source: 'deployments',
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatchObject({
+      code: 'NOT_FOUND',
+      details: { available: ['web'] },
+    });
+    expect(listProviderDeployments).not.toHaveBeenCalled();
     await t.close();
   });
 });

@@ -59,11 +59,31 @@ describe('resolveGitDeploySource', () => {
     expect(result.source).toEqual({ repo: 'davejohnson/billforge', branch: 'main' });
   });
 
-  it('errors for unmappable environments and non-GitHub remotes', () => {
+  it('uses an explicit branch for arbitrary environment names', () => {
     expect(classifyDeployEnvironment('qa-7')).toBeNull();
-    const odd = resolveGitDeploySource({ gitRemoteUrl: 'git@github.com:a/b.git' }, 'qa-7', { strategy: 'branch' });
-    expect(odd.source).toBeNull();
-    expect(odd.error).toContain('staging/production');
+    const explicit = resolveGitDeploySource(
+      { gitRemoteUrl: 'git@github.com:a/b.git' },
+      'qa-7',
+      { strategy: 'branch', branch: 'release/qa-7' }
+    );
+    expect(explicit.source).toEqual({ repo: 'a/b', branch: 'release/qa-7' });
+
+    const defaulted = resolveGitDeploySource(
+      { gitRemoteUrl: 'git@github.com:a/b.git' },
+      'qa-7',
+      { strategy: 'branch' }
+    );
+    expect(defaulted.source).toEqual({ repo: 'a/b', branch: 'main' });
+  });
+
+  it('rejects ambiguous legacy branch maps and non-GitHub remotes', () => {
+    const legacy = resolveGitDeploySource(
+      { gitRemoteUrl: 'git@github.com:a/b.git' },
+      'qa-7',
+      { strategy: 'branch', branches: { production: 'main', staging: 'develop' } }
+    );
+    expect(legacy.source).toBeNull();
+    expect(legacy.error).toContain('Set deploy.branch explicitly');
 
     const gitlab = resolveGitDeploySource({ gitRemoteUrl: 'https://gitlab.com/a/b.git' }, 'production', { strategy: 'branch' });
     expect(gitlab.source).toBeNull();

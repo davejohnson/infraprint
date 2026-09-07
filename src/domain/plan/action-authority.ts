@@ -121,6 +121,7 @@ export type PlanMutationCapability =
   | 'cache.provision'
   | 'cache.env.remove'
   | 'cache.destroy'
+  | 'cache.retained.destroy'
   | 'database.provision'
   | 'database.availability.configure'
   | 'database.backup-policy.configure'
@@ -214,10 +215,19 @@ function metadataStringRecord(action: PlanAction, key: string): Record<string, s
   const value = action.metadata?.[key];
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const entries = Object.entries(value);
-  if (entries.length === 0 || entries.some(([, item]) => typeof item !== 'string' || item.length === 0)) {
+  if (entries.length === 0 || entries.some(([key, item]) => !key.trim() || typeof item !== 'string' || item.trim().length === 0)) {
     return undefined;
   }
   return Object.fromEntries(entries) as Record<string, string>;
+}
+
+function githubInfrastructureIncludesRestoreDrill(action: PlanAction): boolean {
+  const files = action.metadata?.desiredFiles;
+  return Array.isArray(files) && files.some((file) => {
+    if (!file || typeof file !== 'object' || Array.isArray(file)) return false;
+    const path = (file as Record<string, unknown>).path;
+    return typeof path === 'string' && path.includes('restore-drill');
+  });
 }
 
 function metadataBoolean(action: PlanAction, key: string): boolean | undefined {
@@ -235,6 +245,43 @@ function metadataPositiveIntegerString(action: PlanAction, key: string): string 
   return value && /^[1-9]\d*$/.test(value) ? value : undefined;
 }
 
+function metadataSha256(action: PlanAction, key: string): string | undefined {
+  const value = metadataString(action, key);
+  return value && /^[a-f0-9]{64}$/.test(value) ? value : undefined;
+}
+
+function cacheDesiredConfigIsPinned(action: PlanAction): boolean {
+  return ['region', 'network', 'subnetwork', 'tier', 'size'].every((key) => {
+    if (!Object.prototype.hasOwnProperty.call(action.metadata ?? {}, key)) return false;
+    const value = action.metadata?.[key];
+    return value === null || (typeof value === 'string' && value.length > 0);
+  });
+}
+
+function loadBalancerOriginsArePinned(action: PlanAction): boolean {
+  const origins = action.metadata?.origins;
+  if (!Array.isArray(origins) || origins.length < 2 || !metadataSha256(action, 'originsHash')) {
+    return false;
+  }
+  const names = new Set<string>();
+  for (const value of origins) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const origin = value as Record<string, unknown>;
+    if (
+      typeof origin.name !== 'string'
+      || !origin.name
+      || names.has(origin.name)
+      || typeof origin.address !== 'string'
+      || !origin.address
+      || typeof origin.hostHeader !== 'string'
+      || !origin.hostHeader
+      || origin.enabled !== true
+    ) return false;
+    names.add(origin.name);
+  }
+  return true;
+}
+
 function operationTypeIsValid(action: PlanAction): boolean {
   const operation = metadataString(action, 'operation');
   switch (operation) {
@@ -247,16 +294,37 @@ function operationTypeIsValid(action: PlanAction): boolean {
     case IOS_OPERATIONS.betaGroupEnsure:
       return hasType(action, 'create', 'update');
     case QUEUE_OPERATIONS.ensure:
-      return hasType(action, 'create', 'update');
+      return hasType(action, 'create', 'update')
+        && !metadataString(action, 'blockedReason')
+        && (
+          metadataString(action, 'backend') === 'postgres'
+          || (
+            metadataString(action, 'backend') === 'pubsub'
+            && Boolean(metadataStringRecord(action, 'providerScope'))
+          )
+        );
     case QUEUE_OPERATIONS.destroy:
-      return action.type === 'destroy';
+      return action.type === 'destroy' && Boolean(
+        metadataString(action, 'backend') === 'postgres'
+        || (
+          metadataString(action, 'backend') === 'pubsub'
+          && action.dataBearing === true
+          && action.requiresConfirm === true
+          && metadataString(action, 'topicName')
+          && metadataString(action, 'subscriptionName')
+          && metadataStringRecord(action, 'providerScope')
+        )
+      );
     case STORAGE_OPERATIONS.ensure:
-      return action.type === 'create';
+      return (action.type === 'update' && Boolean(metadataString(action, 'blockedReason')))
+        || (action.type === 'create' && action.billable === true);
     case STORAGE_OPERATIONS.wire:
     case STORAGE_OPERATIONS.unwire:
       return action.type === 'update';
     case STORAGE_OPERATIONS.destroy:
-      return action.type === 'destroy';
+      return action.type === 'destroy'
+        && action.dataBearing === true
+        && action.requiresConfirm === true;
     case STRIPE_HOSTING_ENV_SYNC_OPERATION:
       return action.type === 'update';
     case STRIPE_CATALOG_OPERATIONS.productEnsure:
@@ -364,6 +432,7 @@ export function resolvePlanActionAuthority(
     isCloudflareDomainRegistrationAction(action)
     && exactResource(action, 'domain', 'cloudflare')
     && hasType(action, 'create', 'update')
+    && (action.type !== 'create' || (action.billable === true && action.requiresConfirm === true))
     && metadataString(action, 'accountId')
   ) {
     return authority(action, 'domain.registration.mutate');
@@ -579,6 +648,10 @@ export function resolvePlanActionAuthority(
     && exactResource(action, 'repo', 'github')
     && action.type === 'update'
     && action.resource.name === metadataString(action, 'repository')
+    && (
+      !githubInfrastructureIncludesRestoreDrill(action)
+      || action.billable === true
+    )
   ) {
     return authority(action, 'github.infrastructure.sync');
   }
@@ -609,6 +682,11 @@ export function resolvePlanActionAuthority(
     && exactResource(action, 'repo', 'github')
     && action.type === 'update'
     && action.resource.name === metadataString(action, 'repository')
+    && (
+      action.metadata?.operation !== 'githubCodeScanning'
+      || action.metadata?.privateRepository === false
+      || (action.billable === true && action.requiresConfirm === true)
+    )
   ) {
     return authority(action, 'github.setting.sync');
   }
@@ -673,6 +751,10 @@ export function resolvePlanActionAuthority(
         || operation === MAINTENANCE_OPERATIONS.edgeDisable)
       && action.resource.provider === 'cloudflare'
       && action.resource.name === metadataString(action, 'hostname')
+      && (
+        operation !== MAINTENANCE_OPERATIONS.edgeEnable
+        || (action.billable === true && action.requiresConfirm === true)
+      )
     ) {
       return authority(action, 'maintenance.edge.mutate');
     }
@@ -729,6 +811,7 @@ export function resolvePlanActionAuthority(
       && exactResource(action, 'storage')
       && metadataString(action, 'storageName') === action.resource.name
       && metadataString(action, 'sourceExternalId')
+      && metadataStringRecord(action, 'sourceInstanceScope')
       && metadataString(action, 'sourceProvider')
       && metadataString(action, 'targetProvider') === action.resource.provider
       && metadataString(action, 'sourceMaintenanceFingerprint')
@@ -765,8 +848,22 @@ export function resolvePlanActionAuthority(
     && action.resource.name === metadataString(action, 'storageName')
     && (
       action.metadata?.operation === STORAGE_OPERATIONS.ensure
-      || action.metadata?.operation === STORAGE_OPERATIONS.destroy
-      || Boolean(metadataString(action, 'serviceName'))
+      || (
+        action.metadata?.operation === STORAGE_OPERATIONS.destroy
+        && metadataString(action, 'externalId')
+        && metadataStringRecord(action, 'instanceScope')
+      )
+      || Boolean(
+        metadataString(action, 'serviceName')
+        && (
+          metadataString(action, 'serviceId')
+          || (
+            action.metadata?.operation === STORAGE_OPERATIONS.wire
+            && metadataBoolean(action, 'serviceIdPending') === true
+            && action.dependsOn?.includes(`service:${metadataString(action, 'serviceName')}`)
+          )
+        )
+      )
     )
   ) {
     return authority(action, 'storage.mutate');
@@ -794,6 +891,8 @@ export function resolvePlanActionAuthority(
       && action.id === 'load-balancer:pool'
       && metadataString(action, 'externalName')
       && (metadataStringArray(action, 'services')?.length ?? 0) >= 2
+      && (Boolean(action.metadata?.blockedReason) || loadBalancerOriginsArePinned(action))
+      && (Boolean(action.metadata?.blockedReason) || action.billable === true)
     ) {
       return authority(action, 'load-balancer.pool.mutate');
     }
@@ -802,6 +901,7 @@ export function resolvePlanActionAuthority(
       && hasType(action, 'create', 'update')
       && action.id === `load-balancer:${action.resource.name}`
       && (metadataStringArray(action, 'services')?.length ?? 0) >= 2
+      && (action.type !== 'create' || action.billable === true)
     ) {
       return authority(action, 'load-balancer.mutate');
     }
@@ -884,8 +984,30 @@ export function resolvePlanActionAuthority(
     && action.resource.name === 'redis'
   ) {
     if (
+      action.metadata?.operation === CACHE_OPERATIONS.retainedDestroy
+      && action.type === 'destroy'
+      && action.dataBearing === true
+      && action.requiresConfirm === true
+      && metadataString(action, 'externalId')
+      && metadataString(action, 'name')
+      && metadataString(action, 'engine') === 'redis'
+      && metadataStringRecord(action, 'providerScope')
+    ) {
+      return authority(action, 'cache.retained.destroy');
+    }
+    if (
       action.metadata?.operation === CACHE_OPERATIONS.ensure
-      && ['create', 'update', 'replace'].includes(action.type)
+      && cacheDesiredConfigIsPinned(action)
+      && (
+        (action.type === 'create' && action.billable === true)
+        || (
+          action.type === 'update'
+          && (
+            action.billable === true
+            || Boolean(metadataString(action, 'blockedReason'))
+          )
+        )
+      )
     ) {
       return authority(action, 'cache.provision');
     }
@@ -899,6 +1021,11 @@ export function resolvePlanActionAuthority(
     if (
       action.metadata?.operation === CACHE_OPERATIONS.destroy
       && action.type === 'destroy'
+      && action.dataBearing === true
+      && action.requiresConfirm === true
+      && metadataString(action, 'externalId')
+      && metadataStringRecord(action, 'providerScope')
+      && metadataSha256(action, 'bindingsFingerprint')
     ) {
       return authority(action, 'cache.destroy');
     }
@@ -924,6 +1051,7 @@ export function resolvePlanActionAuthority(
       if (
         action.metadata?.operation === DATABASE_RESILIENCE_OPERATIONS.replicaProvision
         && action.type === 'create'
+        && action.billable === true
         && metadataString(action, 'replicaName') === action.resource.name
       ) {
         return authority(action, 'database.replica.provision');
@@ -931,6 +1059,8 @@ export function resolvePlanActionAuthority(
       if (
         action.metadata?.operation === DATABASE_RESILIENCE_OPERATIONS.replicaDestroy
         && action.type === 'destroy'
+        && action.dataBearing === true
+        && action.requiresConfirm === true
         && metadataString(action, 'replicaName') === action.resource.name
         && metadataString(action, 'replicaExternalId')
       ) {
@@ -947,10 +1077,18 @@ export function resolvePlanActionAuthority(
     ) {
       return authority(action, 'database.seed');
     }
-    if (action.type === 'create' && !action.metadata?.operation) {
+    if (action.type === 'create' && action.billable === true && !action.metadata?.operation) {
       return authority(action, 'database.provision');
     }
-    if (action.type === 'destroy' && !action.metadata?.operation) {
+    if (
+      action.type === 'destroy'
+      && action.dataBearing === true
+      && action.requiresConfirm === true
+      && !action.metadata?.operation
+      && metadataString(action, 'externalId')
+      && metadataStringRecord(action, 'providerScope')
+      && metadataSha256(action, 'bindingsFingerprint')
+    ) {
       return authority(action, 'database.destroy');
     }
     if (
@@ -980,6 +1118,7 @@ export function resolvePlanActionAuthority(
       return authority(action, 'hosting.previous-service.destroy');
     }
     if (action.metadata?.operation) return null;
+    if (!metadataString(action, 'externalId')) return null;
     return authority(action, 'hosting.service.destroy');
   }
   if (

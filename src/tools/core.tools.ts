@@ -15,16 +15,12 @@ import { planCache } from '../domain/services/cache-plan.service.js';
 import { planDatabaseResilience } from '../domain/services/database-resilience-plan.service.js';
 import { planQueues } from '../domain/services/queue-plan.service.js';
 import { planStorage } from '../domain/services/storage-plan.service.js';
-import {
-  delegatedSecretsForEnvironment,
-  planDelegatedSecrets,
-} from '../domain/services/delegated-secret.service.js';
+import { planDelegatedSecrets } from '../domain/services/delegated-secret.service.js';
 import { runtimeRolloutRequirements } from '../domain/services/runtime-rollout.service.js';
 import { planManagedCiDeploy } from '../domain/services/managed-ci.service.js';
 import { resolveDevOpsSelection } from '../domain/spec/devops-selection.js';
 import { devOpsProviderRegistry } from '../domain/registry/devops.registry.js';
 import type { Project } from '../domain/entities/project.entity.js';
-import type { Environment } from '../domain/entities/environment.entity.js';
 import type { CommandContext } from '../application/context.js';
 import { projectField, envField } from './schemas.js';
 import { commandSuccess, commandError, wrapCommandHandler, HvError } from '../application/results.js';
@@ -56,7 +52,7 @@ import {
 import { planStripeEnvironmentSync } from '../domain/services/stripe-env.service.js';
 import { planEmail } from '../domain/services/email-plan.service.js';
 import { planTwilioMessaging } from '../domain/services/twilio-messaging.service.js';
-import { validateProjectSpecProviders } from '../domain/services/provider-spec-validation.js';
+import { firstProviderSpecValidationFailure } from '../domain/services/provider-spec-validation.js';
 import { buildManagedDatabaseEnvVars } from '../domain/services/database-env.js';
 import { buildCacheEnvVarsFromComponent } from '../domain/services/cache-env.js';
 import type { ObservedState } from '../domain/ports/observe.port.js';
@@ -73,28 +69,14 @@ import { parseEnvironmentMaintenanceBinding } from '../domain/services/environme
 export { bootstrapActionResultFromSummary } from '../application/apply-plan.js';
 
 function validateInstalledProviders(spec: ProjectSpec): void {
-  const issue = validateProjectSpecProviders(spec)[0];
-  if (!issue) return;
-  const label = issue.capability;
-  const engineIssue = issue.field.endsWith('.engine');
+  const failure = firstProviderSpecValidationFailure(spec);
+  if (!failure) return;
   throw new HvError(
     'VALIDATION',
-    engineIssue
-      ? `${issue.provider} does not support ${label} engine "${issue.engine}" in environment "${issue.environment}".`
-      : issue.field.startsWith('devops.')
-        ? `Unknown or incompatible ${label} provider "${issue.provider}".`
-        : `Unknown ${label} provider "${issue.provider}" in environment "${issue.environment}".`,
+    failure.message,
     {
-      hint: engineIssue
-        ? `Supported ${label} engines for ${issue.provider}: ${issue.available.join(', ') || 'none'}.`
-        : `Available ${label} providers: ${issue.available.join(', ')}.`,
-      details: {
-        path: issue.field.startsWith('devops.')
-          ? issue.field
-          : `environments.${issue.environment}.${issue.field}`,
-        capability: issue.capability,
-        ...(issue.engine ? { engine: issue.engine } : {}),
-      },
+      hint: failure.hint,
+      details: failure.details,
     }
   );
 }
@@ -657,11 +639,11 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
 
   commands.register(
     'hv_plan',
-    'Observe live infrastructure, diff it against the desired spec, and persist an executable plan. Returns planId plus a compact review of non-noop actions; hv_apply requires that planId. scope="retained-cleanup" isolates confirm-gated destruction of exact abandoned hosting, database, and provider-declared resource identities retained through hv_import; it excludes ordinary deployment, integrations, domain, email, and repository work. Missing connections block unsafe work. Delegated values are accepted only through secretRefs and are encrypted into the stored plan, never returned. Optional services restricts a full plan to selected services.',
+    'Observe live infrastructure, diff it against the desired spec, and persist an executable plan. Returns planId plus a compact review of non-noop actions; hv_apply requires that planId. scope="retained-cleanup" isolates confirm-gated destruction of exact abandoned hosting, database, cache, and provider-declared resource identities retained through hv_import; it excludes ordinary deployment, integrations, domain, email, and repository work. Missing connections block unsafe work. Delegated values are accepted only through secretRefs and are encrypted into the stored plan, never returned. Optional services restricts a full plan to selected services.',
     {
       project: projectField,
       env: envField,
-      scope: z.enum(['full', 'retained-cleanup']).optional().describe('Default full. Use retained-cleanup to persist only exact retained abandoned-host, database, or provider-resource destroy actions.'),
+      scope: z.enum(['full', 'retained-cleanup']).optional().describe('Default full. Use retained-cleanup to persist only exact retained abandoned-host, database, cache, or provider-resource destroy actions.'),
       services: z.array(z.string().min(1)).optional().describe('Restrict the plan to these spec services (partial deploy). Must be a subset of the spec services.'),
       envVars: z.record(z.string()).optional().describe('One-off env var overrides for this plan only; values are encrypted in the stored plan and win over .env and spec envVars at apply. Durable non-secret values belong in the spec.'),
       envFile: z.string().optional().describe('Local .env file to consider as deploy input. Defaults to .env.<env>, creating it from repo .env when missing and syncing newly added base keys when present. Selection follows spec envFile policy; values are encrypted in the stored plan and never returned.'),
@@ -690,6 +672,7 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
         }
       }
       const currentSpec = specStore.get(project)?.spec;
+      if (currentSpec) validateInstalledProviders(currentSpec);
       const result = await planService.plan(project, currentSpec ? commandEnvironment(currentSpec, env) : env?.trim() || 'staging', {
         ...(scope ? { scope } : {}),
         ...(services?.length ? { serviceFilter: services } : {}),
@@ -806,6 +789,7 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
       if (!specResult) {
         return commandError('NOT_FOUND', `Project "${project.name}" has no spec.`, { hint: 'Define one with hv_spec.' });
       }
+      validateInstalledProviders(specResult.spec);
       const envName = commandEnvironment(specResult.spec, env);
       const envSpec = specResult.spec.environments[envName];
       if (!envSpec) {
@@ -1182,6 +1166,7 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
       if (!specResult) {
         return commandError('NOT_FOUND', `Project "${project.name}" has no spec.`, { hint: 'hv_spec, then hv_plan.' });
       }
+      validateInstalledProviders(specResult.spec);
 
       const outcome = await executePlanApply(ctx, {
         project,
@@ -1191,6 +1176,13 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
         confirmActions: confirmActions ?? [],
       });
 
+      if (outcome.kind === 'invalid_spec') {
+        return commandError('VALIDATION', outcome.message, {
+          hint: outcome.hint,
+          details: outcome.details,
+          next: ['hv_spec', 'hv_plan'],
+        });
+      }
       if (outcome.kind === 'plan_not_found') {
         return commandError('NOT_FOUND', outcome.error, { next: ['hv_plan'] });
       }

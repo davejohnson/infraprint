@@ -1,5 +1,5 @@
 import type { Environment } from '../entities/environment.entity.js';
-import type { Component, ComponentType } from '../entities/component.entity.js';
+import type { Component } from '../entities/component.entity.js';
 import type { Receipt, TemporaryDatabaseAccess, VerifyResult } from './provider.port.js';
 import type { ObservedDatabase } from './observe.port.js';
 
@@ -23,10 +23,10 @@ export interface DatabaseCapabilities {
   /** Whether the provider supports connection pooling (important for serverless) */
   supportsPooling: boolean;
 
-  /** Whether read replicas can be provisioned */
+  /** Whether this adapter implements declarative read-replica lifecycle. */
   supportsReadReplicas: boolean;
 
-  /** Whether point-in-time recovery is available */
+  /** Whether this adapter implements declarative point-in-time recovery policy. */
   supportsPointInTimeRecovery: boolean;
 
   /** Whether the provider is optimized for serverless workloads */
@@ -54,6 +54,116 @@ export interface ProvisionResult {
 
   /** Additional environment variables to set (e.g., individual host/port/user/pass) */
   envVars?: Record<string, string>;
+}
+
+/** Non-secret logical placement used to scope database observation/mutation. */
+export interface DatabaseTargetOptions {
+  /** Logical Hypervibe project name used only for provider-owned deterministic naming. */
+  projectName?: string;
+  /** Hosting placement inherited by same-cloud database providers. */
+  region?: string;
+}
+
+/**
+ * Durable blocker for a datastore create request whose provider-assigned resource ID was
+ * not returned and whose outcome could not be resolved by bounded observation.
+ * The marker is deliberately not a provider identity and must never be used as
+ * a destroy target. It preserves only the exact deterministic lookup name and
+ * non-secret provider scope needed to prevent another create.
+ */
+export interface UnresolvedDatastoreCreateMutation {
+  resourceKind: 'database' | 'cache';
+  operation: 'create';
+  resourceName: string;
+  providerScope: Record<string, string>;
+}
+
+export function createUnresolvedDatastoreMutation(
+  resourceKind: 'database' | 'cache',
+  resourceName: string,
+  providerScope: Record<string, string>
+): UnresolvedDatastoreCreateMutation {
+  const normalizedName = resourceName.trim();
+  const scope = Object.fromEntries(
+    Object.entries(providerScope)
+      .map(([key, value]) => [key.trim(), value.trim()] as const)
+      .sort(([left], [right]) => left.localeCompare(right))
+  );
+  if (!normalizedName || Object.keys(scope).length === 0
+    || Object.entries(scope).some(([key, value]) => !key || !value)) {
+    throw new Error('An unresolved datastore create requires an exact resource name and complete provider scope.');
+  }
+  return {
+    resourceKind,
+    operation: 'create',
+    resourceName: normalizedName,
+    providerScope: scope,
+  };
+}
+
+export function createUnresolvedDatabaseMutation(
+  resourceName: string,
+  providerScope: Record<string, string>
+): UnresolvedDatastoreCreateMutation & { resourceKind: 'database' } {
+  return createUnresolvedDatastoreMutation(
+    'database',
+    resourceName,
+    providerScope
+  ) as UnresolvedDatastoreCreateMutation & { resourceKind: 'database' };
+}
+
+export function parseUnresolvedDatastoreMutation(
+  bindings: unknown,
+  expectedKind?: 'database' | 'cache'
+): UnresolvedDatastoreCreateMutation | null {
+  if (!bindings || typeof bindings !== 'object' || Array.isArray(bindings)) return null;
+  const raw = (bindings as Record<string, unknown>).unresolvedMutation;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const marker = raw as Record<string, unknown>;
+  if (!['database', 'cache'].includes(String(marker.resourceKind))
+    || (expectedKind && marker.resourceKind !== expectedKind)
+    || marker.operation !== 'create') return null;
+  if (Object.keys(marker).some((key) => (
+    !['resourceKind', 'operation', 'resourceName', 'providerScope'].includes(key)
+  ))) return null;
+  if (typeof marker.resourceName !== 'string' || !marker.resourceName.trim()) return null;
+  if (!marker.providerScope || typeof marker.providerScope !== 'object'
+    || Array.isArray(marker.providerScope)) return null;
+  const entries = Object.entries(marker.providerScope as Record<string, unknown>);
+  if (entries.length === 0 || entries.some(([key, value]) => (
+    !key.trim() || typeof value !== 'string' || !value.trim()
+  ))) return null;
+  return createUnresolvedDatastoreMutation(
+    marker.resourceKind as 'database' | 'cache',
+    marker.resourceName,
+    Object.fromEntries(entries) as Record<string, string>
+  );
+}
+
+export function parseUnresolvedDatabaseMutation(
+  bindings: unknown
+): (UnresolvedDatastoreCreateMutation & { resourceKind: 'database' }) | null {
+  return parseUnresolvedDatastoreMutation(bindings, 'database') as
+    | (UnresolvedDatastoreCreateMutation & { resourceKind: 'database' })
+    | null;
+}
+
+/** A rejected 4xx create is definitive except request timeout; transport
+ * failures, HTTP 408/5xx, and malformed successful responses remain possibly
+ * committed. */
+export function databaseCreateMayHaveCommitted(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return true;
+  const candidate = error as {
+    status?: unknown;
+    statusCode?: unknown;
+    $metadata?: { httpStatusCode?: unknown };
+  };
+  const status = [
+    candidate.status,
+    candidate.statusCode,
+    candidate.$metadata?.httpStatusCode,
+  ].find((value): value is number => typeof value === 'number' && Number.isInteger(value));
+  return status === undefined || status === 408 || status < 400 || status >= 500;
 }
 
 /**
@@ -105,6 +215,9 @@ export interface IDatabaseAdapter {
    * Disconnect and clean up
    */
   disconnect?(): Promise<void>;
+
+  /** Configure read scope before observation. This method must not mutate. */
+  configureTarget?(target: DatabaseTargetOptions): void | Promise<void>;
 
   /**
    * Provision a new database instance.
@@ -172,4 +285,19 @@ export interface IDatabaseAdapter {
     component: Component,
     access: TemporaryDatabaseAccess
   ): Promise<void>;
+}
+
+/** Runtime proof for every method required by the database lifecycle contract. */
+export function supportsDatabaseLifecycle(value: unknown): value is IDatabaseAdapter {
+  if (!value || typeof value !== 'object') return false;
+  const adapter = value as Partial<IDatabaseAdapter>;
+  return typeof adapter.name === 'string'
+    && Boolean(adapter.capabilities)
+    && Array.isArray(adapter.capabilities?.supportedDatabases)
+    && typeof adapter.connect === 'function'
+    && typeof adapter.verify === 'function'
+    && typeof adapter.provision === 'function'
+    && typeof adapter.observeDatabase === 'function'
+    && typeof adapter.getConnectionUrl === 'function'
+    && typeof adapter.destroy === 'function';
 }

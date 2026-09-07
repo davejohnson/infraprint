@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { GitHubAdapter } from '../github.adapter.js';
+import { GitHubActionsOperationsAdapter } from '../github-devops.adapter.js';
+import { providerRegistry } from '../../../../domain/registry/provider.registry.js';
 
 function response(body: unknown, status = 200): Response {
   return new Response(body === undefined ? undefined : JSON.stringify(body), {
@@ -18,6 +20,24 @@ function connectedAdapter(): GitHubAdapter {
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+});
+
+describe('GitHub provider inspection', () => {
+  it('reports missing branch protection as absent instead of present with null data', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(response({ message: 'Branch not protected' }, 404));
+    const inspection = providerRegistry.get('github')!.inspection!;
+
+    await expect(inspection.inspect(connectedAdapter(), {
+      resource: 'branch-protection',
+      scope: 'dave/app',
+      name: 'main',
+      limit: 25,
+    })).resolves.toMatchObject({
+      observation: 'absent',
+      branch: 'main',
+      protection: null,
+    });
+  });
 });
 
 describe('GitHub Pages health', () => {
@@ -81,6 +101,26 @@ describe('GitHub Actions environment variables', () => {
       'https://api.github.com/repos/dave/app/environments/staging/variables/HYPERVIBE_APPLIED_SPEC_HASH',
       expect.objectContaining({ method: 'GET' })
     );
+  });
+
+  it('classifies absence by the provider status instead of error-message text', async () => {
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(response({ message: 'resource unavailable' }, 404))
+      .mockResolvedValueOnce(response({ message: 'Not Found' }, 403));
+    const adapter = connectedAdapter();
+
+    await expect(adapter.getEnvironmentVariable(
+      'dave',
+      'app',
+      'staging',
+      'MISSING'
+    )).resolves.toBeNull();
+    await expect(adapter.getEnvironmentVariable(
+      'dave',
+      'app',
+      'staging',
+      'FORBIDDEN'
+    )).rejects.toMatchObject({ status: 403 });
   });
 
   it('creates a missing GitHub environment and its hash variable', async () => {
@@ -211,6 +251,39 @@ describe('GitHub Actions release evidence', () => {
       'https://api.github.com/repos/dave/app/actions/runs/42/artifacts?per_page=100',
       expect.objectContaining({ method: 'GET' })
     );
+  });
+
+  it('honors the canonical artifact limit for a run-scoped read', async () => {
+    const artifacts = [1, 2, 3].map((id) => ({
+      id,
+      name: `artifact-${id}`,
+      expired: false,
+      created_at: '2026-07-31T10:00:00Z',
+      updated_at: '2026-07-31T10:00:00Z',
+      workflow_run: {
+        id: 42,
+        repository_id: 1,
+        head_repository_id: 1,
+        head_branch: 'main',
+        head_sha: 'a'.repeat(40),
+      },
+    }));
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(response({ total_count: 3, artifacts }));
+    const operations = new GitHubActionsOperationsAdapter(connectedAdapter());
+
+    await expect(operations.listArtifacts({
+      provider: 'github',
+      nativeId: '1',
+      instanceScope: 'https://github.com',
+      canonicalScope: 'https://github.com/dave/app',
+      path: 'dave/app',
+      defaultBranch: 'main',
+      webUrl: 'https://github.com/dave/app',
+      cloneUrls: ['https://github.com/dave/app.git'],
+    }, '42', 2)).resolves.toEqual([
+      expect.objectContaining({ id: '1' }),
+      expect.objectContaining({ id: '2' }),
+    ]);
   });
 });
 

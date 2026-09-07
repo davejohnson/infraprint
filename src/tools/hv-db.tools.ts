@@ -2,10 +2,15 @@ import type { CommandRegistrar } from '../application/commands.js';
 import { createHash } from 'crypto';
 import { z } from 'zod';
 import {
-  DatabaseAdapter,
+  supportsDatabaseQuery,
+  type DatabaseQueryCredentials,
+  type DatabaseQueryResult,
+} from '../domain/ports/database-query.port.js';
+import {
+  analyzeSqlQuery,
   stripSqlLiteralsAndComments,
-  type DatabaseCredentials,
-} from '../adapters/providers/database/database.adapter.js';
+} from '../domain/services/sql-query-analysis.js';
+import { providerRegistry } from '../domain/registry/provider.registry.js';
 import {
   isExternallyUsableDatabaseUrl,
   isPostgresDatabaseUrl,
@@ -88,7 +93,7 @@ async function resolveConfiguredTarget(
         ...connectionSetupOptions('database', { project: opts.project, scope: opts.connectionName }),
       });
     }
-    const creds = ctx.secretStore.decryptObject<DatabaseCredentials>(connection.credentialsEncrypted);
+    const creds = ctx.secretStore.decryptObject<DatabaseQueryCredentials>(connection.credentialsEncrypted);
     assertPostgresTarget(creds.connectionUrl, `connection: ${opts.connectionName}`);
     return { url: creds.connectionUrl, source: `connection: ${opts.connectionName}` };
   }
@@ -171,8 +176,7 @@ export function registerHvDbTools(commands: CommandRegistrar, ctx: CommandContex
           });
         }
       }
-      const dbAdapter = new DatabaseAdapter();
-      const analysis = dbAdapter.analyzeQuery(sql);
+      const analysis = analyzeSqlQuery(sql);
 
       if (analysis.multiStatement) {
         return commandError('VALIDATION', 'Multi-statement SQL is not allowed.', {
@@ -194,13 +198,18 @@ export function registerHvDbTools(commands: CommandRegistrar, ctx: CommandContex
       const target = await resolveTemporaryExternalTarget(ctx, { connectionUrl, connectionName, project, env, service });
       const lease = target.databaseAccess;
       const startedAt = Date.now();
-      let result: Awaited<ReturnType<DatabaseAdapter['query']>> | undefined;
+      let result: DatabaseQueryResult | undefined;
       let queryError: unknown;
       let cleanup: DatabaseAccessCleanup = { status: 'no_op' };
       try {
         result = await lease.withConnection(async (resolvedUrl) => {
-          dbAdapter.connect({ connectionUrl: resolvedUrl });
-          return dbAdapter.query(sql, params, { readOnly: !analysis.isMutation });
+          const adapter = await providerRegistry.createAdapter('database', {
+            connectionUrl: resolvedUrl,
+          });
+          if (!supportsDatabaseQuery(adapter)) {
+            throw new Error('The registered operational database adapter does not implement bounded query execution.');
+          }
+          return adapter.query(sql, params, { readOnly: !analysis.isMutation });
         });
       } catch (error) {
         queryError = error;

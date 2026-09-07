@@ -43,6 +43,7 @@ function server(
       fullyQualifiedDomainName: `${SERVER_NAME}.postgres.database.azure.com`,
       administratorLogin: 'hypervibeadmin',
       version: '16',
+      network: { publicNetworkAccess: 'Enabled' },
     },
     ...overrides,
   };
@@ -53,7 +54,12 @@ function environment(): Environment {
     id: 'env-local',
     projectId: 'project-local',
     name: 'production',
-    platformBindings: {},
+    platformBindings: {
+      provider: 'azure-container-apps',
+      projectId: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+      environmentId: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/managedEnvironments/hv-production`,
+      services: {},
+    },
     createdAt: new Date(),
     updatedAt: new Date(),
   };
@@ -96,8 +102,46 @@ afterEach(() => {
 });
 
 describe('AzurePostgresAdapter', () => {
+  it('inspects an exact ARM id without a credential resource-group scope', async () => {
+    const paths: string[] = [];
+    installAzureFetch((url, method) => {
+      paths.push(`${method} ${url.pathname}`);
+      if (method === 'GET' && url.pathname.endsWith(`/flexibleServers/${SERVER_NAME}`)) {
+        return jsonResponse(server());
+      }
+      throw new Error(`unexpected request: ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+
+    await expect(adapter.inspectDatabaseResources({
+      resource: 'database',
+      id: SERVER_ID,
+      limit: 1,
+    })).resolves.toMatchObject({
+      observation: 'present',
+      databases: [{ id: SERVER_ID }],
+    });
+    expect(paths).toEqual([`GET ${SERVER_ID}`]);
+  });
+
+  it('rejects a malformed successful exact database observation', async () => {
+    installAzureFetch((url, method) => {
+      if (method === 'GET' && url.pathname.endsWith('/databases/app')) {
+        return jsonResponse({});
+      }
+      throw new Error(`unexpected request: ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+
+    await expect((adapter as any).client.getDatabase(SERVER_ID, 'app'))
+      .rejects.toThrow('without an ID');
+  });
+
   it('inventories bounded servers with subscription and resource-group scope', async () => {
     installAzureFetch((url, method) => {
+      if (method === 'GET' && url.pathname.endsWith(`/resourceGroups/${RESOURCE_GROUP}`)) {
+        return jsonResponse({ id: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}` });
+      }
       if (method === 'GET' && url.pathname.endsWith('/flexibleServers')) {
         return jsonResponse({
           value: [
@@ -114,7 +158,11 @@ describe('AzurePostgresAdapter', () => {
     });
     const adapter = await connected();
 
-    const result = await adapter.inspectDatabaseResources({ resource: 'database', limit: 1 });
+    const result = await adapter.inspectDatabaseResources({
+      resource: 'database',
+      scope: RESOURCE_GROUP,
+      limit: 1,
+    });
 
     expect(result).toMatchObject({
       observation: 'present',
@@ -125,12 +173,79 @@ describe('AzurePostgresAdapter', () => {
         providerScope: {
           subscriptionId: SUBSCRIPTION_ID,
           resourceGroup: RESOURCE_GROUP,
-          location: 'canadacentral',
         },
       }],
       truncated: true,
       partial: false,
     });
+  });
+
+  it('derives list scope from an exact Azure Container Apps binding', async () => {
+    const paths: string[] = [];
+    installAzureFetch((url, method) => {
+      paths.push(`${method} ${url.pathname}`);
+      if (method === 'GET' && url.pathname.endsWith(`/resourceGroups/${RESOURCE_GROUP}`)) {
+        return jsonResponse({ id: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}` });
+      }
+      if (method === 'GET' && url.pathname.endsWith('/flexibleServers')) {
+        return jsonResponse({ value: [server()] });
+      }
+      throw new Error(`unexpected request: ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+
+    await expect(adapter.inspectDatabaseResources({
+      resource: 'database',
+      name: SERVER_NAME,
+      binding: {
+        provider: 'azure-container-apps',
+        projectId: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+        environmentId: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/managedEnvironments/hv-production`,
+      },
+      limit: 1,
+    })).resolves.toMatchObject({
+      observation: 'present',
+      databases: [{ id: SERVER_ID }],
+    });
+    expect(paths).toEqual([
+      `GET /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+      `GET /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DBforPostgreSQL/flexibleServers`,
+    ]);
+  });
+
+  it('does not derive list scope from an undeclared hosting binding', async () => {
+    const fetchMock = installAzureFetch((url, method) => {
+      throw new Error(`unexpected request: ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+
+    await expect(adapter.inspectDatabaseResources({
+      resource: 'database',
+      binding: {
+        provider: 'railway',
+        projectId: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+      },
+      limit: 1,
+    })).rejects.toThrow(/explicit Azure resource-group scope or compatible Azure Container Apps/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('proves initial absence only through the deterministic ACA resource group', async () => {
+    const paths: string[] = [];
+    installAzureFetch((url, method) => {
+      paths.push(`${method} ${url.pathname}`);
+      return jsonResponse({ error: 'absent' }, 404);
+    });
+    const adapter = await connected();
+    adapter.configureTarget({ projectName: 'invoice-perfect' });
+    const unbound = environment();
+    unbound.platformBindings = {};
+
+    await expect(adapter.observeDatabase(unbound, null, {
+      resourceName: SERVER_NAME,
+    })).resolves.toBeNull();
+    expect(paths).toHaveLength(1);
+    expect(paths[0]).toMatch(/^GET \/subscriptions\/.*\/resourceGroups\/hv-invoice-perfect-production-[0-9a-f]{8}$/);
   });
 
   it('creates a server and logical database while keeping receipts secret-safe', async () => {
@@ -141,6 +256,12 @@ describe('AzurePostgresAdapter', () => {
     }> = [];
     installAzureFetch((url, method, body) => {
       requests.push({ method, pathname: url.pathname, body });
+      if (method === 'GET' && url.pathname.endsWith(`/resourceGroups/${RESOURCE_GROUP}`)) {
+        return jsonResponse({
+          id: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+          tags: { 'managed-by': 'hypervibe', 'hypervibe-environment-id': 'env-local' },
+        });
+      }
       if (method === 'GET' && url.pathname.endsWith('/flexibleServers')) {
         return jsonResponse({ value: [] });
       }
@@ -221,6 +342,12 @@ describe('AzurePostgresAdapter', () => {
 
   it('blocks name-match adoption and never issues a create', async () => {
     const fetchMock = installAzureFetch((url, method) => {
+      if (method === 'GET' && url.pathname.endsWith(`/resourceGroups/${RESOURCE_GROUP}`)) {
+        return jsonResponse({
+          id: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+          tags: { 'managed-by': 'hypervibe', 'hypervibe-environment-id': 'env-local' },
+        });
+      }
       if (method === 'GET' && url.pathname.endsWith('/flexibleServers')) {
         return jsonResponse({ value: [server()] });
       }
@@ -240,6 +367,12 @@ describe('AzurePostgresAdapter', () => {
 
   it('preserves the reviewed resource id after an unknown create outcome', async () => {
     installAzureFetch((url, method) => {
+      if (method === 'GET' && url.pathname.endsWith(`/resourceGroups/${RESOURCE_GROUP}`)) {
+        return jsonResponse({
+          id: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+          tags: { 'managed-by': 'hypervibe', 'hypervibe-environment-id': 'env-local' },
+        });
+      }
       if (method === 'GET' && url.pathname.endsWith('/flexibleServers')) {
         return jsonResponse({ value: [] });
       }
@@ -264,6 +397,7 @@ describe('AzurePostgresAdapter', () => {
 
   it('opens and removes an operation-scoped firewall rule for portable data access', async () => {
     const requests: Array<{ method: string; pathname: string; body: any }> = [];
+    let deleted = false;
     installAzureFetch((url, method, body) => {
       if (url.hostname === 'checkip.amazonaws.com') {
         return new Response('203.0.113.24\n');
@@ -271,12 +405,16 @@ describe('AzurePostgresAdapter', () => {
       requests.push({ method, pathname: url.pathname, body });
       if (url.pathname.includes('/firewallRules/hypervibe-operation-')) {
         if (method === 'PUT') return accepted();
+        if (method === 'GET' && deleted) return jsonResponse({ error: 'gone' }, 404);
         if (method === 'GET') return jsonResponse({
-          id: `${SERVER_ID}/firewallRules/temporary`,
-          name: 'temporary',
+          id: url.pathname,
+          name: url.pathname.split('/').at(-1),
           properties: { startIpAddress: '203.0.113.24', endIpAddress: '203.0.113.24' },
         });
-        if (method === 'DELETE') return accepted();
+        if (method === 'DELETE') {
+          deleted = true;
+          return accepted();
+        }
       }
       throw new Error(`Unexpected ${method} ${url.pathname}`);
     });
@@ -285,7 +423,12 @@ describe('AzurePostgresAdapter', () => {
       id: 'component',
       environmentId: 'env-local',
       type: 'postgres',
-      bindings: { connectionString: 'postgresql://user:password@server.example.com/app?sslmode=require' },
+      bindings: {
+        provider: 'azure-postgres',
+        instanceId: SERVER_ID,
+        providerScope: { subscriptionId: SUBSCRIPTION_ID, resourceGroup: RESOURCE_GROUP },
+        connectionString: 'postgresql://user:password@server.example.com/app?sslmode=require',
+      },
       externalId: SERVER_ID,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -302,11 +445,47 @@ describe('AzurePostgresAdapter', () => {
     expect(requests.some((request) => request.method === 'DELETE' && request.pathname.includes('/firewallRules/hypervibe-operation-'))).toBe(true);
   });
 
+  it('refuses temporary firewall mutation for an unscoped legacy binding', async () => {
+    const fetchMock = installAzureFetch((url, method) => {
+      throw new Error(`Unexpected ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+
+    await expect(adapter.acquireTemporaryDatabaseAccess(environment(), {
+      id: 'component',
+      environmentId: 'env-local',
+      type: 'postgres',
+      bindings: {
+        provider: 'azure-postgres',
+        instanceId: SERVER_ID,
+        connectionString: 'postgresql://user:password@server.example.com/app?sslmode=require',
+      },
+      externalId: SERVER_ID,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }, 5432)).rejects.toThrow(/missing its durable subscription\/resource-group provider scope/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('resolves durable ids before names and treats only 404 as absence', async () => {
     let listCalled = false;
     installAzureFetch((url, method) => {
       if (method === 'GET' && url.pathname.endsWith(`/flexibleServers/${SERVER_NAME}`)) {
         return jsonResponse(server());
+      }
+      if (method === 'GET' && url.pathname.endsWith('/firewallRules/hypervibe-azure-services')) {
+        return jsonResponse({
+          id: `${SERVER_ID}/firewallRules/hypervibe-azure-services`,
+          name: 'hypervibe-azure-services',
+          properties: { startIpAddress: '0.0.0.0', endIpAddress: '0.0.0.0' },
+        });
+      }
+      if (method === 'GET' && url.pathname.endsWith('/databases/app')) {
+        return jsonResponse({
+          id: `${SERVER_ID}/databases/app`,
+          name: 'app',
+          properties: { charset: 'UTF8', collation: 'en_US.utf8' },
+        });
       }
       if (url.pathname.endsWith('/flexibleServers')) listCalled = true;
       throw new Error(`Unexpected ${method} ${url.pathname}`);
@@ -319,7 +498,10 @@ describe('AzurePostgresAdapter', () => {
         id: 'component',
         environmentId: 'env-local',
         type: 'postgres',
-        bindings: { provider: 'azure-postgres' },
+        bindings: {
+          provider: 'azure-postgres',
+          providerScope: { subscriptionId: SUBSCRIPTION_ID, resourceGroup: RESOURCE_GROUP },
+        },
         externalId: SERVER_ID,
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -340,12 +522,70 @@ describe('AzurePostgresAdapter', () => {
         id: 'component',
         environmentId: 'env-local',
         type: 'postgres',
-        bindings: { provider: 'azure-postgres' },
+        bindings: {
+          provider: 'azure-postgres',
+          providerScope: { subscriptionId: SUBSCRIPTION_ID, resourceGroup: RESOURCE_GROUP },
+        },
         externalId: SERVER_ID,
         createdAt: new Date(),
         updatedAt: new Date(),
       }
     )).rejects.toMatchObject({ status: 403 });
+  });
+
+  it('rejects legacy exact-id bindings without durable provider scope', async () => {
+    const fetchMock = installAzureFetch((url, method) => {
+      throw new Error(`Unexpected ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+    const legacy = {
+      id: 'component',
+      environmentId: 'env-local',
+      type: 'postgres' as const,
+      bindings: { provider: 'azure-postgres', instanceId: SERVER_ID },
+      externalId: SERVER_ID,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    await expect(adapter.observeDatabase(environment(), legacy))
+      .rejects.toThrow(/missing its durable subscription\/resource-group provider scope/);
+    await expect(adapter.destroy(legacy)).resolves.toMatchObject({
+      success: false,
+      error: expect.stringMatching(/missing its durable subscription\/resource-group provider scope/),
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('blocks observation when the public ACA connectivity contract drifts', async () => {
+    installAzureFetch((url, method) => {
+      if (method === 'GET' && url.pathname.endsWith(`/flexibleServers/${SERVER_NAME}`)) {
+        return jsonResponse(server({
+          properties: {
+            ...(server().properties as Record<string, unknown>),
+            network: { publicNetworkAccess: 'Disabled' },
+          },
+        }));
+      }
+      throw new Error(`Unexpected ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+    adapter.configureTarget({ projectName: 'invoice-perfect' });
+
+    await expect(adapter.observeDatabase(environment(), {
+      id: 'component',
+      environmentId: 'env-local',
+      type: 'postgres',
+      bindings: {
+        provider: 'azure-postgres',
+        instanceId: SERVER_ID,
+        providerScope: { subscriptionId: SUBSCRIPTION_ID, resourceGroup: RESOURCE_GROUP },
+        database: 'app',
+      },
+      externalId: SERVER_ID,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })).rejects.toThrow(/publicNetworkAccess Enabled/);
   });
 
   it('makes deletion idempotent and verifies terminal absence', async () => {
@@ -369,7 +609,11 @@ describe('AzurePostgresAdapter', () => {
       id: 'component',
       environmentId: 'env-local',
       type: 'postgres' as const,
-      bindings: { provider: 'azure-postgres', instanceId: SERVER_ID },
+      bindings: {
+        provider: 'azure-postgres',
+        instanceId: SERVER_ID,
+        providerScope: { subscriptionId: SUBSCRIPTION_ID, resourceGroup: RESOURCE_GROUP },
+      },
       externalId: SERVER_ID,
       createdAt: new Date(),
       updatedAt: new Date(),

@@ -16,6 +16,7 @@ import { adapterFactory } from '../../services/adapter.factory.js';
 import type { ObservedState } from '../../ports/observe.port.js';
 import type { Project } from '../../entities/project.entity.js';
 import { PlanService } from '../plan.service.js';
+import { CACHE_OPERATIONS } from '../../services/cache-plan.service.js';
 
 const originalCwd = process.cwd();
 let project: Project;
@@ -245,6 +246,73 @@ describe('PlanService retained-cleanup scope', () => {
     expect(document).toMatchObject({ scope: 'retained-cleanup', actions: plan.actions });
   });
 
+  it('plans one exact confirmation-gated retained cache destroy without unrelated actions', async () => {
+    arrangeEnvironment('railway');
+    const environment = new EnvironmentRepository().findByProjectAndName(project.id, 'production')!;
+    new EnvironmentRepository().updatePlatformBindings(environment.id, {
+      previousCache: {
+        provider: 'memorystore',
+        externalId: 'projects/gcp/locations/us-west1/instances/legacy-cache',
+        engine: 'redis',
+        providerEngine: 'redis',
+        name: 'legacy-cache',
+        providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+      },
+    });
+    const disconnect = vi.fn(async () => {});
+    vi.spyOn(adapterFactory, 'getCacheAdapter').mockResolvedValue({
+      success: true,
+      adapter: {
+        name: 'memorystore',
+        capabilities: {
+          supportedCaches: ['redis'],
+          supportsTls: true,
+          supportsHighAvailability: true,
+          supportsPersistence: true,
+          serverlessOptimized: false,
+        },
+        connect: async () => {},
+        verify: async () => ({ success: true }),
+        disconnect,
+        provision: async () => { throw new Error('unused'); },
+        observeCache: async () => ({
+          provider: 'memorystore',
+          engine: 'redis',
+          externalId: 'projects/gcp/locations/us-west1/instances/legacy-cache',
+          providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+          name: 'legacy-cache',
+          status: 'running',
+        }),
+        getConnectionUrl: async () => null,
+        destroy: async () => { throw new Error('unused'); },
+      },
+    });
+
+    const result = await new PlanService().plan(project, 'production', cleanupOptions);
+
+    expect(result).not.toHaveProperty('error');
+    const plan = result as Exclude<typeof result, { error: string }>;
+    expect(plan.actions).toEqual([expect.objectContaining({
+      id: 'cache:memorystore:retained-destroy',
+      type: 'destroy',
+      resource: { kind: 'cache', name: 'redis', provider: 'memorystore' },
+      verified: true,
+      dataBearing: true,
+      requiresConfirm: true,
+      metadata: {
+        operation: CACHE_OPERATIONS.retainedDestroy,
+        externalId: 'projects/gcp/locations/us-west1/instances/legacy-cache',
+        name: 'legacy-cache',
+        engine: 'redis',
+        providerEngine: 'redis',
+        providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+      },
+    })]);
+    expect(disconnect).toHaveBeenCalledOnce();
+    const document = new RunRepository().findById(plan.planRunId)!.plan as Record<string, unknown>;
+    expect(document).toMatchObject({ scope: 'retained-cleanup', actions: plan.actions });
+  });
+
   it('plans one exact confirmation-gated provider resource destroy without unrelated actions', async () => {
     arrangeEnvironment('railway');
     const environment = new EnvironmentRepository().findByProjectAndName(project.id, 'production')!;
@@ -350,6 +418,7 @@ describe('PlanService retained-cleanup scope', () => {
         provider: 'cloudsql',
         externalId: 'legacy-production-db',
         engine: 'postgres',
+        name: 'legacy-production-db',
         providerScope: { projectId: 'gcp-project', region: 'us-west1' },
       },
     });

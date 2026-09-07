@@ -27,4 +27,23 @@ describe('cache spec schema', () => {
     });
     expect(parsed.environments.staging.database).toBeUndefined();
   });
+
+  it('keeps cache placement in desired state and trims provider-native options', () => {
+    expect(cacheSpecSchema.parse({
+      provider: 'memorystore',
+      region: ' europe-west1 ',
+      network: ' app-vpc ',
+      subnetwork: ' app-subnet ',
+      tier: ' STANDARD_HA ',
+      size: ' 5gb ',
+    })).toEqual({
+      provider: 'memorystore',
+      engine: 'redis',
+      region: 'europe-west1',
+      network: 'app-vpc',
+      subnetwork: 'app-subnet',
+      tier: 'STANDARD_HA',
+      size: '5gb',
+    });
+  });
 });

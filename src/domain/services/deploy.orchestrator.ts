@@ -3,7 +3,13 @@ import type { Environment } from '../entities/environment.entity.js';
 import { serviceWorkloadKind, type Service } from '../entities/service.entity.js';
 import type { Run, RunPlan, RunStep, RunReceipt } from '../entities/run.entity.js';
 import type { IProviderAdapter } from '../ports/provider.port.js';
-import type { IHostingAdapter, HostingBindings } from '../ports/hosting.port.js';
+import {
+  createHostingServiceCreateRecovery,
+  parseHostingServiceCreateRecovery,
+  type HostingBindings,
+  type HostingServiceCreateRecovery,
+  type IHostingAdapter,
+} from '../ports/hosting.port.js';
 import { RunRepository } from '../../adapters/db/repositories/run.repository.js';
 import { EnvironmentRepository } from '../../adapters/db/repositories/environment.repository.js';
 import { ServiceRepository } from '../../adapters/db/repositories/service.repository.js';
@@ -132,6 +138,7 @@ export class DeployOrchestrator {
     const serviceUrls: Record<string, string> = {};
     const errors: string[] = [];
     const tx = new InfraTransaction();
+    const pendingServiceCreateRecoveries = new Map<string, HostingServiceCreateRecovery>();
 
     // Create run record
     const run = this.runRepo.create({
@@ -157,6 +164,12 @@ export class DeployOrchestrator {
     try {
       for (const step of plan.steps) {
         const receipt = await this.executeStep(step, options, tx);
+        if (receipt.status === 'failure' && typeof receipt.result?.service === 'string') {
+          const recovery = parseHostingServiceCreateRecovery(receipt.result.serviceCreateRecovery);
+          if (recovery) {
+            pendingServiceCreateRecoveries.set(receipt.result.service, recovery);
+          }
+        }
         this.runRepo.addReceipt(run.id, receipt);
 
         if (receipt.status === 'failure') {
@@ -177,6 +190,11 @@ export class DeployOrchestrator {
       let rollback: InfraTransactionRollbackResult | undefined;
       if (hasErrors) {
         rollback = await tx.rollback();
+        const recoveryPersistenceError = this.persistServiceCreateRecoveries(
+          options.environment.id,
+          pendingServiceCreateRecoveries
+        );
+        if (recoveryPersistenceError) errors.push(recoveryPersistenceError);
       }
       this.runRepo.updateStatus(
         run.id,
@@ -203,13 +221,18 @@ export class DeployOrchestrator {
       };
     } catch (error) {
       const rollback = await tx.rollback();
-      this.runRepo.updateStatus(run.id, 'failed', String(error));
+      const recoveryPersistenceError = this.persistServiceCreateRecoveries(
+        options.environment.id,
+        pendingServiceCreateRecoveries
+      );
+      const caughtErrors = [String(error), ...(recoveryPersistenceError ? [recoveryPersistenceError] : [])];
+      this.runRepo.updateStatus(run.id, 'failed', caughtErrors.join('; '));
 
       this.auditRepo.create({
         action: 'deploy.failed',
         resourceType: 'run',
         resourceId: run.id,
-        details: { error: String(error) },
+        details: { error: caughtErrors.join('; ') },
       });
 
       return {
@@ -218,11 +241,86 @@ export class DeployOrchestrator {
         urls,
         serviceUrls,
         primaryUrl: urls[0],
-        errors: [...errors, String(error)],
+        errors: [...errors, ...caughtErrors],
         createdResources: tx.listResources(),
         rollback,
       };
     }
+  }
+
+  /**
+   * Rollback restores the pre-run environment snapshot. A create whose result
+   * is unresolved or only partially identified must survive that rollback so
+   * a later deploy cannot issue a second create. Recovery markers are hints,
+   * not normal service bindings or deletion authority.
+   */
+  private persistServiceCreateRecoveries(
+    environmentId: string,
+    recoveries: ReadonlyMap<string, HostingServiceCreateRecovery>
+  ): string | undefined {
+    if (recoveries.size === 0) return undefined;
+    try {
+      const environment = this.envRepo.findById(environmentId);
+      if (!environment) {
+        return `Failed to retain service-create recovery state: environment ${environmentId} is missing.`;
+      }
+      const rawRecovery = (environment.platformBindings as Record<string, unknown>).serviceCreateRecovery;
+      const currentRecovery = rawRecovery && typeof rawRecovery === 'object' && !Array.isArray(rawRecovery)
+        ? { ...(rawRecovery as Record<string, unknown>) }
+        : {};
+      for (const [serviceName, recovery] of recoveries) {
+        currentRecovery[serviceName] = recovery;
+      }
+      const updated = this.envRepo.updatePlatformBindings(environmentId, {
+        serviceCreateRecovery: currentRecovery,
+      });
+      return updated
+        ? undefined
+        : `Failed to retain service-create recovery state for environment ${environmentId}.`;
+    } catch (error) {
+      return `Failed to retain service-create recovery state for environment ${environmentId}: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  private validateServiceCreateRecovery(input: {
+    value: unknown;
+    adapterName: string;
+    bindings: Partial<HostingBindings>;
+    receiptEnvironmentId?: string;
+    externalId?: string;
+  }): { recovery?: HostingServiceCreateRecovery; error?: string } {
+    if (input.value === undefined) return {};
+    const recovery = parseHostingServiceCreateRecovery(input.value);
+    if (!recovery) {
+      return { error: 'Provider returned malformed service-create recovery state; it was not accepted as a binding.' };
+    }
+    if (recovery.provider !== input.adapterName) {
+      return { error: `Provider returned service-create recovery state for ${recovery.provider}, not ${input.adapterName}; it was not accepted as a binding.` };
+    }
+
+    const expectedProjectId = typeof input.bindings.projectId === 'string'
+      && input.bindings.projectId.trim().length > 0
+      ? input.bindings.projectId
+      : undefined;
+    const expectedEnvironmentId = typeof input.receiptEnvironmentId === 'string'
+      && input.receiptEnvironmentId.trim().length > 0
+      ? input.receiptEnvironmentId
+      : typeof input.bindings.environmentId === 'string'
+        && input.bindings.environmentId.trim().length > 0
+        ? input.bindings.environmentId
+        : undefined;
+    if ((expectedProjectId && recovery.providerScope.projectId !== expectedProjectId)
+      || (expectedEnvironmentId && recovery.providerScope.environmentId !== expectedEnvironmentId)) {
+      return { error: 'Provider returned service-create recovery state for a different project or environment; it was not accepted as a binding.' };
+    }
+
+    const externalId = typeof input.externalId === 'string' && input.externalId.trim().length > 0
+      ? input.externalId
+      : undefined;
+    if (recovery.serviceId !== externalId) {
+      return { error: 'Provider returned inconsistent service-create recovery identity; it was not accepted as a binding.' };
+    }
+    return { recovery };
   }
 
   private async executeStep(step: RunStep, options: DeployOptions, tx: InfraTransaction): Promise<RunReceipt> {
@@ -411,19 +509,34 @@ export class DeployOrchestrator {
             )
             : await options.adapter.deploy(service, environment, serviceEnvVars);
 
-          // Update environment bindings with service info using platform-agnostic structure
-          if (result.externalId) {
+          const externalId = typeof result.externalId === 'string'
+            && result.externalId.trim().length > 0
+            ? result.externalId
+            : undefined;
+          const deployData = (result.receipt.data ?? {}) as Record<string, unknown>;
+          const receiptEnvironmentId = typeof deployData.environmentId === 'string'
+            && deployData.environmentId.trim().length > 0
+            ? deployData.environmentId
+            : undefined;
+
+          // A provider-reported success without an exact, non-empty identity
+          // cannot become a successful deploy or a normal service binding.
+          const deploySucceeded = result.receipt.success && Boolean(externalId);
+
+          // Update environment bindings with service info using platform-agnostic structure.
+          // Failed receipts may carry an id only as partial recovery evidence;
+          // they never grant normal binding or rollback-deletion authority.
+          if (deploySucceeded && externalId) {
             const latestEnvironment = this.envRepo.findById(options.environment.id) ?? environment;
             const currentBindings = latestEnvironment.platformBindings as Partial<HostingBindings>;
-            const services = currentBindings.services ?? {};
+            const services = { ...(currentBindings.services ?? {}) };
             const existingServiceBinding = services[service.name] ?? {};
             services[service.name] = {
               ...existingServiceBinding,
-              serviceId: result.externalId,
+              serviceId: externalId,
               url: result.url ?? existingServiceBinding.url,
               workloadKind: serviceWorkloadKind(service),
             };
-            const deployData = (result.receipt.data ?? {}) as Record<string, unknown>;
             if (typeof deployData.imageUri === 'string') {
               services[service.name].imageUri = deployData.imageUri;
             }
@@ -432,15 +545,17 @@ export class DeployOrchestrator {
                 services[service.name][key] = deployData[key];
               }
             }
-            const resolvedEnvironmentId = typeof deployData.environmentId === 'string'
-              ? deployData.environmentId
-              : undefined;
+            const currentRecoveries = { ...(currentBindings.serviceCreateRecovery ?? {}) };
+            delete currentRecoveries[service.name];
             const bindingUpdates: Partial<HostingBindings> = {
               provider: options.adapter.name,
               services,
+              serviceCreateRecovery: Object.keys(currentRecoveries).length > 0
+                ? currentRecoveries
+                : undefined,
             };
-            if (resolvedEnvironmentId) {
-              bindingUpdates.environmentId = resolvedEnvironmentId;
+            if (receiptEnvironmentId) {
+              bindingUpdates.environmentId = receiptEnvironmentId;
             }
             snapshotEnvironmentBindings({
               tx,
@@ -452,7 +567,7 @@ export class DeployOrchestrator {
 
             const createdService = result.receipt.data?.createdService === true || result.receipt.data?.created === true;
             if (createdService) {
-              const createdServiceId = result.externalId;
+              const createdServiceId = externalId;
               tx.addStep({
                 id: `provider-service:${createdServiceId}`,
                 label: `deploy_${service.name}`,
@@ -483,14 +598,74 @@ export class DeployOrchestrator {
             }
           }
 
+          const currentBindings = (this.envRepo.findById(options.environment.id) ?? environment)
+            .platformBindings as Partial<HostingBindings>;
+          const recoveryValidation = result.receipt.success
+            ? {}
+            : this.validateServiceCreateRecovery({
+                value: deployData.serviceCreateRecovery,
+                adapterName: options.adapter.name,
+                bindings: currentBindings,
+                receiptEnvironmentId,
+                externalId,
+              });
+          let serviceCreateRecovery = recoveryValidation.recovery;
+          let recoveryValidationError = recoveryValidation.error;
+          const serviceCreateMayHaveCommitted = (result.receipt.success && !externalId)
+            || (!result.receipt.success && (
+              (deployData.phase === 'serviceCreate' && deployData.mutationAttempted !== false)
+              || deployData.createdService === true
+              || deployData.created === true
+            ));
+          if (!serviceCreateRecovery && serviceCreateMayHaveCommitted) {
+            const providerScope: Record<string, string> = {};
+            if (typeof currentBindings.projectId === 'string' && currentBindings.projectId.trim()) {
+              providerScope.projectId = currentBindings.projectId;
+            }
+            if (receiptEnvironmentId) {
+              providerScope.environmentId = receiptEnvironmentId;
+            } else if (typeof currentBindings.environmentId === 'string' && currentBindings.environmentId.trim()) {
+              providerScope.environmentId = currentBindings.environmentId;
+            }
+            try {
+              serviceCreateRecovery = createHostingServiceCreateRecovery({
+                provider: options.adapter.name,
+                resourceName: service.name,
+                providerScope,
+                state: externalId ? 'mismatched' : 'unresolved',
+                ...(externalId ? { serviceId: externalId } : {}),
+              });
+              recoveryValidationError = [
+                recoveryValidationError,
+                'Hypervibe retained a conservative service-create blocker because the provider reported a possibly committed create without trustworthy recovery state.',
+              ].filter(Boolean).join(' ');
+            } catch {
+              recoveryValidationError = [
+                recoveryValidationError,
+                'Provider reported a possibly committed service create, but Hypervibe could not derive complete provider scope for a durable recovery blocker.',
+              ].filter(Boolean).join(' ');
+            }
+          }
+          const missingSuccessIdentityError = result.receipt.success && !externalId
+            ? `Provider ${options.adapter.name} reported a successful deploy for ${service.name} without a valid service id; Hypervibe refused to bind it.`
+            : undefined;
+          const receiptError = [
+            result.receipt.error,
+            recoveryValidationError,
+            missingSuccessIdentityError,
+          ].filter((value): value is string => Boolean(value)).join('; ') || undefined;
+
           return {
             step: step.name,
-            status: result.receipt.success ? 'success' : 'failure',
+            status: deploySucceeded ? 'success' : 'failure',
             result: {
               service: service.name,
               url: result.url,
               publicUrl: result.url,
-              externalId: result.externalId,
+              externalId,
+              ...(serviceCreateRecovery
+                ? { serviceCreateRecovery }
+                : {}),
               ...(result.receipt.data?.deploymentDeferred === true ? { deploymentDeferred: true } : {}),
               ...(result.receipt.data?.runtimeRolloutRequired === true
                 ? { runtimeRolloutRequired: true }
@@ -499,7 +674,7 @@ export class DeployOrchestrator {
                 ? { rolloutBaseline: result.receipt.data.rolloutBaseline }
                 : {}),
             },
-            error: result.receipt.error,
+            error: receiptError,
             timestamp,
           };
         }

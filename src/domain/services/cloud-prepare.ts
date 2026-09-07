@@ -127,12 +127,12 @@ export type GcsPrepareAccess = keyof typeof GCS_PREPARE_ADDONS;
 
 export const MEMORYSTORE_PREPARE_ADDONS = {
   inspect: {
-    requiredApis: ['redis.googleapis.com'],
-    requiredRoles: ['roles/redis.viewer'],
+    requiredApis: ['compute.googleapis.com', 'redis.googleapis.com'],
+    requiredRoles: ['roles/compute.networkViewer', 'roles/redis.viewer'],
   },
   lifecycle: {
-    requiredApis: ['redis.googleapis.com'],
-    requiredRoles: ['roles/redis.admin'],
+    requiredApis: ['compute.googleapis.com', 'redis.googleapis.com'],
+    requiredRoles: ['roles/compute.networkUser', 'roles/compute.networkViewer', 'roles/redis.admin'],
   },
 } as const;
 

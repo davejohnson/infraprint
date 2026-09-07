@@ -92,7 +92,6 @@ export function githubCiDeployPermissionProblem(
 }
 
 const connectionRepo = new ConnectionRepository();
-const secretStore = getSecretStore();
 
 type ProviderSecret = { name: string; value: string };
 type WorkflowCiBinding = {
@@ -132,7 +131,7 @@ export function providerSecretsForGitHubActions(
   const ci = providerRegistry.getMetadata(provider)?.orchestration?.ci;
 
   if (connection) {
-    const credentials = secretStore.decryptObject<Record<string, unknown>>(connection.credentialsEncrypted);
+    const credentials = getSecretStore().decryptObject<Record<string, unknown>>(connection.credentialsEncrypted);
     for (const name of ci?.requiredSecrets ?? []) {
       const credentialKey = ci?.secretCredentialKeys?.[name];
       if (!credentialKey) continue;

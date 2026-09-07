@@ -28,6 +28,33 @@ function databaseCopy(overrides: Partial<PlanAction> = {}): PlanAction {
   };
 }
 
+function storageCopy(overrides: Partial<PlanAction> = {}): PlanAction {
+  return {
+    id: 'data-migration:initial-launch:storage:documents',
+    type: 'update',
+    resource: { kind: 'storage', name: 'documents', provider: 's3' },
+    verified: true,
+    reason: 'copy',
+    dataBearing: true,
+    billable: true,
+    requiresConfirm: true,
+    metadata: {
+      operation: 'dataMigrationStorageCopy',
+      migrationId: 'initial-launch',
+      storageName: 'documents',
+      sourceEnvironment: 'staging',
+      targetEnvironment: 'production',
+      sourceProvider: 'gcs',
+      targetProvider: 's3',
+      sourceExternalId: 'source-bucket',
+      sourceInstanceScope: { projectId: 'source-project', location: 'us-west1' },
+      sourceMaintenanceFingerprint: 'source-maintenance-fingerprint',
+      targetMaintenanceFingerprint: 'target-maintenance-fingerprint',
+    },
+    ...overrides,
+  };
+}
+
 describe('data migration action authority', () => {
   it('authorizes an exact confirmed database copy', () => {
     expect(resolvePlanActionAuthority(databaseCopy())).toMatchObject({
@@ -46,6 +73,16 @@ describe('data migration action authority', () => {
         ...databaseCopy().metadata,
         sourceMaintenanceFingerprint: undefined,
       },
+    }))).toBeNull();
+  });
+
+  it('authorizes storage copy only with a pinned source provider scope', () => {
+    expect(resolvePlanActionAuthority(storageCopy())).toMatchObject({ capability: 'storage.migrate' });
+    expect(resolvePlanActionAuthority(storageCopy({
+      metadata: { ...storageCopy().metadata, sourceInstanceScope: undefined },
+    }))).toBeNull();
+    expect(resolvePlanActionAuthority(storageCopy({
+      metadata: { ...storageCopy().metadata, sourceInstanceScope: { projectId: '' } },
     }))).toBeNull();
   });
 

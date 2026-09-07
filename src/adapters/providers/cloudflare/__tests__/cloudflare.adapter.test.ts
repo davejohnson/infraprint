@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CloudflareAdapter } from '../cloudflare.adapter.js';
+import { providerRegistry } from '../../../../domain/registry/provider.registry.js';
 
 function cfResponse<T>(result: T, init?: {
   success?: boolean;
@@ -48,6 +49,91 @@ describe('CloudflareAdapter.findZoneByName', () => {
 
     await expect(adapter.findZoneByName('example.com'))
       .rejects.toThrow('Multiple Cloudflare zones match example.com');
+  });
+});
+
+describe('Cloudflare provider inspection', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('reports an exact missing DNS name as absent', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/zones?name=')) {
+        return cfResponse([{ id: 'zone-1', name: 'example.com' }]);
+      }
+      if (url.includes('/zones/zone-1/dns_records')) {
+        return cfResponse([cfDnsRecord({ name: 'other.example.com' })]);
+      }
+      throw new Error(`unexpected url: ${url}`);
+    }));
+    const adapter = new CloudflareAdapter();
+    adapter.connect({ apiToken: 'cfut_dns' });
+
+    await expect(providerRegistry.get('cloudflare')!.inspection!.inspect(adapter, {
+      resource: 'dns',
+      scope: 'example.com',
+      name: 'missing.example.com',
+      limit: 25,
+    })).resolves.toMatchObject({
+      observation: 'absent',
+      name: 'missing.example.com',
+      records: [],
+      truncated: false,
+      partial: false,
+    });
+  });
+
+  it('hard-bounds account inventory and reports truncation', async () => {
+    const adapter = new CloudflareAdapter();
+    vi.spyOn(adapter, 'listAccounts').mockResolvedValue([
+      { id: 'account-1', name: 'One' },
+      { id: 'account-2', name: 'Two' },
+    ]);
+
+    await expect(providerRegistry.get('cloudflare')!.inspection!.inspect(adapter, {
+      resource: 'account',
+      limit: 1,
+    })).resolves.toMatchObject({
+      observation: 'present',
+      accounts: [{ id: 'account-1' }],
+      truncated: true,
+      partial: true,
+    });
+  });
+
+  it('hard-bounds email-routing rules and reports truncation', async () => {
+    const adapter = new CloudflareAdapter();
+    vi.spyOn(adapter, 'findZoneByName').mockResolvedValue({
+      id: 'zone-1',
+      name: 'example.com',
+      status: 'active',
+      paused: false,
+      type: 'full',
+      name_servers: [],
+    });
+    vi.spyOn(adapter, 'getEmailRoutingSettings').mockResolvedValue({
+      id: 'settings-1',
+      enabled: true,
+      name: 'example.com',
+    });
+    vi.spyOn(adapter, 'getEmailRoutingDnsSettings').mockResolvedValue({ record: [] });
+    vi.spyOn(adapter, 'listEmailRoutingRules').mockResolvedValue([
+      { id: 'rule-1', name: 'One', enabled: true, actions: [], matchers: [] },
+      { id: 'rule-2', name: 'Two', enabled: true, actions: [], matchers: [] },
+    ]);
+
+    await expect(providerRegistry.get('cloudflare')!.inspection!.inspect(adapter, {
+      resource: 'email-routing',
+      scope: 'example.com',
+      limit: 1,
+    })).resolves.toMatchObject({
+      observation: 'present',
+      rules: [{ id: 'rule-1' }],
+      truncated: true,
+      partial: true,
+    });
   });
 });
 
@@ -646,30 +732,44 @@ describe('CloudflareAdapter Registrar token routing', () => {
 describe('CloudflareAdapter load-balancer lifecycle', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
   });
 
   it('creates an origin pool with HTTPS host-header overrides', async () => {
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const href = String(url);
       expect(href).toContain('/accounts/account-1/load_balancers/pools');
-      expect(init?.method).toBe('POST');
-      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      expect(body).toMatchObject({
-        name: 'hv-production-pool',
-        monitor: 'monitor-1',
-        enabled: true,
-        origin_steering: { policy: 'random' },
-        origins: [
-          {
-            name: 'web-a', address: 'a.up.railway.app', enabled: true,
-            header: { Host: ['a.up.railway.app'] },
-          },
-          {
-            name: 'web-b', address: 'b.up.railway.app', enabled: true,
-            header: { Host: ['b.up.railway.app'] },
-          },
-        ],
-      });
+      const method = init?.method ?? 'GET';
+      const body = method === 'POST'
+        ? JSON.parse(String(init?.body)) as Record<string, unknown>
+        : {
+            name: 'hv-production-pool',
+            monitor: 'monitor-1',
+            enabled: true,
+            origin_steering: { policy: 'random' },
+            origins: [
+              { name: 'web-a', address: 'a.up.railway.app', enabled: true, header: { Host: ['a.up.railway.app'] } },
+              { name: 'web-b', address: 'b.up.railway.app', enabled: true, header: { Host: ['b.up.railway.app'] } },
+            ],
+          };
+      if (method === 'POST') {
+        expect(body).toMatchObject({
+          name: 'hv-production-pool',
+          monitor: 'monitor-1',
+          enabled: true,
+          origin_steering: { policy: 'random' },
+          origins: [
+            {
+              name: 'web-a', address: 'a.up.railway.app', enabled: true,
+              header: { Host: ['a.up.railway.app'] },
+            },
+            {
+              name: 'web-b', address: 'b.up.railway.app', enabled: true,
+              header: { Host: ['b.up.railway.app'] },
+            },
+          ],
+        });
+      }
       return cfResponse({
         id: 'pool-1', name: 'hv-production-pool', monitor: 'monitor-1', enabled: true,
         origin_steering: { policy: 'random' }, origins: (body.origins as unknown[]),
@@ -688,7 +788,92 @@ describe('CloudflareAdapter load-balancer lifecycle', () => {
     });
 
     expect(result.created).toBe(true);
+    expect(result.verified).toBe(true);
     expect(result.resource).toMatchObject({ id: 'pool-1', monitorId: 'monitor-1', steering: 'random' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns the acknowledged id without claiming success when exact read-back stays unknown', async () => {
+    vi.stubEnv('HYPERVIBE_CLOUDFLARE_LB_VERIFY_ATTEMPTS', '1');
+    vi.stubEnv('HYPERVIBE_CLOUDFLARE_LB_VERIFY_INTERVAL_MS', '0');
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(cfResponse({
+        id: 'monitor-acknowledged',
+        description: 'hv-production-monitor',
+        type: 'https',
+        path: '/health',
+        interval: 60,
+        timeout: 5,
+        expected_codes: '200-399',
+        follow_redirects: true,
+      }))
+      .mockResolvedValueOnce(cfResponse(null, {
+        success: false,
+        status: 503,
+        errors: [{ code: 1001, message: 'temporarily unavailable' }],
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = new CloudflareAdapter();
+    adapter.connect({ apiToken: 'cfut_load_balancer', accountId: 'account-1' });
+
+    await expect(adapter.ensureMonitor('account-1', {
+      name: 'hv-production-monitor',
+      type: 'https',
+      path: '/health',
+      intervalSeconds: 60,
+      timeoutSeconds: 5,
+      expectedCodes: '200-399',
+      followRedirects: true,
+    })).resolves.toMatchObject({
+      created: true,
+      verified: false,
+      resource: { id: 'monitor-acknowledged' },
+      verificationError: expect.stringContaining('temporarily unavailable'),
+    });
+  });
+
+  it('recovers and verifies a monitor id when the create response is lost after commit', async () => {
+    vi.stubEnv('HYPERVIBE_CLOUDFLARE_LB_VERIFY_ATTEMPTS', '1');
+    vi.stubEnv('HYPERVIBE_CLOUDFLARE_LB_VERIFY_INTERVAL_MS', '0');
+    const monitor = {
+      id: 'monitor-recovered',
+      description: 'hv-production-monitor',
+      type: 'https',
+      path: '/health',
+      interval: 60,
+      timeout: 5,
+      expected_codes: '200-399',
+      follow_redirects: true,
+    };
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      const pathname = new URL(href).pathname;
+      const method = init?.method ?? 'GET';
+      if (method === 'POST') throw new Error('connection closed after request transmission');
+      if (pathname.endsWith('/load_balancers/monitors')) return cfResponse([monitor]);
+      if (pathname.endsWith('/load_balancers/monitors/monitor-recovered')) return cfResponse(monitor);
+      throw new Error(`unexpected request: ${method} ${href}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = new CloudflareAdapter();
+    adapter.connect({ apiToken: 'cfut_load_balancer', accountId: 'account-1' });
+
+    const result = await adapter.ensureMonitor('account-1', {
+      name: 'hv-production-monitor',
+      type: 'https',
+      path: '/health',
+      intervalSeconds: 60,
+      timeoutSeconds: 5,
+      expectedCodes: '200-399',
+      followRedirects: true,
+    });
+
+    expect(result).toMatchObject({
+      created: true,
+      verified: true,
+      resource: { id: 'monitor-recovered' },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it('treats only provider-confirmed 404 as absence', async () => {
@@ -726,6 +911,35 @@ describe('CloudflareAdapter load-balancer lifecycle', () => {
       expect.objectContaining({ id: 'pool-match', name: 'wanted' }),
     ]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not treat a full page without pagination metadata as complete', async () => {
+    const fetchMock = vi.fn(async () => cfResponse(
+      Array.from({ length: 100 }, (_, index) => ({
+        id: `pool-${index}`,
+        name: `unrelated-${index}`,
+      }))
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = new CloudflareAdapter();
+    adapter.connect({ apiToken: 'cfut_load_balancer', accountId: 'account-1' });
+
+    await expect(adapter.findPoolsByName('account-1', 'wanted')).rejects.toThrow(
+      /full page without pagination metadata/
+    );
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('honors HTTP failure status even if a malformed body claims success', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => cfResponse({
+      id: 'monitor-forbidden',
+      description: 'forbidden',
+    }, { status: 403, success: true })));
+    const adapter = new CloudflareAdapter();
+    adapter.connect({ apiToken: 'cfut_load_balancer', accountId: 'account-1' });
+
+    await expect(adapter.getMonitor('account-1', 'monitor-forbidden'))
+      .rejects.toThrow(/HTTP 403/);
   });
 
   it('verifies terminal absence after deleting the public load balancer', async () => {

@@ -86,7 +86,7 @@ export class ComponentRepository {
     `).run(
       updates.type ?? existing.type,
       serializeComponentBindings(updates.bindings ?? existing.bindings),
-      updates.externalId ?? existing.externalId,
+      updates.externalId !== undefined ? updates.externalId : existing.externalId,
       now,
       id
     );

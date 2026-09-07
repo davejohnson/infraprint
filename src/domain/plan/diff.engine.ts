@@ -9,6 +9,9 @@ import {
   DOMAIN_ADOPT_OPERATION,
   DOMAIN_DETACH_OPERATION,
 } from '../services/domain-attach-policy.js';
+import { bindingIdentityFingerprint } from '../services/binding-identity.js';
+import { parseUnresolvedDatabaseMutation } from '../ports/database.port.js';
+import { parseHostingServiceCreateRecovery } from '../ports/hosting.port.js';
 
 type PreviousHostingBinding = NonNullable<NonNullable<LocalSnapshot['bindings']>['previousHosting']>;
 
@@ -148,6 +151,8 @@ export function diffEnvironment(input: {
   managedDatabaseEnvVars?: Record<string, string>;
   managedCacheEnvVars?: Record<string, string>;
   managedQueueEnvVars?: Record<string, string>;
+  /** The database consumes infrastructure owned by this hosting project. */
+  databaseDependsOnHostingProject?: boolean;
   /** Explicit project build runtime; omission preserves legacy local state. */
   projectRuntime?: ProjectRuntimeSpec;
 }): DiffResult {
@@ -183,6 +188,13 @@ export function diffEnvironment(input: {
   // ---- project / environment ------------------------------------------------
   const boundProvider = local.bindings?.provider;
   const providerChanged = Boolean(boundProvider && boundProvider !== provider);
+  const rawServiceCreateRecoveries = local.bindings?.serviceCreateRecovery;
+  const recoveryMapIsMalformed = rawServiceCreateRecoveries !== undefined
+    && (!rawServiceCreateRecoveries
+      || typeof rawServiceCreateRecoveries !== 'object'
+      || Array.isArray(rawServiceCreateRecoveries));
+  const hasRetainedServiceCreateState = recoveryMapIsMalformed
+    || Object.keys(rawServiceCreateRecoveries ?? {}).length > 0;
 
   const projectExists = observed && projectObservationKnown
     ? observed.projectExists
@@ -199,8 +211,14 @@ export function diffEnvironment(input: {
         : providerChanged
         ? `Hosting provider changes from ${boundProvider} to ${provider}`
         : `No ${provider} project exists for this environment`,
-      ...(!projectObservationKnown && !providerChanged
-        ? { metadata: { blockedReason: 'project_observation_unknown' } }
+      ...(hasRetainedServiceCreateState || (!projectObservationKnown && !providerChanged)
+        ? {
+            metadata: {
+              blockedReason: hasRetainedServiceCreateState
+                ? 'service_create_recovery_requires_project_resolution'
+                : 'project_observation_unknown',
+            },
+          }
         : {}),
     });
   }
@@ -208,23 +226,136 @@ export function diffEnvironment(input: {
 
   // ---- services -------------------------------------------------------------
   const observedServiceGroups = new Map<string, ObservedService[]>();
-  for (const service of observed?.services ?? []) {
+  for (const service of serviceObservationKnown ? observed?.services ?? [] : []) {
     observedServiceGroups.set(service.name, [
       ...(observedServiceGroups.get(service.name) ?? []),
       service,
     ]);
   }
-  const observedServices = new Map<string, ObservedService>(
-    [...observedServiceGroups.entries()]
-      .filter(([, candidates]) => candidates.length === 1)
-      .map(([name, candidates]) => [name, candidates[0]!])
-  );
   const localServices = new Map(local.services.map((s) => [s.name, s]));
   const localServiceBindings = local.bindings?.services ?? {};
+  const observedServices = new Map<string, ObservedService>();
+  const serviceIdentityBlocks = new Map<string, {
+    reason: string;
+    blockedReason: string;
+    externalIds: string[];
+  }>();
+
+  // A provider name/label is not a durable identity. Resolve an existing local
+  // binding first and treat every unbound name match as an adoption candidate.
+  // This also lets one exact bound id disambiguate duplicate logical names
+  // without silently claiming the other provider resources.
+  for (const name of Object.keys(spec.services)) {
+    const nameCandidates = observedServiceGroups.get(name) ?? [];
+    const boundServiceId = localServiceBindings[name]?.serviceId;
+    const boundCandidates = boundServiceId
+      ? (serviceObservationKnown ? observed?.services ?? [] : [])
+        .filter((candidate) => candidate.externalId === boundServiceId)
+      : [];
+
+    if (boundServiceId && boundCandidates.length === 1) {
+      const exact = boundCandidates[0]!;
+      observedServices.set(name, exact);
+      for (const candidate of nameCandidates) {
+        if (candidate.externalId === exact.externalId) continue;
+        unmanaged.push({
+          kind: 'service',
+          name: candidate.name,
+          detail: `Service ${candidate.externalId} matches logical name "${name}" but is not the bound service ${boundServiceId}`,
+        });
+      }
+      continue;
+    }
+
+    if (boundCandidates.length > 1) {
+      serviceIdentityBlocks.set(name, {
+        reason: `Multiple live services report the exact bound id for logical service "${name}"`,
+        blockedReason: 'ambiguous_service_identity',
+        externalIds: boundCandidates.map((candidate) => candidate.externalId).sort(),
+      });
+      continue;
+    }
+
+    if (boundServiceId && nameCandidates.length > 0) {
+      const externalIds = nameCandidates.map((candidate) => candidate.externalId).sort();
+      serviceIdentityBlocks.set(name, {
+        reason: `The bound service id ${boundServiceId} is absent, while different live service identities match logical name "${name}"`,
+        blockedReason: 'service_binding_identity_mismatch',
+        externalIds,
+      });
+      for (const candidate of nameCandidates) {
+        unmanaged.push({
+          kind: 'service',
+          name: candidate.name,
+          detail: `Service ${candidate.externalId} is an adoption candidate; the current binding points to ${boundServiceId}`,
+        });
+      }
+      continue;
+    }
+
+    if (!boundServiceId && nameCandidates.length > 0) {
+      const externalIds = nameCandidates.map((candidate) => candidate.externalId).sort();
+      serviceIdentityBlocks.set(name, {
+        reason: nameCandidates.length > 1
+          ? `Multiple live services map to logical service "${name}"; explicit adoption or cleanup is required`
+          : `A live service named "${name}" exists without a durable Hypervibe binding; explicit adoption is required`,
+        blockedReason: nameCandidates.length > 1
+          ? 'ambiguous_service_identity'
+          : 'service_adoption_required',
+        externalIds,
+      });
+      for (const candidate of nameCandidates) {
+        unmanaged.push({
+          kind: 'service',
+          name: candidate.name,
+          detail: `${provider} service ${candidate.externalId} requires explicit adoption`,
+        });
+      }
+    }
+  }
 
   for (const [name, serviceSpec] of Object.entries(spec.services)) {
     const id = `service:${name}`;
     const resource = { kind: 'service' as const, name, provider };
+
+    const hasRecoveryEntry = recoveryMapIsMalformed
+      || Boolean(rawServiceCreateRecoveries
+        && Object.prototype.hasOwnProperty.call(rawServiceCreateRecoveries, name));
+    if (hasRecoveryEntry) {
+      const recovery = recoveryMapIsMalformed
+        ? null
+        : parseHostingServiceCreateRecovery(rawServiceCreateRecoveries?.[name]);
+      const boundProjectId = local.bindings?.projectId;
+      const boundEnvironmentId = local.bindings?.environmentId;
+      const markerMatchesBindings = Boolean(
+        recovery
+        && recovery.provider === provider
+        && (!boundProjectId || recovery.providerScope.projectId === boundProjectId)
+        && (!boundEnvironmentId || recovery.providerScope.environmentId === boundEnvironmentId)
+      );
+      const markerDescription = recovery
+        ? `${recovery.state} create for provider resource "${recovery.resourceName}"${recovery.serviceId ? ` (${recovery.serviceId})` : ''}`
+        : 'malformed service-create recovery state';
+      actions.unshift({
+        id,
+        type: 'update',
+        resource,
+        verified: false,
+        reason: markerMatchesBindings
+          ? `Service "${name}" has an ${markerDescription}; inspect and explicitly recover or clean it up before another create`
+          : `Service "${name}" has ${markerDescription} that does not exactly match its current provider scope; Hypervibe will not guess or create a replacement`,
+        metadata: {
+          blockedReason: markerMatchesBindings
+            ? 'service_create_recovery_required'
+            : 'service_create_recovery_invalid',
+          ...(recovery ? { serviceCreateRecovery: recovery } : {}),
+        },
+      });
+      warnings.push(
+        `Service "${name}" is blocked by retained service-create recovery state. Resolve that exact provider identity before planning another create.`
+      );
+      continue;
+    }
 
     if (providerChanged) {
       actions.push({
@@ -241,21 +372,21 @@ export function diffEnvironment(input: {
       continue;
     }
 
-    const duplicateCandidates = observedServiceGroups.get(name) ?? [];
-    if (duplicateCandidates.length > 1) {
+    const identityBlock = serviceIdentityBlocks.get(name);
+    if (identityBlock) {
       actions.push({
         id,
         type: 'update',
         resource,
         verified: true,
-        reason: `Multiple live services map to logical service "${name}"; explicit adoption or cleanup is required`,
+        reason: identityBlock.reason,
         metadata: {
-          blockedReason: 'ambiguous_service_identity',
-          externalIds: duplicateCandidates.map((candidate) => candidate.externalId).sort(),
+          blockedReason: identityBlock.blockedReason,
+          externalIds: identityBlock.externalIds,
         },
       });
       warnings.push(
-        `Ambiguous service identity for "${name}": ${duplicateCandidates.map((candidate) => candidate.externalId).join(', ')}. Hypervibe will not mutate any candidate.`
+        `Unresolved service identity for "${name}": ${identityBlock.externalIds.join(', ')}. Hypervibe will not mutate or silently adopt any candidate.`
       );
       continue;
     }
@@ -274,6 +405,25 @@ export function diffEnvironment(input: {
             ? { billable: true, requiresConfirm: true }
             : {}),
         });
+        continue;
+      }
+
+      if (live.status === 'failed' || live.status === 'unknown') {
+        actions.push({
+          id,
+          type: 'update',
+          resource,
+          verified: true,
+          reason: `Service "${name}" live status is ${live.status}; refusing to report configuration convergence`,
+          metadata: {
+            blockedReason: `service_status_${live.status}`,
+            observedStatus: live.status,
+            externalId: live.externalId,
+          },
+        });
+        warnings.push(
+          `Service "${name}" is ${live.status}; diagnose its deployment before applying further service mutations.`
+        );
         continue;
       }
 
@@ -314,6 +464,9 @@ export function diffEnvironment(input: {
       };
       const diff = diffServiceConfig(serviceSpec, live, desiredServiceEnvVars, {
         presenceOnlyEnvVars: presenceOnlyManagedEnvVars,
+        cacheNetwork: spec.cache && local.bindings?.cacheNetwork
+          ? local.bindings.cacheNetwork
+          : undefined,
       });
       const localRuntime = localServices.get(name)?.buildConfig.runtime;
       const runtimeDrift = Boolean(input.projectRuntime)
@@ -411,6 +564,49 @@ export function diffEnvironment(input: {
     }
   }
 
+  // A recovery marker is not deletion authority. If its logical service has
+  // been removed from the spec, surface an explicit blocker rather than
+  // silently reporting convergence and abandoning a possibly billable
+  // provider resource.
+  if (recoveryMapIsMalformed && Object.keys(spec.services).length === 0) {
+    actions.unshift({
+      id: 'service:recovery-state',
+      type: 'update',
+      resource: { kind: 'service', name: 'service-create-recovery', provider: boundProvider ?? provider },
+      verified: false,
+      reason: 'Hosting bindings contain malformed service-create recovery state; inspect and repair the binding before any service lifecycle operation',
+      metadata: { blockedReason: 'service_create_recovery_invalid' },
+    });
+    warnings.push('Malformed service-create recovery state may refer to a provider resource that is absent from the desired spec. Hypervibe will not discard it or infer deletion authority.');
+  } else {
+    for (const [name, rawRecovery] of Object.entries(rawServiceCreateRecoveries ?? {})) {
+      if (spec.services[name]) continue;
+      const recovery = parseHostingServiceCreateRecovery(rawRecovery);
+      actions.unshift({
+        id: `service:${name}:recovery`,
+        type: 'update',
+        resource: {
+          kind: 'service',
+          name,
+          provider: recovery?.provider ?? boundProvider ?? provider,
+        },
+        verified: false,
+        reason: recovery
+          ? `Retained ${recovery.state} create identity for removed service "${name}" is not deletion authority; inspect and explicitly recover or clean up provider resource "${recovery.resourceName}" before removing the marker`
+          : `Removed service "${name}" has malformed retained create recovery state; Hypervibe will not discard it or guess which provider resource to delete`,
+        metadata: {
+          blockedReason: recovery
+            ? 'orphaned_service_create_recovery'
+            : 'service_create_recovery_invalid',
+          ...(recovery ? { serviceCreateRecovery: recovery } : {}),
+        },
+      });
+      warnings.push(
+        `Service "${name}" is absent from the spec but still has service-create recovery state. Explicit provider inspection and cleanup/adoption are required.`
+      );
+    }
+  }
+
   // Variable omission is preserve-only. Deletion is modeled separately from
   // service configuration so it is visible, confirm-gated, and can never be
   // inferred from a partial desired map.
@@ -462,10 +658,25 @@ export function diffEnvironment(input: {
   // Services absent from the spec: destroy previously managed bindings, but
   // only report truly unknown live resources as unmanaged.
   const plannedServiceDestroys = new Set<string>();
+  const ambiguousTaskServicesReported = new Set<string>();
   for (const live of serviceObservationKnown ? observed?.services ?? [] : []) {
     if (spec.services[live.name]) continue;
-    const bound = Boolean(localServiceBindings[live.name]?.serviceId);
     if (live.name.startsWith('hv-task-')) {
+      const taskCandidates = observedServiceGroups.get(live.name) ?? [];
+      const taskExternalIds = Array.from(new Set(taskCandidates.map((candidate) => candidate.externalId)));
+      if (taskExternalIds.length > 1) {
+        unmanaged.push({
+          kind: 'service',
+          name: live.name,
+          detail: `Multiple leftover task services share this name (${taskExternalIds.sort().join(', ')}); automatic deletion is blocked`,
+        });
+        if (!ambiguousTaskServicesReported.has(live.name)) {
+          warnings.push(`Multiple leftover task services named "${live.name}" were observed. Cleanup is blocked until their exact identities are inspected.`);
+          ambiguousTaskServicesReported.add(live.name);
+        }
+        continue;
+      }
+      if (plannedServiceDestroys.has(live.name)) continue;
       actions.push(serviceDestroyAction(
         live.name,
         true,
@@ -474,28 +685,44 @@ export function diffEnvironment(input: {
         false
       ));
       plannedServiceDestroys.add(live.name);
-    } else if (bound) {
+      continue;
+    }
+
+    // A logical name is not proof of ownership. Only the exact durable id in
+    // a removed local binding authorizes deletion; same-name replacements and
+    // duplicates remain unmanaged.
+    const boundEntry = Object.entries(localServiceBindings).find(([boundName, binding]) => (
+      !spec.services[boundName]
+      && typeof binding?.serviceId === 'string'
+      && binding.serviceId === live.externalId
+    ));
+    if (boundEntry) {
+      const [boundName, binding] = boundEntry;
+      if (plannedServiceDestroys.has(boundName)) continue;
       actions.push(serviceDestroyAction(
-        live.name,
+        boundName,
         true,
-        `Service "${live.name}" was removed from the spec and is managed by Hypervibe`
+        `Service "${boundName}" was removed from the spec and is managed by Hypervibe`,
+        { externalId: binding!.serviceId }
       ));
-      plannedServiceDestroys.add(live.name);
+      plannedServiceDestroys.add(boundName);
     } else {
       unmanaged.push({ kind: 'service', name: live.name, detail: `Running on ${provider} but absent from spec` });
     }
   }
 
-  if (!observed) {
-    for (const [name, binding] of Object.entries(localServiceBindings)) {
-      if (spec.services[name] || plannedServiceDestroys.has(name) || !binding?.serviceId) continue;
-      actions.push(serviceDestroyAction(
-        name,
-        false,
-        `Service "${name}" was removed from the spec and has a local ${provider} binding`
-      ));
-      plannedServiceDestroys.add(name);
-    }
+  for (const [name, binding] of Object.entries(localServiceBindings)) {
+    if (spec.services[name] || plannedServiceDestroys.has(name) || !binding?.serviceId) continue;
+    const absenceVerified = Boolean(observed && serviceObservationKnown);
+    actions.push(serviceDestroyAction(
+      name,
+      absenceVerified,
+      absenceVerified
+        ? `Service "${name}" was removed from the spec and its bound provider id is already absent`
+        : `Service "${name}" was removed from the spec and has a local ${provider} binding`,
+      { externalId: binding.serviceId }
+    ));
+    plannedServiceDestroys.add(name);
   }
 
   // ---- abandoned hosting provider teardown ----------------------------------
@@ -524,6 +751,19 @@ export function diffEnvironment(input: {
   const previousDbProvider = localDb
     ? String(localDbBindings?.previousProvider ?? '') || undefined
     : undefined;
+  const previousDbBindings = localDbBindings?.previousBindings
+    && typeof localDbBindings.previousBindings === 'object'
+    && !Array.isArray(localDbBindings.previousBindings)
+    ? localDbBindings.previousBindings as Record<string, unknown>
+    : undefined;
+  const previousDbExternalId = typeof localDbBindings?.previousExternalId === 'string'
+    && localDbBindings.previousExternalId.length > 0
+    ? localDbBindings.previousExternalId
+    : typeof previousDbBindings?.instanceId === 'string' && previousDbBindings.instanceId.length > 0
+      ? previousDbBindings.instanceId
+      : typeof previousDbBindings?.serviceId === 'string' && previousDbBindings.serviceId.length > 0
+        ? previousDbBindings.serviceId
+        : undefined;
   const observedDatabases = databaseObservationKnown
     ? (observed?.databases ?? []).filter((database) => (
       desiredDatabaseEngine
@@ -531,13 +771,191 @@ export function diffEnvironment(input: {
         : database.engine === 'postgres'
     ))
     : [];
-  const observedDb = observedDatabases.length === 1 ? observedDatabases[0] : undefined;
-  const databaseAmbiguous = observedDatabases.length > 1;
+  const localDbExternalId = localDb?.externalId
+    ?? (typeof localDbBindings?.instanceId === 'string' ? localDbBindings.instanceId : undefined)
+    ?? (typeof localDbBindings?.serviceId === 'string' ? localDbBindings.serviceId : undefined);
+  const localDbScope = localDbBindings?.providerScope
+    && typeof localDbBindings.providerScope === 'object'
+    && !Array.isArray(localDbBindings.providerScope)
+    ? localDbBindings.providerScope as Record<string, unknown>
+    : undefined;
+  const destroyProviderScope = (value: unknown): Record<string, string> | null => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const entries = Object.entries(value);
+    if (entries.length === 0 || entries.some(([, item]) => typeof item !== 'string' || item.length === 0)) {
+      return null;
+    }
+    return Object.fromEntries(entries) as Record<string, string>;
+  };
+  const localDbDestroyScope = destroyProviderScope(localDbBindings?.providerScope);
+  const previousDbDestroyScope = destroyProviderScope(previousDbBindings?.providerScope);
+  const databaseMatchesLocalBinding = (database: NonNullable<ObservedState['databases']>[number]): boolean => {
+    if (!localDbExternalId || database.externalId !== localDbExternalId) return false;
+    if (localDbProvider && database.provider !== localDbProvider) return false;
+    const localScopeEntries = Object.entries(localDbScope ?? {});
+    const liveScopeEntries = Object.entries(database.providerScope ?? {});
+
+    // Scope is part of a durable provider identity. If persisted state knows a
+    // scope, an unscoped or partially scoped observation cannot prove that the
+    // matching bare id belongs to this environment.
+    if (localScopeEntries.length > 0) {
+      if (liveScopeEntries.length !== localScopeEntries.length) return false;
+      return localScopeEntries.every(([key, value]) => (
+        typeof value === 'string'
+        && value.length > 0
+        && database.providerScope?.[key] === value
+      ));
+    }
+    if (liveScopeEntries.length === 0) return true;
+
+    // Scoped provider ids are identities only together with their provider
+    // scope. Read legacy flattened scope fields when present, but never accept
+    // an unscoped id as proof that a scoped live datastore is the same one.
+    return liveScopeEntries.every(([key, value]) => {
+      const localValue = localDbScope?.[key] ?? localDbBindings?.[key];
+      return typeof localValue === 'string' && localValue === value;
+    });
+  };
+  const boundObservedDatabases = localDb
+    ? observedDatabases.filter(databaseMatchesLocalBinding)
+    : [];
+  const observedDb = boundObservedDatabases.length === 1
+    ? boundObservedDatabases[0]
+    : !localDb && observedDatabases.length === 1
+      ? observedDatabases[0]
+      : undefined;
+  const databaseAmbiguous = boundObservedDatabases.length > 1
+    || (!observedDb && observedDatabases.length > 1);
+  const databaseIdentityMismatch = Boolean(
+    localDb
+    && observed
+    && databaseObservationKnown
+    && observedDatabases.length > 0
+    && !observedDb
+    && !databaseAmbiguous
+  );
+  const desiredDatabaseBindingAbsent = Boolean(
+    localDb
+    && localDbProvider
+    && localDbProvider === spec.database?.provider
+    && observed
+    && databaseObservationKnown
+    && observedDatabases.length === 0
+  );
   const currentDbProvider = observed && databaseObservationKnown ? observedDb?.provider : localDbProvider;
   const dbVerified = Boolean(observed && databaseObservationKnown);
+  const databaseProvisioningIncomplete = localDbBindings?.provisioningIncomplete === true;
+  const unresolvedDatabaseCreate = parseUnresolvedDatabaseMutation(localDbBindings);
+  const unresolvedCreateCandidates = unresolvedDatabaseCreate && databaseObservationKnown
+    ? observedDatabases.filter((database) => (
+        database.provider === localDbProvider
+        && database.name === unresolvedDatabaseCreate.resourceName
+        && Object.entries(unresolvedDatabaseCreate.providerScope).every(([key, value]) => (
+          database.providerScope?.[key] === value
+        ))
+      ))
+    : [];
   let activeDatabaseActionId: string | undefined;
 
-  if (spec.database) {
+  if (observedDb && localDb) {
+    for (const database of observedDatabases) {
+      if (database === observedDb) continue;
+      unmanaged.push({
+        kind: 'database',
+        name: database.name ?? database.engine,
+        detail: `${database.provider} datastore ${database.externalId} is not the bound ${database.engine} datastore`,
+      });
+    }
+  }
+
+  if (databaseProvisioningIncomplete) {
+    const retainedProvider = localDbProvider ?? spec.database?.provider ?? 'unknown';
+    const retainedId = `database:${retainedProvider}`;
+    activeDatabaseActionId = spec.database ? retainedId : undefined;
+    if (unresolvedDatabaseCreate && localDbProvider && localDbBindings) {
+      const observedCandidate = unresolvedCreateCandidates.length === 1
+        ? unresolvedCreateCandidates[0]
+        : undefined;
+      actions.push({
+        id: retainedId,
+        type: 'update',
+        resource: {
+          kind: 'database',
+          name: localDb?.type ?? spec.database?.engine ?? 'postgres',
+          provider: retainedProvider,
+        },
+        verified: Boolean(databaseObservationKnown && observedCandidate),
+        reason: observedCandidate
+          ? `The previously unresolved ${retainedProvider} database create is now visible as ${observedCandidate.externalId}, but explicit reconciliation is required`
+          : unresolvedCreateCandidates.length > 1
+            ? `Multiple ${retainedProvider} databases now match the unresolved create name; no identity can be selected`
+            : `The outcome of the previous ${retainedProvider} database create remains unresolved`,
+        metadata: {
+          blockedReason: observedCandidate
+            ? 'database_unresolved_create_observed'
+            : unresolvedCreateCandidates.length > 1
+              ? 'database_unresolved_create_ambiguous'
+              : 'database_unresolved_create_unknown',
+          resourceName: unresolvedDatabaseCreate.resourceName,
+          providerScope: unresolvedDatabaseCreate.providerScope,
+          ...(observedCandidate ? {
+            externalId: observedCandidate.externalId,
+            observedProviderScope: observedCandidate.providerScope,
+          } : {}),
+          ...(unresolvedCreateCandidates.length > 1 ? {
+            externalIds: unresolvedCreateCandidates.map((candidate) => candidate.externalId).sort(),
+          } : {}),
+        },
+      });
+      warnings.push(observedCandidate
+        ? `Database create ${unresolvedDatabaseCreate.resourceName} is now visible as ${observedCandidate.externalId}. Inspect that exact ID, then use hv_import mode="retained-database-cleanup" and the isolated retained-cleanup plan to delete it; Hypervibe will clear the matching unresolved marker only after terminal absence.`
+        : `Database create ${unresolvedDatabaseCreate.resourceName} has no safely reconciled provider ID. Hypervibe will not retry the billable create; re-observe its exact scope and, if it appears, use hv_import mode="retained-database-cleanup" for that exact ID.`);
+    } else if (!localDbProvider || !localDbExternalId || !localDbDestroyScope || !localDbBindings) {
+      actions.push({
+        id: retainedId,
+        type: 'update',
+        resource: {
+          kind: 'database',
+          name: localDb?.type ?? spec.database?.engine ?? 'postgres',
+          provider: retainedProvider,
+        },
+        verified: false,
+        reason: 'A failed database provision was retained without a complete cleanup identity',
+        metadata: { blockedReason: 'database_incomplete_provision_identity_missing' },
+      });
+      warnings.push('Database reconciliation is blocked because the retained failed provision lacks a complete provider id and scope. Inspect the provider and repair the exact binding before any retry or deletion.');
+    } else if (spec.database) {
+      actions.push({
+        id: retainedId,
+        type: 'update',
+        resource: { kind: 'database', name: localDb!.type, provider: localDbProvider },
+        verified: false,
+        reason: `The ${localDbProvider} database create was acknowledged, but readiness and runtime credentials were not fully proven`,
+        metadata: {
+          blockedReason: 'database_provision_incomplete',
+          externalId: localDbExternalId,
+          providerScope: localDbDestroyScope,
+        },
+      });
+      warnings.push(`Database ${localDbExternalId} is retained for recovery and will not be treated as active. Inspect it with hv_inspect; to recreate safely, remove the database from desired state, confirm its exact cleanup, then add it again.`);
+    } else {
+      actions.push({
+        id: `${retainedId}:destroy`,
+        type: 'destroy',
+        resource: { kind: 'database', name: localDb!.type, provider: localDbProvider },
+        verified: Boolean(observedDb),
+        reason: `Delete the incomplete ${localDbProvider} database provision before clearing or restoring any previous database binding`,
+        dataBearing: true,
+        requiresConfirm: true,
+        metadata: {
+          externalId: localDbExternalId,
+          providerScope: localDbDestroyScope,
+          bindingsFingerprint: bindingIdentityFingerprint(localDbBindings),
+          incompleteProvision: true,
+        },
+      });
+    }
+  } else if (spec.database) {
     const wanted = spec.database.provider;
     const databaseEngineLabel = 'PostgreSQL';
     const createId = `database:${wanted}`;
@@ -555,7 +973,7 @@ export function diffEnvironment(input: {
           externalIds: candidateIds,
         },
       });
-      warnings.push(`Multiple ${databaseEngineLabel} datastores were observed (${candidateIds.join(', ')}). Database mutations are blocked until one identity is explicitly adopted.`);
+      warnings.push(`Multiple ${databaseEngineLabel} datastores were observed (${candidateIds.join(', ')}). Database mutations are blocked; remove the unmanaged candidates because generic database adoption is not implemented.`);
       for (const database of observedDatabases) {
         if (database.externalId === localDb?.externalId) continue;
         unmanaged.push({
@@ -565,24 +983,73 @@ export function diffEnvironment(input: {
         });
       }
     } else if (observed && !databaseObservationKnown) {
-      if (localDbProvider === wanted) {
-        actions.push({
-          id: createId,
-          type: 'noop',
-          resource: { kind: 'database', name: spec.database.engine, provider: wanted },
-          verified: false,
-          reason: 'Preserving the locally bound database because live database observation is unknown',
-        });
-      } else {
-        actions.push({
-          id: createId,
-          type: 'update',
-          resource: { kind: 'database', name: spec.database.engine, provider: wanted },
-          verified: false,
-          reason: `Cannot verify whether the desired ${wanted} database exists`,
-          metadata: { blockedReason: 'database_observation_unknown' },
+      actions.push({
+        id: createId,
+        type: 'update',
+        resource: { kind: 'database', name: spec.database.engine, provider: wanted },
+        verified: false,
+        reason: localDbProvider === wanted
+          ? 'Preserving the locally bound database, but blocking dependent mutations because live database observation is unknown'
+          : `Cannot verify whether the desired ${wanted} database exists`,
+        metadata: { blockedReason: 'database_observation_unknown' },
+      });
+    } else if (desiredDatabaseBindingAbsent) {
+      actions.push({
+        id: createId,
+        type: 'update',
+        resource: { kind: 'database', name: spec.database.engine, provider: wanted },
+        verified: true,
+        reason: `The locally bound ${databaseEngineLabel} datastore is absent; refusing to silently create a replacement`,
+        metadata: {
+          blockedReason: 'database_binding_absent',
+          boundExternalId: localDbExternalId,
+        },
+      });
+      warnings.push(
+        `The durable ${wanted} database binding ${localDbExternalId ?? '(missing id)'} was not found. Resolve the missing data resource explicitly before planning a replacement.`
+      );
+    } else if (databaseIdentityMismatch) {
+      const candidateIds = observedDatabases.map((database) => database.externalId).sort();
+      actions.push({
+        id: createId,
+        type: 'update',
+        resource: { kind: 'database', name: spec.database.engine, provider: wanted },
+        verified: true,
+        reason: `The locally bound ${databaseEngineLabel} identity is absent, while a different live datastore is an adoption candidate`,
+        metadata: {
+          blockedReason: 'database_binding_identity_mismatch',
+          boundExternalId: localDbExternalId,
+          externalIds: candidateIds,
+        },
+      });
+      for (const database of observedDatabases) {
+        unmanaged.push({
+          kind: 'database',
+          name: database.name ?? database.engine,
+          detail: `${database.provider} datastore ${database.externalId} does not match the durable local binding ${localDbExternalId ?? '(missing)'}`,
         });
       }
+    } else if (
+      observedDb
+      && currentDbProvider === wanted
+      && observedDb.status !== 'running'
+    ) {
+      actions.push({
+        id: createId,
+        type: 'update',
+        resource: { kind: 'database', name: spec.database.engine, provider: wanted },
+        verified: true,
+        reason: `The bound ${databaseEngineLabel} datastore is ${observedDb.status}, not running`,
+        metadata: {
+          blockedReason: 'database_not_running',
+          observedStatus: observedDb.status,
+          externalId: observedDb.externalId,
+          ...(observedDb.providerScope ? { providerScope: observedDb.providerScope } : {}),
+        },
+      });
+      warnings.push(
+        `Database ${observedDb.externalId} is ${observedDb.status}; dependent service mutations are blocked until live observation reports running.`
+      );
     } else if (!currentDbProvider) {
       actions.push({
         id: createId,
@@ -591,8 +1058,49 @@ export function diffEnvironment(input: {
         verified,
         reason: `No ${spec.database.engine} database exists`,
         billable: true,
-        dependsOn: wanted === provider ? projectDep : undefined,
+        dependsOn: wanted === provider || input.databaseDependsOnHostingProject
+          ? projectDep
+          : undefined,
       });
+    } else if (
+      currentDbProvider !== wanted
+      && observedDatabases.some((database) => database.provider === wanted)
+    ) {
+      const candidates = observedDatabases
+        .filter((database) => database.provider === wanted)
+        .sort((left, right) => left.externalId.localeCompare(right.externalId));
+      const candidateIds = candidates.map((database) => database.externalId);
+      actions.push({
+        id: createId,
+        type: 'update',
+        resource: { kind: 'database', name: spec.database.engine, provider: wanted },
+        verified: true,
+        reason: candidates.length === 1
+          ? `A live ${wanted} ${databaseEngineLabel} datastore already exists but is not the durable local binding; refusing to create a duplicate during provider change`
+          : `Multiple live ${wanted} ${databaseEngineLabel} datastores already exist; refusing to create another during provider change`,
+        metadata: candidates.length === 1
+          ? {
+              blockedReason: 'database_adoption_required',
+              externalId: candidates[0].externalId,
+              observedName: candidates[0].name,
+            }
+          : {
+              blockedReason: 'ambiguous_database_identity',
+              externalIds: candidateIds,
+            },
+      });
+      warnings.push(
+        candidates.length === 1
+          ? `The existing ${wanted} database ${candidateIds[0]} must be removed before Hypervibe can continue the provider change; generic database adoption is not implemented.`
+          : `Multiple unbound ${wanted} databases were observed (${candidateIds.join(', ')}). Database mutations are blocked; generic database adoption is not implemented.`,
+      );
+      for (const database of candidates) {
+        unmanaged.push({
+          kind: 'database',
+          name: database.name ?? database.engine,
+          detail: `${database.provider} datastore ${database.externalId} is an unbound provider-change candidate`,
+        });
+      }
     } else if (currentDbProvider !== wanted) {
       warnings.push(
         `Database provider change from ${currentDbProvider} to ${wanted} is staged: this plan creates the new database only. Hypervibe does not migrate data automatically and will not delete the old database in this plan.`
@@ -604,7 +1112,9 @@ export function diffEnvironment(input: {
         verified: dbVerified,
         reason: `Database provider changes from ${currentDbProvider} to ${wanted}. Create the new database first; services and old database deletion are planned after the new database is recorded locally.`,
         billable: true,
-        dependsOn: wanted === provider ? projectDep : undefined,
+        dependsOn: wanted === provider || input.databaseDependsOnHostingProject
+          ? projectDep
+          : undefined,
       });
     } else if (observedDb && !localDb) {
       actions.push({
@@ -612,7 +1122,7 @@ export function diffEnvironment(input: {
         type: 'update',
         resource: { kind: 'database', name: spec.database.engine, provider: wanted },
         verified: true,
-        reason: `A live ${wanted} ${spec.database.engine} datastore exists but is not adopted into Hypervibe state`,
+        reason: `A live ${wanted} ${spec.database.engine} datastore exists without a durable Hypervibe binding`,
         metadata: {
           blockedReason: 'database_adoption_required',
           externalId: observedDb.externalId,
@@ -622,7 +1132,7 @@ export function diffEnvironment(input: {
       unmanaged.push({
         kind: 'database',
         name: observedDb.name ?? observedDb.engine,
-        detail: `${observedDb.provider} datastore ${observedDb.externalId} requires explicit hv_import adoption`,
+        detail: `${observedDb.provider} datastore ${observedDb.externalId} is unbound; generic database adoption is not implemented`,
       });
     } else {
       actions.push({
@@ -636,15 +1146,36 @@ export function diffEnvironment(input: {
         warnings.push(
           `Database cutover from ${previousDbProvider} to ${wanted} is pending: restore data into ${wanted}, apply the service env updates, verify health, then confirm the old ${previousDbProvider} destroy.`
         );
-        actions.push({
-          id: `database:${previousDbProvider}:destroy`,
-          type: 'destroy',
-          resource: { kind: 'database', name: spec.database.engine, provider: previousDbProvider },
-          verified: dbVerified,
-          reason: `Previous ${previousDbProvider} database is no longer active. Data is NOT migrated automatically — confirm only after cutover is verified.`,
-          dataBearing: true,
-          requiresConfirm: true,
-        });
+        if (previousDbExternalId && previousDbDestroyScope && previousDbBindings) {
+          actions.push({
+            id: `database:${previousDbProvider}:destroy`,
+            type: 'destroy',
+            resource: { kind: 'database', name: spec.database.engine, provider: previousDbProvider },
+            // The active provider observation cannot verify a retained database
+            // that belongs to a different provider connection.
+            verified: false,
+            reason: `Previous ${previousDbProvider} database is no longer active. Data is NOT migrated automatically — confirm only after cutover is verified.`,
+            dataBearing: true,
+            requiresConfirm: true,
+            metadata: {
+              externalId: previousDbExternalId,
+              providerScope: previousDbDestroyScope,
+              bindingsFingerprint: bindingIdentityFingerprint(previousDbBindings),
+            },
+          });
+        } else {
+          actions.push({
+            id: `database:${previousDbProvider}:destroy`,
+            type: 'update',
+            resource: { kind: 'database', name: spec.database.engine, provider: previousDbProvider },
+            verified: false,
+            reason: `The retained ${previousDbProvider} database binding lacks an exact provider id or scope; refusing to authorize its destruction`,
+            metadata: { blockedReason: 'database_previous_binding_incomplete' },
+          });
+          warnings.push(
+            `Repair or explicitly resolve the retained ${previousDbProvider} database provider id and scope before cleanup.`
+          );
+        }
       }
     }
 
@@ -688,20 +1219,100 @@ export function diffEnvironment(input: {
       reason: 'Database was removed from the spec, but live observation is unknown; refusing to destroy it',
       metadata: { blockedReason: 'database_observation_unknown' },
     });
-  } else if (localDb && currentDbProvider) {
-    // Spec no longer declares a database but we manage one: confirm-gated destroy.
-    actions.push({
-      id: `database:${currentDbProvider}:destroy`,
-      type: 'destroy',
-      resource: { kind: 'database', name: localDb.type, provider: currentDbProvider },
-      verified: dbVerified,
-      reason: 'Database removed from spec. Data will be lost — confirm to destroy.',
-      dataBearing: true,
-      requiresConfirm: true,
-      dependsOn: actions
-        .filter((action) => action.resource.kind === 'service' && action.type === 'destroy')
-        .map((action) => action.id),
-    });
+  } else if (localDb && (currentDbProvider ?? localDbProvider)) {
+    const destroyDbProvider = currentDbProvider ?? localDbProvider!;
+    // A completed provider cutover can leave two managed data-bearing resources
+    // in one component. Retire the retained provider first so deleting the
+    // current component cannot discard the only durable identity for the old
+    // database. The current action fingerprints the binding shape that will
+    // remain after the retained cleanup succeeds.
+    const serviceDestroyDependencies = actions
+      .filter((action) => action.resource.kind === 'service' && action.type === 'destroy')
+      .map((action) => action.id);
+    const currentDestroyId = `database:${destroyDbProvider}:destroy`;
+    const currentBindingComplete = Boolean(
+      localDbProvider === destroyDbProvider
+      && localDbExternalId
+      && localDbDestroyScope
+      && localDbBindings
+    );
+
+    if (!currentBindingComplete) {
+      actions.push({
+        id: currentDestroyId,
+        type: 'update',
+        resource: { kind: 'database', name: localDb.type, provider: destroyDbProvider },
+        verified: false,
+        reason: `Database was removed from the spec, but its durable ${destroyDbProvider} binding lacks an exact provider id, provider name, or scope; refusing to authorize destruction`,
+        metadata: { blockedReason: 'database_binding_incomplete' },
+      });
+      warnings.push(
+        `Repair or explicitly resolve the ${destroyDbProvider} database provider id and scope before cleanup.`
+      );
+    } else {
+      const retainedPreviousDestroyId = previousDbProvider && previousDbProvider !== destroyDbProvider
+        ? `database:${previousDbProvider}:destroy`
+        : undefined;
+      let currentBindingsForDestroy = localDbBindings!;
+
+      if (retainedPreviousDestroyId) {
+        if (previousDbExternalId && previousDbDestroyScope && previousDbBindings) {
+          actions.push({
+            id: retainedPreviousDestroyId,
+            type: 'destroy',
+            resource: { kind: 'database', name: localDb.type, provider: previousDbProvider! },
+            verified: false,
+            reason: `Database was removed from the spec. Destroy the retained ${previousDbProvider} database before the active ${destroyDbProvider} database so neither durable identity is lost.`,
+            dataBearing: true,
+            requiresConfirm: true,
+            metadata: {
+              externalId: previousDbExternalId,
+              providerScope: previousDbDestroyScope,
+              bindingsFingerprint: bindingIdentityFingerprint(previousDbBindings),
+            },
+          });
+        } else {
+          actions.push({
+            id: retainedPreviousDestroyId,
+            type: 'update',
+            resource: { kind: 'database', name: localDb.type, provider: previousDbProvider! },
+            verified: false,
+            reason: `Database was removed from the spec, but the retained ${previousDbProvider} database binding lacks an exact provider id or scope; refusing to discard it while destroying the active database`,
+            metadata: { blockedReason: 'database_previous_binding_incomplete' },
+          });
+          warnings.push(
+            `The retained ${previousDbProvider} database binding is incomplete. Repair or explicitly resolve its durable provider identity before destroying the active ${destroyDbProvider} database.`
+          );
+        }
+
+        currentBindingsForDestroy = { ...currentBindingsForDestroy };
+        delete currentBindingsForDestroy.previousProvider;
+        delete currentBindingsForDestroy.previousExternalId;
+        delete currentBindingsForDestroy.previousBindings;
+      }
+
+      // Spec no longer declares a database but we manage one: confirm-gated destroy.
+      actions.push({
+        id: currentDestroyId,
+        type: 'destroy',
+        resource: { kind: 'database', name: localDb.type, provider: destroyDbProvider },
+        verified: dbVerified,
+        reason: observedDb
+          ? 'Database removed from spec. Data will be lost — confirm to destroy.'
+          : 'Database removed from spec and its exact bound provider identity is already absent. Confirm the idempotent teardown to clear the durable local binding.',
+        dataBearing: true,
+        requiresConfirm: true,
+        metadata: {
+          externalId: localDbExternalId,
+          providerScope: localDbDestroyScope,
+          bindingsFingerprint: bindingIdentityFingerprint(currentBindingsForDestroy),
+        },
+        dependsOn: [
+          ...(retainedPreviousDestroyId ? [retainedPreviousDestroyId] : []),
+          ...serviceDestroyDependencies,
+        ],
+      });
+    }
   } else if (observedDb && !localDb) {
     unmanaged.push({
       kind: 'database',
@@ -713,13 +1324,18 @@ export function diffEnvironment(input: {
   const activeDatabaseAction = activeDatabaseActionId
     ? actions.find((action) => action.id === activeDatabaseActionId)
     : undefined;
-  if (activeDatabaseAction && activeDatabaseAction.type !== 'noop' && !currentDbProvider) {
+  const activeDatabaseBlocked = typeof activeDatabaseAction?.metadata?.blockedReason === 'string';
+  if (
+    activeDatabaseAction
+    && activeDatabaseAction.type !== 'noop'
+    && (!currentDbProvider || activeDatabaseBlocked)
+  ) {
     for (const serviceAction of actions.filter((action) =>
       action.resource.kind === 'service'
       && action.type !== 'destroy'
       && !action.id.includes(':env-remove')
     )) {
-      if (serviceAction.type === 'noop') {
+      if (serviceAction.type === 'noop' && !activeDatabaseBlocked) {
         serviceAction.type = 'update';
         serviceAction.reason = `${serviceAction.reason}; wire the newly created ${activeDatabaseAction.resource.provider} database`;
       }
@@ -986,7 +1602,10 @@ function diffServiceConfig(
   spec: ServiceSpec,
   live: ObservedService,
   envVars: Record<string, string>,
-  options: { presenceOnlyEnvVars?: Set<string> } = {}
+  options: {
+    presenceOnlyEnvVars?: Set<string>;
+    cacheNetwork?: NonNullable<NonNullable<LocalSnapshot['bindings']>['cacheNetwork']>;
+  } = {}
 ): PlanFieldDiff[] {
   const diff: PlanFieldDiff[] = [];
 
@@ -1015,6 +1634,17 @@ function diffServiceConfig(
       continue;
     } else if (liveHash !== hashEnvValue(value)) {
       diff.push({ field: `env:${key}` });
+    }
+  }
+
+  if (options.cacheNetwork?.network && options.cacheNetwork.subnetwork && options.cacheNetwork.egress) {
+    const wanted = {
+      network: options.cacheNetwork.network,
+      subnetwork: options.cacheNetwork.subnetwork,
+      egress: options.cacheNetwork.egress,
+    };
+    if (JSON.stringify(live.config.cacheNetwork) !== JSON.stringify(wanted)) {
+      diff.push({ field: 'cacheNetwork' });
     }
   }
 

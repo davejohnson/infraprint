@@ -58,11 +58,14 @@ export class BitwardenAdapter implements ISecretManagerAdapter {
   private async resolveSecretId(client: BwClient, path: string): Promise<string> {
     if (UUID_RE.test(path)) return path;
     const list = await client.secrets().list(this.credentials!.organizationId);
-    const match = list.data.find((s) => s.key === path);
-    if (!match) {
+    const matches = list.data.filter((secret) => secret.key === path);
+    if (matches.length === 0) {
       throw new Error(`No Bitwarden secret named "${path}" in organization ${this.credentials!.organizationId}`);
     }
-    return match.id;
+    if (matches.length > 1) {
+      throw new Error(`Multiple Bitwarden secrets named "${path}" exist in organization ${this.credentials!.organizationId}; use the exact secret UUID.`);
+    }
+    return matches[0]!.id;
   }
 
   async verify(): Promise<SecretManagerVerifyResult> {
@@ -81,17 +84,31 @@ export class BitwardenAdapter implements ISecretManagerAdapter {
     }
   }
 
-  async getSecret(path: string, _key?: string, _version?: string): Promise<ResolvedSecret> {
+  async getSecret(path: string, key?: string, version?: string): Promise<ResolvedSecret> {
+    if (key !== undefined) {
+      throw new Error('Bitwarden Secrets Manager values are scalar; select the secret by path instead of key.');
+    }
+    if (version !== undefined) {
+      throw new Error('Bitwarden Secrets Manager does not support selecting a historical version.');
+    }
     const client = await this.getClient();
     const id = await this.resolveSecretId(client, path);
     const secret = await client.secrets().get(id);
+    if (secret.id !== id) {
+      throw new Error(`Bitwarden returned secret ${secret.id}, not the requested identity ${id}.`);
+    }
+    if (!UUID_RE.test(path) && secret.key !== path) {
+      throw new Error(`Bitwarden secret ${id} is named "${secret.key}", not requested name "${path}".`);
+    }
     return { value: secret.value };
   }
 
-  async listSecrets(_pathPrefix?: string): Promise<SecretListItem[]> {
+  async listSecrets(pathPrefix?: string): Promise<SecretListItem[]> {
     const client = await this.getClient();
     const list = await client.secrets().list(this.credentials!.organizationId);
-    return list.data.map((s) => ({ path: s.key }));
+    return list.data
+      .filter((secret) => !pathPrefix || secret.key.startsWith(pathPrefix))
+      .map((secret) => ({ path: secret.key }));
   }
 }
 

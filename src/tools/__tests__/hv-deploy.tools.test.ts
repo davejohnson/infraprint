@@ -9,6 +9,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { SqliteAdapter } from '../../adapters/db/sqlite.adapter.js';
 import '../../adapters/providers/railway/railway.adapter.js';
+import '../../adapters/providers/gcp/cloudrun.adapter.js';
+import '../../adapters/providers/gcp/cloudsql.adapter.js';
 import { ProjectRepository } from '../../adapters/db/repositories/project.repository.js';
 import { EnvironmentRepository } from '../../adapters/db/repositories/environment.repository.js';
 import { ServiceRepository } from '../../adapters/db/repositories/service.repository.js';
@@ -25,7 +27,7 @@ import {
   buildBranchDeployWorkflow,
   resolveBranchDeployTargets,
 } from '../../domain/services/github-ops.service.js';
-import { createToolContext } from '../context.js';
+import { createToolContext } from '../../application/context.js';
 import { registerHvDeployTools } from '../hv-deploy.tools.js';
 
 let tempDir: string;
@@ -524,6 +526,51 @@ describe('hv_deploy database env injection', () => {
       },
       async setEnvVars() { return { success: true, message: 'ok' }; },
       async getDeployStatus() { return { status: 'deployed' }; },
+      async observe() {
+        return {
+          provider: 'cloudrun',
+          observedAt: new Date().toISOString(),
+          projectExists: true,
+          projectId: 'gcp-project',
+          services: [
+            {
+              name: 'web',
+              externalId: 'gcp-project-web',
+              workloadKind: 'web' as const,
+              customDomains: [],
+              config: {},
+              envVarKeys: [],
+              envVarHashes: {},
+              status: 'running' as const,
+              sourceState: 'disconnected' as const,
+            },
+            {
+              name: 'events-worker',
+              externalId: 'gcp-project-events-worker',
+              workloadKind: 'worker' as const,
+              customDomains: [],
+              config: {},
+              envVarKeys: [],
+              envVarHashes: {},
+              status: 'running' as const,
+              sourceState: 'disconnected' as const,
+            },
+          ],
+          databases: [],
+          caches: [],
+          storage: [],
+          completeness: {
+            project: 'complete' as const,
+            environment: 'complete' as const,
+            services: 'complete' as const,
+            databases: 'unknown' as const,
+            caches: 'complete' as const,
+            storage: 'complete' as const,
+          },
+          partial: false,
+          warnings: [],
+        };
+      },
     };
     new SpecStore().replace(project, {
       version: 1,
@@ -547,9 +594,22 @@ describe('hv_deploy database env injection', () => {
     seedVerifiedConnection('cloudrun');
     seedVerifiedConnection('cloudsql');
     vi.spyOn(adapterFactory, 'getHostingAdapter').mockResolvedValue({ success: true, adapter: fakeAdapter });
+    vi.spyOn(adapterFactory, 'getProviderAdapter').mockResolvedValue({
+      success: true,
+      adapter: fakeAdapter as never,
+    });
     vi.spyOn(adapterFactory, 'getDatabaseAdapter').mockResolvedValue({
       success: true,
-      adapter: { name: 'cloudsql' } as never,
+      adapter: {
+        name: 'cloudsql',
+        observeDatabase: async () => ({
+          provider: 'cloudsql',
+          engine: 'postgres',
+          externalId: 'production-postgres',
+          name: 'dbenv-app-production-postgres',
+          status: 'running',
+        }),
+      } as never,
     });
 
     const t = await makeClient();
@@ -928,7 +988,7 @@ describe('hv_rollback', () => {
     await t.close();
   });
 
-  it('records the rollback as a plan/apply run pair with per-service receipts', async () => {
+  it('fails closed for an old direct-provider run without immutable release evidence and performs no provider mutation', async () => {
     const project = new ProjectRepository().create({ name: 'rollback-pair-app', defaultPlatform: 'railway' });
     const environment = new EnvironmentRepository().create({ projectId: project.id, name: 'staging' });
     new ServiceRepository().create({ projectId: project.id, name: 'web', buildConfig: {}, envVarSpec: {} });
@@ -944,6 +1004,15 @@ describe('hv_rollback', () => {
     runRepo.addReceipt(priorRun.id, { step: 'deploy_web', status: 'success', timestamp: new Date().toISOString() });
     runRepo.updateStatus(priorRun.id, 'succeeded');
 
+    const ensureProject = vi.fn(async () => ({ success: true, message: 'ok', data: { projectId: 'rp', environmentId: 're' } }));
+    const deploy = vi.fn(async (service: { id: string }) => ({
+      serviceId: service.id,
+      externalId: 'rail-web',
+      url: 'https://web.up.railway.app',
+      status: 'deployed' as const,
+      receipt: { success: true, message: 'deployed' },
+    }));
+    const setEnvVars = vi.fn(async () => ({ success: true, message: 'ok' }));
     const fakeAdapter: IHostingAdapter = {
       name: 'railway',
       capabilities: {
@@ -959,47 +1028,38 @@ describe('hv_rollback', () => {
       },
       async connect() {},
       async verify() { return { success: true }; },
-      async ensureProject() { return { success: true, message: 'ok', data: { projectId: 'rp', environmentId: 're' } }; },
-      async deploy(service) {
-        return {
-          serviceId: service.id,
-          externalId: 'rail-web',
-          url: 'https://web.up.railway.app',
-          status: 'deployed',
-          receipt: { success: true, message: 'deployed' },
-        };
-      },
-      async setEnvVars() { return { success: true, message: 'ok' }; },
+      ensureProject,
+      deploy,
+      setEnvVars,
       async getDeployStatus() { return { status: 'deployed', url: 'https://web.up.railway.app' }; },
     };
-    vi.spyOn(adapterFactory, 'getHostingAdapter').mockResolvedValue({ success: true, adapter: fakeAdapter });
+    const adapterLookup = vi.spyOn(adapterFactory, 'getHostingAdapter')
+      .mockResolvedValue({ success: true, adapter: fakeAdapter });
+    const runIdsBefore = runRepo.findByEnvironmentId(environment.id).map((run) => run.id);
 
     const t = await makeClient();
-    const result = await t.call('hv_rollback', { project: 'rollback-pair-app', env: 'staging' });
-    expect(result.ok).toBe(true);
-    expect(result.data.rollbackFromRunId).toBe(priorRun.id);
-    expect(typeof result.data.planId).toBe('string');
-    expect(typeof result.data.applyRunId).toBe('string');
-    expect(result.data.services).toEqual(['web']);
-
-    // The synthetic plan run carries the rollback action with fromRunId.
-    const planRun = runRepo.findById(result.data.planId)!;
-    expect(planRun.type).toBe('plan');
-    const doc = planRun.plan as Record<string, any>;
-    expect(doc.actions).toHaveLength(1);
-    expect(doc.actions[0].id).toBe('service:web:rollback');
-    expect(doc.actions[0].metadata).toMatchObject({ operation: 'rollbackRedeploy', fromRunId: priorRun.id });
-
-    // The apply run has a per-service receipt.
-    const applyRun = runRepo.findById(result.data.applyRunId)!;
-    expect(applyRun.type).toBe('apply');
-    expect(applyRun.receipts.some((receipt) => receipt.step === 'service:web:rollback' && receipt.status === 'success')).toBe(true);
+    const result = await t.call('hv_rollback', {
+      project: 'rollback-pair-app',
+      env: 'staging',
+      toRunId: priorRun.id,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('UNSUPPORTED');
+    expect(result.error.message).toContain('do not retain verified immutable');
+    expect(result.error.message).toContain('refuses to redeploy the current spec or checkout');
+    expect(result.hint).toContain('Use hv_deploy only when you intend to deploy the current desired state');
+    expect(adapterLookup).not.toHaveBeenCalled();
+    expect(ensureProject).not.toHaveBeenCalled();
+    expect(setEnvVars).not.toHaveBeenCalled();
+    expect(deploy).not.toHaveBeenCalled();
+    expect(runRepo.findByEnvironmentId(environment.id).map((run) => run.id)).toEqual(runIdsBefore);
     await t.close();
   });
 
-  it('still validates toRunId against successful deploy runs', async () => {
+  it('does not treat an arbitrary direct-provider toRunId as rollback authority', async () => {
     const project = new ProjectRepository().create({ name: 'rollback-invalid-app', defaultPlatform: 'railway' });
     new EnvironmentRepository().create({ projectId: project.id, name: 'staging' });
+    const adapterLookup = vi.spyOn(adapterFactory, 'getHostingAdapter');
 
     const t = await makeClient();
     const result = await t.call('hv_rollback', {
@@ -1008,8 +1068,9 @@ describe('hv_rollback', () => {
       toRunId: '00000000-0000-4000-8000-000000000000',
     });
     expect(result.ok).toBe(false);
-    expect(result.error.code).toBe('VALIDATION');
-    expect(result.error.message).toContain('not a successful deploy run');
+    expect(result.error.code).toBe('UNSUPPORTED');
+    expect(result.error.message).toContain('cannot prove that a historical run can be restored');
+    expect(adapterLookup).not.toHaveBeenCalled();
     await t.close();
   });
 

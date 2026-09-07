@@ -5,4 +5,3 @@ export * from './component.entity.js';
 export * from './connection.entity.js';
 export * from './run.entity.js';
 export * from './audit.entity.js';
-export * from './integration.entity.js';

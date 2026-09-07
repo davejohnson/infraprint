@@ -248,16 +248,38 @@ async function inspectTwilio(
   }
   if (request.id) {
     const service = await adapter.getMessagingService(request.id);
+    const services = service ? [{ id: service.sid, name: service.friendly_name, ...service }] : [];
     return {
       observation: service ? 'present' : 'absent',
       resource: request.resource,
+      services,
       ...(service ? { service } : { id: request.id }),
+      truncated: false,
+      partial: false,
     };
   }
-  const services = (await adapter.listMessagingServices(request.limit))
+  const fetchLimit = request.name ? 1000 : Math.min(1000, request.limit + 1);
+  const listed = await adapter.listMessagingServices(fetchLimit);
+  const matches = listed
     .filter((service) => !request.name || service.friendly_name === request.name)
-    .slice(0, request.limit);
-  return { observation: 'present', resource: request.resource, services };
+    .map((service) => ({ id: service.sid, name: service.friendly_name, ...service }));
+  const incompleteExactSearch = Boolean(request.name && listed.length >= fetchLimit && matches.length === 0);
+  const ambiguous = Boolean(request.name && matches.length > 1);
+  const truncated = matches.length > request.limit;
+  return {
+    observation: incompleteExactSearch
+      ? 'unknown'
+      : ambiguous
+        ? 'ambiguous'
+        : matches.length > 0
+          ? 'present'
+          : 'absent',
+    resource: request.resource,
+    services: matches.slice(0, request.limit),
+    ...(matches.length === 0 && request.name ? { name: request.name } : {}),
+    truncated,
+    partial: incompleteExactSearch || truncated,
+  };
 }
 
 providerRegistry.register({
@@ -277,7 +299,7 @@ providerRegistry.register({
     resources: ['messaging-service'],
     defaultResource: 'messaging-service',
     selectors: {
-      'messaging-service': { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true },
+      'messaging-service': { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, collectionKey: 'services' },
     },
     inspect: (adapter, request) => inspectTwilio(adapter as TwilioAdapter, request),
   },

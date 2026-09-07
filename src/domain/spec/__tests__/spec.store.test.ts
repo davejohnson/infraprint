@@ -63,6 +63,27 @@ describe('desiredStateToSpec', () => {
     expect(env.deploy).toEqual({ strategy: 'branch', branch: 'main' });
     expect(env.migrations).toMatchObject({ mode: 'releaseCommand', command: 'npm run migrate' });
   });
+
+  it('preserves an explicit legacy desired-state branch for a custom environment', () => {
+    const project = {
+      name: 'preview-app',
+      defaultPlatform: 'railway',
+      policies: {
+        desiredState: {
+          environmentName: 'qa-7',
+          services: ['web'],
+          databaseProvider: 'railway',
+          setupEmail: false,
+          deploy: { strategy: 'branch', branch: 'release/qa-7' },
+        },
+      },
+    } as unknown as Project;
+
+    expect(desiredStateToSpec(project)?.environments['qa-7'].deploy).toEqual({
+      strategy: 'branch',
+      branch: 'release/qa-7',
+    });
+  });
 });
 
 describe('deepMergeSpec', () => {
@@ -278,6 +299,41 @@ describe('SpecStore', () => {
     }
   });
 
+  it('refuses to overwrite a corrupt repo spec or append a divergent local revision', () => {
+    const oldCwd = process.cwd();
+    const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+    const repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-corrupt-repo-spec-write-')));
+    mkdirSync(path.join(repoDir, '.git'));
+    mkdirSync(path.join(repoDir, '.hypervibe'));
+    const specPath = path.join(repoDir, '.hypervibe', 'spec.json');
+    const malformed = '{"apiToken":"must-not-be-overwritten",';
+
+    try {
+      process.env.HYPERVIBE_DISABLE_REPO_SPEC = '0';
+      process.chdir(repoDir);
+      writeFileSync(specPath, malformed, 'utf8');
+      const project = makeProject();
+      const replacement = projectSpecSchema.parse({
+        version: 1,
+        project: project.name,
+        environments: {},
+      });
+
+      expect(() => writeRepoSpecFile(replacement)).toThrow(/is not valid JSON/);
+      expect(() => new SpecStore().replace(project, replacement)).toThrow(/is not valid JSON/);
+      expect(readFileSync(specPath, 'utf8')).toBe(malformed);
+      const count = SqliteAdapter.getInstance().getDb()
+        .prepare('SELECT COUNT(*) AS count FROM project_specs WHERE project_id = ?')
+        .get(project.id) as { count: number };
+      expect(count.count).toBe(0);
+    } finally {
+      process.chdir(oldCwd);
+      if (oldDisable === undefined) delete process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+      else process.env.HYPERVIBE_DISABLE_REPO_SPEC = oldDisable;
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
   it('preserves existing env template content and adds only missing reCAPTCHA slots', () => {
     const oldCwd = process.cwd();
     const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
@@ -323,5 +379,36 @@ describe('SpecStore', () => {
     const project = makeProject();
     const store = new SpecStore();
     expect(() => store.replace(project, { version: 1, project: project.name, environments: { staging: {} } })).toThrow();
+  });
+
+  it('fails closed on corrupt or schema-invalid stored desired state without appending a replacement revision', () => {
+    const project = makeProject();
+    const store = new SpecStore();
+    store.replace(project, {
+      version: 1,
+      project: project.name,
+      environments: {},
+    });
+    const db = SqliteAdapter.getInstance().getDb();
+
+    db.prepare('UPDATE project_specs SET document = ? WHERE project_id = ?')
+      .run('{"secret":"must-not-appear",', project.id);
+    expect(() => store.get(project)).toThrow(/persisted JSON is corrupt/);
+    expect(() => store.getRevision(project.id, 1)).toThrow(/persisted JSON is corrupt/);
+    try {
+      store.get(project);
+    } catch (error) {
+      expect(String(error)).not.toContain('must-not-appear');
+    }
+
+    db.prepare('UPDATE project_specs SET document = ? WHERE project_id = ?')
+      .run(JSON.stringify({ version: 1, project: project.name }), project.id);
+    expect(() => store.get(project)).toThrow(/persisted JSON has an invalid shape/);
+    expect(() => store.getRevision(project.id, 1)).toThrow(/persisted JSON has an invalid shape/);
+    expect(() => store.merge(project, { environments: {} })).toThrow(/persisted JSON has an invalid shape/);
+
+    const count = db.prepare('SELECT COUNT(*) AS count FROM project_specs WHERE project_id = ?')
+      .get(project.id) as { count: number };
+    expect(count.count).toBe(1);
   });
 });

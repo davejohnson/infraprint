@@ -87,12 +87,19 @@ export class VaultAdapter implements ISecretManagerAdapter {
   }
 
   async getSecret(path: string, key?: string, version?: string): Promise<ResolvedSecret> {
+    if (version !== undefined && !/^[1-9]\d*$/.test(version)) {
+      throw new Error('Vault KV v2 version must be a positive integer.');
+    }
     // Vault KV v2 paths need /data/ inserted
     const apiPath = this.toKv2Path(path, 'data');
-    const endpoint = version ? `${apiPath}?version=${version}` : apiPath;
+    const endpoint = version ? `${apiPath}?version=${encodeURIComponent(version)}` : apiPath;
 
     const response = await this.request<VaultSecretResponse>('GET', endpoint);
     const data = response.data.data;
+    const observedVersion = response.data.metadata?.version?.toString();
+    if (version !== undefined && observedVersion !== version) {
+      throw new Error(`Vault returned version ${observedVersion ?? 'unknown'}, not requested version ${version}.`);
+    }
 
     if (key) {
       if (!(key in data)) {
@@ -131,8 +138,11 @@ export class VaultAdapter implements ISecretManagerAdapter {
   }
 
   async listSecrets(pathPrefix?: string): Promise<SecretListItem[]> {
+    if (!pathPrefix) {
+      throw new Error('Vault KV v2 listing requires pathPrefix to identify the mount, for example "secret".');
+    }
     try {
-      const basePath = pathPrefix || '';
+      const basePath = pathPrefix.replace(/\/+$/, '');
       const apiPath = this.toKv2Path(basePath, 'metadata');
 
       const response = await this.request<VaultListResponse>('LIST', apiPath);
@@ -239,7 +249,7 @@ secretManagerRegistry.register({
     credentialsSchema: VaultCredentialsSchema,
     setupHelpUrl: 'https://developer.hashicorp.com/vault/docs',
   },
-  factory: (credentials) => {
+  factory: (_credentials) => {
     const adapter = new VaultAdapter();
     // connect() is async, will be called separately
     return adapter;

@@ -36,6 +36,7 @@ import {
 } from '../../domain/services/ci-rollback.contract.js';
 import { DATABASE_RESILIENCE_OPERATIONS } from '../../domain/services/database-resilience-plan.service.js';
 import { LOAD_BALANCER_OPERATIONS } from '../../domain/services/load-balancer-plan.service.js';
+import { MAINTENANCE_OPERATIONS } from '../../domain/services/maintenance-plan.service.js';
 import { MESSAGING_OPERATIONS } from '../../domain/services/twilio-messaging.service.js';
 import { DOMAIN_DETACH_OPERATION } from '../../domain/services/domain-attach-policy.js';
 import {
@@ -63,6 +64,7 @@ function action(params: {
   provider?: string;
   operation?: string;
   metadata?: Record<string, unknown>;
+  billable?: boolean;
   dataBearing?: boolean;
   requiresConfirm?: boolean;
 } = {}): PlanAction {
@@ -76,6 +78,7 @@ function action(params: {
     },
     verified: true,
     reason: 'contract fixture',
+    ...(params.billable ? { billable: true } : {}),
     ...(params.dataBearing ? { dataBearing: true } : {}),
     ...(params.requiresConfirm ? { requiresConfirm: true } : {}),
     ...(
@@ -119,6 +122,8 @@ const authorized: AuthorizedCase[] = [
       name: 'example.com',
       provider: 'cloudflare',
       operation: 'cloudflareRegistrarRegistration',
+      billable: true,
+      requiresConfirm: true,
       metadata: { accountId: 'cf-account' },
     }),
   },
@@ -511,7 +516,12 @@ const authorized: AuthorizedCase[] = [
       name: 'owner/repo',
       provider: 'github',
       operation,
-      metadata: { repository: 'owner/repo' },
+      billable: operation === 'githubCodeScanning',
+      requiresConfirm: operation === 'githubCodeScanning',
+      metadata: {
+        repository: 'owner/repo',
+        ...(operation === 'githubCodeScanning' ? { privateRepository: true } : {}),
+      },
     }),
   })),
   ...Object.values(IOS_OPERATIONS).map((operation): AuthorizedCase => {
@@ -539,6 +549,24 @@ const authorized: AuthorizedCase[] = [
       }),
     };
   }),
+  {
+    label: MAINTENANCE_OPERATIONS.edgeEnable,
+    capability: 'maintenance.edge.mutate',
+    action: action({
+      id: 'maintenance:production:edge',
+      type: 'update',
+      kind: 'maintenance',
+      name: 'app.example.com',
+      provider: 'cloudflare',
+      operation: MAINTENANCE_OPERATIONS.edgeEnable,
+      billable: true,
+      requiresConfirm: true,
+      metadata: {
+        environmentName: 'production',
+        hostname: 'app.example.com',
+      },
+    }),
+  },
   ...Object.values(QUEUE_OPERATIONS).map((operation): AuthorizedCase => ({
     label: operation,
     capability: 'queue.mutate',
@@ -549,7 +577,21 @@ const authorized: AuthorizedCase[] = [
       name: 'jobs',
       provider: 'cloudrun',
       operation,
-      metadata: { queueName: 'jobs' },
+      dataBearing: operation === QUEUE_OPERATIONS.destroy,
+      requiresConfirm: operation === QUEUE_OPERATIONS.destroy,
+      metadata: {
+        queueName: 'jobs',
+        backend: 'pubsub',
+        providerScope: { projectId: 'gcp-project' },
+        ...(operation === QUEUE_OPERATIONS.destroy
+          ? {
+              backend: 'pubsub',
+              topicName: 'projects/gcp-project/topics/jobs',
+              subscriptionName: 'projects/gcp-project/subscriptions/jobs',
+              providerScope: { projectId: 'gcp-project' },
+            }
+          : {}),
+      },
     }),
   })),
   ...Object.values(STORAGE_OPERATIONS).map((operation): AuthorizedCase => ({
@@ -566,11 +608,20 @@ const authorized: AuthorizedCase[] = [
       name: 'documents',
       provider: 'railway',
       operation,
+      billable: operation === STORAGE_OPERATIONS.ensure,
+      dataBearing: operation === STORAGE_OPERATIONS.destroy,
+      requiresConfirm: operation === STORAGE_OPERATIONS.destroy,
       metadata: {
         storageName: 'documents',
+        ...(operation === STORAGE_OPERATIONS.destroy
+          ? {
+              externalId: 'bucket-1',
+              instanceScope: { projectId: 'railway-project', environmentId: 'railway-environment' },
+            }
+          : {}),
         ...(
           operation === STORAGE_OPERATIONS.wire || operation === STORAGE_OPERATIONS.unwire
-            ? { serviceName: 'web' }
+            ? { serviceName: 'web', serviceId: 'service-1' }
             : {}
         ),
       },
@@ -609,13 +660,23 @@ const authorized: AuthorizedCase[] = [
         name: 'app.example.com',
         provider: 'cloudflare',
         operation,
+        billable: operation === LOAD_BALANCER_OPERATIONS.poolEnsure
+          || operation === LOAD_BALANCER_OPERATIONS.ensure,
         metadata: {
           hostname: 'app.example.com',
           accountId: 'account-1',
           zoneId: 'zone-1',
           configHash: 'config-hash',
           ...(!destroy && monitor ? { externalName: 'monitor-name' } : {}),
-          ...(!destroy && pool ? { externalName: 'pool-name', services: ['web-a', 'web-b'] } : {}),
+          ...(!destroy && pool ? {
+            externalName: 'pool-name',
+            services: ['web-a', 'web-b'],
+            origins: [
+              { name: 'web-a', address: 'a.example', hostHeader: 'a.example', enabled: true },
+              { name: 'web-b', address: 'b.example', hostHeader: 'b.example', enabled: true },
+            ],
+            originsHash: 'a'.repeat(64),
+          } : {}),
           ...(!destroy && !monitor && !pool ? { services: ['web-a', 'web-b'] } : {}),
           ...(destroy ? { externalId: 'external-1' } : {}),
         },
@@ -705,7 +766,9 @@ const authorized: AuthorizedCase[] = [
     capability: 'hosting.deploy-source.disconnect',
     action: action({ operation: PROVIDER_NATIVE_SOURCE_DISCONNECT_OPERATION, metadata: { serviceId: 'svc-1' } }),
   },
-  ...Object.values(CACHE_OPERATIONS).map((operation): AuthorizedCase => ({
+  ...Object.values(CACHE_OPERATIONS)
+    .filter((operation) => operation !== CACHE_OPERATIONS.retainedDestroy)
+    .map((operation): AuthorizedCase => ({
     label: operation,
     capability: operation === CACHE_OPERATIONS.ensure
       ? 'cache.provision'
@@ -722,13 +785,51 @@ const authorized: AuthorizedCase[] = [
       kind: 'cache',
       name: 'redis',
       operation,
-      metadata: operation === CACHE_OPERATIONS.unwire ? { serviceName: 'web' } : undefined,
+      billable: operation === CACHE_OPERATIONS.ensure,
+      dataBearing: operation === CACHE_OPERATIONS.destroy,
+      requiresConfirm: operation === CACHE_OPERATIONS.destroy,
+      metadata: operation === CACHE_OPERATIONS.unwire
+        ? { serviceName: 'web' }
+        : operation === CACHE_OPERATIONS.destroy
+          ? {
+              externalId: 'cache-1',
+              providerScope: { projectId: 'railway-project' },
+              bindingsFingerprint: 'b'.repeat(64),
+            }
+          : {
+              region: null,
+              network: null,
+              subnetwork: null,
+              tier: null,
+              size: null,
+            },
     }),
   })),
   {
+    label: 'retained cache destroy',
+    capability: 'cache.retained.destroy',
+    action: action({
+      id: 'cache:memorystore:retained-destroy',
+      type: 'destroy',
+      kind: 'cache',
+      name: 'redis',
+      provider: 'memorystore',
+      operation: CACHE_OPERATIONS.retainedDestroy,
+      metadata: {
+        externalId: 'legacy-cache',
+        name: 'legacy-cache-name',
+        engine: 'redis',
+        providerEngine: 'redis',
+        providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+      },
+      dataBearing: true,
+      requiresConfirm: true,
+    }),
+  },
+  {
     label: 'database provision',
     capability: 'database.provision',
-    action: action({ id: 'database:railway', type: 'create', kind: 'database', name: 'postgres' }),
+    action: action({ id: 'database:railway', type: 'create', kind: 'database', name: 'postgres', billable: true }),
   },
   {
     label: 'database availability configure',
@@ -754,6 +855,7 @@ const authorized: AuthorizedCase[] = [
     action: action({
       id: 'database:cloudsql:replica:analytics', type: 'create', kind: 'database', name: 'analytics', provider: 'cloudsql',
       operation: DATABASE_RESILIENCE_OPERATIONS.replicaProvision,
+      billable: true,
       metadata: { primaryExternalId: 'primary-1', replicaName: 'analytics' },
     }),
   },
@@ -763,6 +865,8 @@ const authorized: AuthorizedCase[] = [
     action: action({
       id: 'database:cloudsql:replica:analytics:destroy', type: 'destroy', kind: 'database', name: 'analytics', provider: 'cloudsql',
       operation: DATABASE_RESILIENCE_OPERATIONS.replicaDestroy,
+      dataBearing: true,
+      requiresConfirm: true,
       metadata: { primaryExternalId: 'primary-1', replicaName: 'analytics', replicaExternalId: 'replica-1' },
     }),
   },
@@ -781,7 +885,15 @@ const authorized: AuthorizedCase[] = [
   {
     label: 'database destroy',
     capability: 'database.destroy',
-    action: action({ id: 'database:railway:destroy', type: 'destroy', kind: 'database', name: 'postgres' }),
+    action: action({
+      id: 'database:railway:destroy', type: 'destroy', kind: 'database', name: 'postgres',
+      dataBearing: true, requiresConfirm: true,
+      metadata: {
+        externalId: 'database-1',
+        providerScope: { projectId: 'railway-project', environmentId: 'railway-environment' },
+        bindingsFingerprint: 'a'.repeat(64),
+      },
+    }),
   },
   {
     label: 'retained database destroy',
@@ -856,7 +968,7 @@ const authorized: AuthorizedCase[] = [
   {
     label: 'hosting service destroy',
     capability: 'hosting.service.destroy',
-    action: action({ type: 'destroy' }),
+    action: action({ type: 'destroy', metadata: { externalId: 'service-1' } }),
   },
   {
     label: 'custom domain configure',
@@ -1097,6 +1209,217 @@ describe('plan action mutation-authority contract', () => {
       ...candidate,
       metadata: { ...candidate.metadata, providerScope: { projectId: '' } },
     })).toBeNull();
+  });
+
+  it('rejects retained cache deletion without its exact identity and complete non-empty provider scope', () => {
+    const candidate = authorized.find((entry) => entry.label === 'retained cache destroy')!.action;
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, name: undefined },
+    })).toBeNull();
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, providerScope: {} },
+    })).toBeNull();
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, providerScope: { projectId: '   ' } },
+    })).toBeNull();
+  });
+
+  it('rejects database deletion without its exact provider id and non-empty provider scope', () => {
+    const candidate = authorized.find((entry) => entry.label === 'database destroy')!.action;
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, externalId: undefined },
+    })).toBeNull();
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, providerScope: undefined },
+    })).toBeNull();
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, providerScope: null },
+    })).toBeNull();
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, providerScope: { projectId: '' } },
+    })).toBeNull();
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, bindingsFingerprint: undefined },
+    })).toBeNull();
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, bindingsFingerprint: 'not-a-sha256' },
+    })).toBeNull();
+  });
+
+  it('rejects hosting service deletion without an exact provider target', () => {
+    const candidate = authorized.find((entry) => entry.label === 'hosting service destroy')!.action;
+    expect(resolvePlanActionAuthority({ ...candidate, metadata: undefined })).toBeNull();
+    expect(resolvePlanActionAuthority({ ...candidate, metadata: { externalId: '' } })).toBeNull();
+  });
+
+  it('rejects storage deletion without its exact provider id and instance scope', () => {
+    const candidate = authorized.find((entry) => entry.label === STORAGE_OPERATIONS.destroy)!.action;
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, externalId: undefined },
+    })).toBeNull();
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, instanceScope: undefined },
+    })).toBeNull();
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, instanceScope: { projectId: '' } },
+    })).toBeNull();
+  });
+
+  it.each([STORAGE_OPERATIONS.wire, STORAGE_OPERATIONS.unwire])(
+    'rejects stale storage service mutation without a pinned service id for %s',
+    (label) => {
+      const candidate = authorized.find((entry) => entry.label === label)!.action;
+      expect(resolvePlanActionAuthority({
+        ...candidate,
+        metadata: { ...candidate.metadata, serviceId: undefined },
+      })).toBeNull();
+    }
+  );
+
+  it('allows create-then-wire only with an explicit service dependency', () => {
+    const candidate = authorized.find((entry) => entry.label === STORAGE_OPERATIONS.wire)!.action;
+    const pending: PlanAction = {
+      ...candidate,
+      dependsOn: ['storage:documents', 'service:web'],
+      metadata: { ...candidate.metadata, serviceId: undefined, serviceIdPending: true },
+    };
+    expect(resolvePlanActionAuthority(pending)).toMatchObject({ capability: 'storage.mutate' });
+    expect(resolvePlanActionAuthority({ ...pending, dependsOn: ['storage:documents'] })).toBeNull();
+  });
+
+  it('rejects cache deletion without its exact provider id and non-empty provider scope', () => {
+    const candidate = authorized.find((entry) => entry.label === CACHE_OPERATIONS.destroy)!.action;
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, externalId: undefined },
+    })).toBeNull();
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, providerScope: undefined },
+    })).toBeNull();
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, providerScope: null },
+    })).toBeNull();
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, bindingsFingerprint: undefined },
+    })).toBeNull();
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, bindingsFingerprint: 'not-a-sha256' },
+    })).toBeNull();
+  });
+
+  it('pins Pub/Sub queue deletion identity while allowing local postgres binding cleanup', () => {
+    const candidate = authorized.find((entry) => entry.label === QUEUE_OPERATIONS.destroy)!.action;
+    for (const key of ['topicName', 'subscriptionName', 'providerScope'] as const) {
+      expect(resolvePlanActionAuthority({
+        ...candidate,
+        metadata: { ...candidate.metadata, [key]: undefined },
+      })).toBeNull();
+    }
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      dataBearing: undefined,
+      requiresConfirm: undefined,
+      metadata: { queueName: 'jobs', backend: 'postgres', operation: QUEUE_OPERATIONS.destroy },
+    })).toMatchObject({ capability: 'queue.mutate' });
+  });
+
+  it('rejects a queue ensure action that the planner marked blocked', () => {
+    const candidate = authorized.find((entry) => entry.label === QUEUE_OPERATIONS.ensure)!.action;
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      type: 'update',
+      metadata: { ...candidate.metadata, blockedReason: 'queue_observation_unknown' },
+    })).toBeNull();
+  });
+
+  it('authorizes exact desired cache reconciliation and rejects unpinned config', () => {
+    const create = authorized.find((entry) => entry.label === CACHE_OPERATIONS.ensure)!.action;
+    const update: PlanAction = { ...create, type: 'update', billable: true };
+    expect(resolvePlanActionAuthority(update)).toMatchObject({ capability: 'cache.provision' });
+
+    const metadata = { ...update.metadata };
+    delete metadata.size;
+    expect(resolvePlanActionAuthority({ ...update, metadata })).toBeNull();
+  });
+
+  it('rejects a domain purchase whose billing confirmation flags were stripped', () => {
+    const candidate = authorized.find((entry) => entry.label === 'Cloudflare registration')!.action;
+    expect(resolvePlanActionAuthority({ ...candidate, billable: undefined })).toBeNull();
+    expect(resolvePlanActionAuthority({ ...candidate, requiresConfirm: undefined })).toBeNull();
+  });
+
+  it('rejects maintenance edge enablement whose billing confirmation flags were stripped', () => {
+    const candidate = authorized.find((entry) => entry.label === MAINTENANCE_OPERATIONS.edgeEnable)!.action;
+    expect(resolvePlanActionAuthority({ ...candidate, billable: undefined })).toBeNull();
+    expect(resolvePlanActionAuthority({ ...candidate, requiresConfirm: undefined })).toBeNull();
+  });
+
+  it.each([
+    LOAD_BALANCER_OPERATIONS.poolEnsure,
+    LOAD_BALANCER_OPERATIONS.ensure,
+  ])('rejects billable load-balancer mutation with a stripped billing flag for %s', (label) => {
+    const candidate = authorized.find((entry) => entry.label === label)!.action;
+    expect(resolvePlanActionAuthority({ ...candidate, billable: undefined })).toBeNull();
+  });
+
+  it('rejects private GitHub code scanning when billing confirmation is stripped', () => {
+    const candidate = authorized.find((entry) => entry.label === 'githubCodeScanning')!.action;
+    expect(resolvePlanActionAuthority({ ...candidate, billable: undefined })).toBeNull();
+    expect(resolvePlanActionAuthority({ ...candidate, requiresConfirm: undefined })).toBeNull();
+  });
+
+  it('rejects restore-drill infrastructure changes when billing metadata is stripped', () => {
+    const candidate = authorized.find((entry) => entry.label === 'GitHub infrastructure')!.action;
+    const restoreDrillAction: PlanAction = {
+      ...candidate,
+      billable: true,
+      diff: [{ field: 'file:.github/workflows/hypervibe-db-restore-drill-production.yml' }],
+      metadata: {
+        ...candidate.metadata,
+        desiredFiles: [{ path: '.github/workflows/hypervibe-db-restore-drill-production.yml' }],
+      },
+    };
+    expect(resolvePlanActionAuthority(restoreDrillAction)).not.toBeNull();
+    expect(resolvePlanActionAuthority({ ...restoreDrillAction, billable: undefined })).toBeNull();
+  });
+
+  it.each([
+    'database provision',
+    CACHE_OPERATIONS.ensure,
+    STORAGE_OPERATIONS.ensure,
+    'database replica provision',
+  ])('rejects billable data-resource creation when its safety flag is stripped from %s', (label) => {
+    const candidate = authorized.find((entry) => entry.label === label)!.action;
+    expect(resolvePlanActionAuthority({ ...candidate, billable: undefined })).toBeNull();
+  });
+
+  it.each([
+    'database destroy',
+    CACHE_OPERATIONS.destroy,
+    'retained cache destroy',
+    STORAGE_OPERATIONS.destroy,
+    'database replica destroy',
+    QUEUE_OPERATIONS.destroy,
+  ])('rejects data-resource destruction when confirmation metadata is stripped from %s', (label) => {
+    const candidate = authorized.find((entry) => entry.label === label)!.action;
+    expect(resolvePlanActionAuthority({ ...candidate, dataBearing: undefined })).toBeNull();
+    expect(resolvePlanActionAuthority({ ...candidate, requiresConfirm: undefined })).toBeNull();
   });
 
   it('grants no mutation authority to noop or unknown actions', () => {

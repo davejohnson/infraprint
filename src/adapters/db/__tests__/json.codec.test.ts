@@ -3,6 +3,7 @@ import { parseJsonColumn } from '../json.codec.js';
 import {
   buildConfigColumnSchema,
   componentBindingsColumnSchema,
+  platformBindingsColumnSchema,
   runReceiptsColumnSchema,
 } from '../column.schemas.js';
 
@@ -69,5 +70,24 @@ describe('parseJsonColumn', () => {
   it('rejects wrong field types inside known keys', () => {
     expect(() => parseJsonColumn(buildConfigColumnSchema, JSON.stringify({ public: 'yes' }), 'test'))
       .toThrow('persisted JSON has an invalid shape');
+  });
+
+  it('rejects malformed hosting identities without rejecting provider-specific bindings', () => {
+    expect(() => parseJsonColumn(
+      platformBindingsColumnSchema,
+      JSON.stringify({ provider: 42, projectId: 'project-1' }),
+      'environments.platform_bindings'
+    )).toThrow('refuses to treat unreadable state as empty');
+    expect(() => parseJsonColumn(
+      platformBindingsColumnSchema,
+      JSON.stringify({
+        provider: 'railway',
+        projectId: 'project-1',
+        services: { web: { serviceId: 'service-1' } },
+        railwayEnvironmentName: 'production',
+        providerRuntime: { arbitrary: ['passthrough', 1] },
+      }),
+      'environments.platform_bindings'
+    )).not.toThrow();
   });
 });

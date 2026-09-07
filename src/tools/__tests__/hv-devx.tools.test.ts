@@ -12,7 +12,7 @@ import { ProjectRepository } from '../../adapters/db/repositories/project.reposi
 import { EnvironmentRepository } from '../../adapters/db/repositories/environment.repository.js';
 import { RunRepository } from '../../adapters/db/repositories/run.repository.js';
 import { AuditRepository } from '../../adapters/db/repositories/audit.repository.js';
-import { createToolContext } from '../context.js';
+import { createToolContext } from '../../application/context.js';
 import { registerHvDevxTools } from '../hv-devx.tools.js';
 import { CommandRegistry } from '../../application/commands.js';
 
@@ -80,6 +80,36 @@ describe('hv_runs', () => {
       error: 'boom',
     });
     expect(list.hint).toContain(newer.id);
+    await t.close();
+  });
+
+  it('hard-bounds run and audit output when a repository over-returns', async () => {
+    const { project, newer, older } = await seedRuns();
+    const findByProjectId = vi.spyOn(RunRepository.prototype, 'findByProjectId')
+      .mockReturnValue([newer, older]);
+    const eventOne = new AuditRepository().create({
+      action: 'one',
+      resourceType: 'run',
+      resourceId: newer.id,
+    });
+    const eventTwo = new AuditRepository().create({
+      action: 'two',
+      resourceType: 'run',
+      resourceId: older.id,
+    });
+    const findRecent = vi.spyOn(AuditRepository.prototype, 'findRecent')
+      .mockReturnValue([eventOne, eventTwo]);
+    const t = await makeClient();
+
+    const runs = await t.call('hv_runs', { project: project.name, limit: 1 });
+    const audit = await t.call('hv_runs', { action: 'audit', limit: 1 });
+
+    expect(runs.data.runs).toHaveLength(1);
+    expect(runs.data.count).toBe(1);
+    expect(audit.data.events).toHaveLength(1);
+    expect(audit.data.count).toBe(1);
+    expect(findByProjectId).toHaveBeenCalledWith(project.id, 1);
+    expect(findRecent).toHaveBeenCalledWith(1);
     await t.close();
   });
 

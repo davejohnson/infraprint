@@ -56,15 +56,15 @@ function fakeAdapter(overrides: Partial<ILoadBalancerAdapter> = {}): ILoadBalanc
     resolveLoadBalancerScope: async () => ({ accountId: 'account-1', zoneId: 'zone-1' }),
     findMonitorsByName: async () => [],
     getMonitor: async () => null,
-    ensureMonitor: async (_accountId, desired, id) => ({ resource: { id: id ?? 'monitor-1', ...desired }, created: !id }),
+    ensureMonitor: async (_accountId, desired, id) => ({ resource: { id: id ?? 'monitor-1', ...desired }, created: !id, verified: true }),
     deleteMonitor: async () => {},
     findPoolsByName: async () => [],
     getPool: async () => null,
-    ensurePool: async (_accountId, desired, id) => ({ resource: { id: id ?? 'pool-1', ...desired }, created: !id }),
+    ensurePool: async (_accountId, desired, id) => ({ resource: { id: id ?? 'pool-1', ...desired }, created: !id, verified: true }),
     deletePool: async () => {},
     findLoadBalancersByHostname: async () => [],
     getLoadBalancer: async () => null,
-    ensureLoadBalancer: async (_zoneId, desired, id) => ({ resource: { id: id ?? 'load-balancer-1', ...desired }, created: !id }),
+    ensureLoadBalancer: async (_zoneId, desired, id) => ({ resource: { id: id ?? 'load-balancer-1', ...desired }, created: !id, verified: true }),
     deleteLoadBalancer: async () => {},
     ...overrides,
   };
@@ -95,7 +95,15 @@ describe('load-balancer plan contract', () => {
     expect(result.actions[1]).toMatchObject({
       type: 'create', billable: true,
       dependsOn: ['load-balancer:monitor', 'service:webA', 'service:webB'],
-      metadata: expect.objectContaining({ operation: LOAD_BALANCER_OPERATIONS.poolEnsure, services: ['webA', 'webB'] }),
+      metadata: expect.objectContaining({
+        operation: LOAD_BALANCER_OPERATIONS.poolEnsure,
+        services: ['webA', 'webB'],
+        origins: [
+          { name: 'webA', address: 'a.up.railway.app', hostHeader: 'a.up.railway.app', enabled: true },
+          { name: 'webB', address: 'b.up.railway.app', hostHeader: 'b.up.railway.app', enabled: true },
+        ],
+        originsHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
     });
     expect(result.actions[2]).toMatchObject({
       type: 'create', billable: true, dependsOn: ['load-balancer:pool'],
@@ -177,7 +185,14 @@ describe('load-balancer plan contract', () => {
       }),
       observed: observed(), serviceActions: replacementActions,
     });
-    expect(serviceReplacement.actions.map((candidate) => candidate.type)).toEqual(['noop', 'update', 'noop']);
+    expect(serviceReplacement.actions).toEqual([
+      expect.objectContaining({
+        type: 'update',
+        metadata: expect.objectContaining({
+          blockedReason: 'load_balancer_origin_url_missing_or_invalid',
+        }),
+      }),
+    ]);
 
     vi.restoreAllMocks();
     useAdapter(fakeAdapter({
@@ -219,6 +234,59 @@ describe('load-balancer plan contract', () => {
         metadata: expect.objectContaining({ blockedReason: 'load_balancer_observation_unknown' }),
       }),
     ]);
+  });
+
+  it.each([
+    ['a private hostname', 'https://web.internal'],
+    ['localhost', 'https://localhost'],
+    ['an IP literal', 'https://203.0.113.10'],
+    ['embedded credentials', 'https://user:password@a.up.railway.app'],
+    ['a nonstandard port', 'https://a.up.railway.app:8443'],
+    ['a path-qualified URL', 'https://a.up.railway.app/application'],
+  ])('blocks %s instead of sending an unusable origin to the provider', async (_label, url) => {
+    useAdapter(fakeAdapter());
+    const unsafe = observed();
+    unsafe.services[0] = { ...unsafe.services[0]!, url };
+
+    const result = await planLoadBalancer({
+      project, environmentName: 'production', environmentSpec: desiredSpec,
+      environment: environment(), observed: unsafe, serviceActions: serviceActions(),
+    });
+
+    expect(result.actions).toHaveLength(1);
+    expect(result.actions[0]).toMatchObject({
+      type: 'update',
+      metadata: expect.objectContaining({
+        blockedReason: 'load_balancer_origin_url_missing_or_invalid',
+      }),
+    });
+    expect(result.actions[0]?.billable).toBeUndefined();
+    expect(result.actions[0]?.metadata).not.toHaveProperty('origins');
+  });
+
+  it('requires distinct public origin addresses instead of counting aliases as redundancy', async () => {
+    useAdapter(fakeAdapter());
+    const aliased = observed();
+    aliased.services[1] = {
+      ...aliased.services[1]!,
+      url: aliased.services[0]!.url,
+    };
+
+    const result = await planLoadBalancer({
+      project, environmentName: 'production', environmentSpec: desiredSpec,
+      environment: environment(), observed: aliased, serviceActions: serviceActions(),
+    });
+
+    expect(result.actions).toHaveLength(1);
+    expect(result.actions[0]).toMatchObject({
+      type: 'update',
+      reason: expect.stringContaining('distinct public HTTPS origins'),
+      metadata: expect.objectContaining({
+        blockedReason: 'load_balancer_origin_url_duplicate',
+      }),
+    });
+    expect(result.actions[0]?.billable).toBeUndefined();
+    expect(result.actions[0]?.metadata).not.toHaveProperty('origins');
   });
 
   it('plans an explicit unsupported action when the provider lacks the capability', async () => {

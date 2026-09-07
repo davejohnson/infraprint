@@ -3,6 +3,28 @@ import { RailwayAdapter, type RailwayCustomDomain } from '../railway.adapter.js'
 import { hashEnvValue } from '../../../../domain/ports/observe.port.js';
 import type { Environment } from '../../../../domain/entities/environment.entity.js';
 
+function graphqlNotFound(rootField: string, message: string): Error {
+  const error = new Error(message) as Error & {
+    response: {
+      status: number;
+      errors: Array<{
+        message: string;
+        path: string[];
+        extensions: { code: string };
+      }>;
+    };
+  };
+  error.response = {
+    status: 200,
+    errors: [{
+      message,
+      path: [rootField],
+      extensions: { code: 'NOT_FOUND' },
+    }],
+  };
+  return error;
+}
+
 function makeEnvironment(platformBindings: Record<string, unknown>, name = 'production'): Environment {
   return {
     id: 'env-local',
@@ -58,6 +80,8 @@ const projectDetailsResponse = {
                 {
                   node: {
                     environmentId: 'env-prod',
+                    source: { image: 'postgres:16' },
+                    latestDeployment: { id: 'dep-pg', status: 'SUCCESS' },
                     domains: {
                       serviceDomains: [],
                       customDomains: [],
@@ -109,8 +133,15 @@ describe('RailwayAdapter observe', () => {
     expect(result.projectExists).toBe(true);
     expect(result.projectId).toBe('rail-project-1');
     expect(result.environmentId).toBe('env-prod');
-    expect(result.partial).toBe(false);
-    expect(result.warnings).toEqual([]);
+    expect(result.partial).toBe(true);
+    expect(result.warnings).toEqual([
+      expect.stringContaining('legacy plugin inventory'),
+    ]);
+    expect(result.completeness).toMatchObject({
+      services: 'complete',
+      databases: 'complete',
+      caches: 'unknown',
+    });
 
     expect(result.services).toHaveLength(1);
     const web = result.services[0];
@@ -136,7 +167,7 @@ describe('RailwayAdapter observe', () => {
         externalId: 'svc-pg',
         providerScope: { projectId: 'rail-project-1' },
         name: 'postgres-db',
-        status: 'unknown',
+        status: 'running',
       },
     ]);
     expect(result.caches).toEqual([
@@ -512,24 +543,31 @@ describe('RailwayAdapter observe', () => {
     expect(logs).toContain('2026-06-16T21:00:01Z info Check image credentials');
   });
 
-  it('preserves Railway service-log read failures', async () => {
-    const request = vi.fn().mockRejectedValue(new TypeError('fetch failed'));
+  it('preserves Railway deployment-log errors instead of reporting an empty log set', async () => {
+    const request = vi.fn().mockRejectedValue(new Error('Railway logs permission denied'));
+
     const adapter = new RailwayAdapter();
     (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
 
-    await expect(adapter.getDeploymentLogs('dep-1', 50)).rejects.toThrow('fetch failed');
+    await expect(adapter.getDeploymentLogs('dep-1', 37))
+      .rejects.toThrow('Railway logs permission denied');
+    expect(request.mock.calls[0]?.[1]).toEqual({ deploymentId: 'dep-1', limit: 37 });
   });
 
-  it('preserves Railway build-log read failures', async () => {
-    const request = vi.fn().mockRejectedValue(new TypeError('fetch failed'));
+  it('preserves Railway build-log errors instead of reporting an empty build', async () => {
+    const request = vi.fn().mockRejectedValue(new Error('Railway build logs unavailable'));
+
     const adapter = new RailwayAdapter();
     (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
 
-    await expect(adapter.getBuildLogs('dep-1')).rejects.toThrow('fetch failed');
+    await expect(adapter.getBuildLogs('dep-1'))
+      .rejects.toThrow('Railway build logs unavailable');
   });
 
-  it('returns projectExists false when the project query fails', async () => {
-    const request = vi.fn().mockRejectedValueOnce(new Error('Project not found'));
+  it('returns projectExists false only for provider-confirmed project absence', async () => {
+    const request = vi.fn().mockRejectedValueOnce(
+      graphqlNotFound('project', 'Project not found')
+    );
 
     const adapter = new RailwayAdapter();
     (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
@@ -585,6 +623,39 @@ describe('RailwayAdapter observe', () => {
     expect(result.services).toEqual([]);
     expect(result.databases.find((db) => db.engine === 'postgres')).toBeUndefined();
     expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats exact bound application services as services even when their names or images resemble datastores', async () => {
+    const ambiguousProject = structuredClone(projectDetailsResponse);
+    ambiguousProject.project.plugins.edges = [];
+    ambiguousProject.project.services.edges[0].node.name = 'postgres-exporter';
+    ambiguousProject.project.services.edges[1].node.name = 'redis-worker';
+    const request = vi.fn()
+      .mockResolvedValueOnce(ambiguousProject)
+      .mockResolvedValueOnce({ serviceInstance: { latestDeployment: { status: 'SUCCESS' } } })
+      .mockResolvedValueOnce({ variables: {} })
+      .mockResolvedValueOnce({ serviceInstance: { latestDeployment: { status: 'SUCCESS' } } })
+      .mockResolvedValueOnce({ variables: {} });
+
+    const adapter = new RailwayAdapter();
+    (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
+
+    const result = await adapter.observe(makeEnvironment({
+      projectId: 'rail-project-1',
+      environmentId: 'env-prod',
+      services: {
+        'postgres-exporter': { serviceId: 'svc-web' },
+        'redis-worker': { serviceId: 'svc-pg' },
+      },
+    }));
+
+    expect(result.services.map((service) => service.name).sort()).toEqual([
+      'postgres-exporter',
+      'redis-worker',
+    ]);
+    expect(result.databases).toEqual([]);
+    expect(result.caches).toEqual([]);
+    expect(request).toHaveBeenCalledTimes(5);
   });
 
   it('maps Hypervibe-created environment-suffixed Railway service names back to desired names', async () => {
@@ -654,8 +725,10 @@ describe('RailwayAdapter observe', () => {
 
     expect(result.projectExists).toBe(true);
     expect(result.partial).toBe(true);
-    expect(result.warnings).toHaveLength(2);
-    expect(result.warnings[0]).toContain('web');
+    expect(result.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining('web'),
+      expect.stringContaining('legacy plugin inventory'),
+    ]));
     // Service is still reported, falling back to project-level instance data.
     expect(result.services[0]).toMatchObject({
       name: 'web',

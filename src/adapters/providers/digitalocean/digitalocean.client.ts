@@ -202,6 +202,8 @@ export class DigitalOceanApiError extends Error {
 }
 
 export class DigitalOceanClient {
+  private accountUuid: string | null = null;
+
   constructor(private readonly apiToken: string) {}
 
   async verifyAppAccess(): Promise<void> {
@@ -221,6 +223,11 @@ export class DigitalOceanClient {
       if (!response.registry?.name) {
         throw new Error(
           `DigitalOcean returned an invalid container registry response for ${registryName}.`
+        );
+      }
+      if (response.registry.name !== registryName) {
+        throw new Error(
+          `DigitalOcean returned registry ${response.registry.name} for exact registry lookup ${registryName}.`
         );
       }
       return response.registry;
@@ -261,12 +268,14 @@ export class DigitalOceanClient {
   }
 
   async getAccountUuid(): Promise<string> {
+    if (this.accountUuid) return this.accountUuid;
     const response = await this.request<AccountResponse>('GET', '/v2/account');
     const uuid = response.account?.uuid?.trim();
     if (!uuid) {
       throw new Error('DigitalOcean account observation returned no account UUID.');
     }
-    return uuid;
+    this.accountUuid = uuid;
+    return this.accountUuid;
   }
 
   async createContainerRegistry(input: {
@@ -286,6 +295,11 @@ export class DigitalOceanClient {
     );
     if (!response.registry?.name) {
       throw new Error('DigitalOcean returned an invalid container registry create response.');
+    }
+    if (response.registry.name !== input.name) {
+      throw new Error(
+        `DigitalOcean created registry ${response.registry.name} instead of reviewed registry ${input.name}.`
+      );
     }
     return response.registry;
   }
@@ -324,6 +338,16 @@ export class DigitalOceanClient {
         'GET',
         `/v2/apps/${encodeURIComponent(appId)}`
       );
+      if (!response.app?.id) {
+        throw new Error(
+          `DigitalOcean returned an invalid app response for ${appId}; absence was not confirmed.`
+        );
+      }
+      if (response.app.id !== appId) {
+        throw new Error(
+          `DigitalOcean returned app ${response.app.id} for exact app lookup ${appId}.`
+        );
+      }
       return response.app;
     } catch (error) {
       if (error instanceof DigitalOceanApiError && error.status === 404) {
@@ -448,6 +472,16 @@ export class DigitalOceanClient {
         'GET',
         `/v2/databases/${encodeURIComponent(clusterId)}`
       );
+      if (!response.database?.id) {
+        throw new Error(
+          `DigitalOcean returned an invalid database response for ${clusterId}; absence was not confirmed.`
+        );
+      }
+      if (response.database.id !== clusterId) {
+        throw new Error(
+          `DigitalOcean returned database ${response.database.id} for exact database lookup ${clusterId}.`
+        );
+      }
       return response.database;
     } catch (error) {
       if (error instanceof DigitalOceanApiError && error.status === 404) {
@@ -489,7 +523,87 @@ export class DigitalOceanClient {
         },
       }
     );
+    if (
+      typeof response.database?.id !== 'string'
+      || !response.database.id.trim()
+      || response.database.id !== response.database.id.trim()
+    ) {
+      throw new Error(
+        `DigitalOcean acknowledged database cluster create for ${input.name} without a durable cluster ID.`
+      );
+    }
     return response.database;
+  }
+
+  async resizeDatabaseCluster(
+    clusterId: string,
+    input: { size: string; numNodes: number }
+  ): Promise<void> {
+    await this.request(
+      'PUT',
+      `/v2/databases/${encodeURIComponent(clusterId)}/resize`,
+      {
+        body: {
+          size: input.size,
+          num_nodes: input.numNodes,
+        },
+      }
+    );
+  }
+
+  async migrateDatabaseCluster(
+    clusterId: string,
+    region: string
+  ): Promise<void> {
+    await this.request(
+      'PUT',
+      `/v2/databases/${encodeURIComponent(clusterId)}/migrate`,
+      { body: { region } }
+    );
+  }
+
+  async waitForDatabaseConfiguration(
+    clusterId: string,
+    expected: { region?: string; size?: string }
+  ): Promise<DigitalOceanDatabaseCluster> {
+    const attempts = this.positiveIntegerEnv(
+      'HYPERVIBE_DIGITALOCEAN_DATABASE_READY_ATTEMPTS',
+      60
+    );
+    const delayMs = this.nonNegativeIntegerEnv(
+      'HYPERVIBE_DIGITALOCEAN_DATABASE_READY_DELAY_MS',
+      5000
+    );
+    let latest: DigitalOceanDatabaseCluster | null = null;
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      latest = await this.getDatabaseCluster(clusterId);
+      if (!latest) {
+        throw new Error(
+          `DigitalOcean database cluster ${clusterId} disappeared while reconciling its configuration.`
+        );
+      }
+      const status = latest.status?.toLowerCase();
+      if (status && ['error', 'failed', 'offline'].includes(status)) {
+        throw new Error(
+          `DigitalOcean database cluster ${clusterId} entered terminal status ${latest.status}.`
+        );
+      }
+      const regionMatches = expected.region === undefined
+        || latest.region === expected.region;
+      const sizeMatches = expected.size === undefined
+        || latest.size === expected.size;
+      if (status === 'online' && regionMatches && sizeMatches) {
+        return latest;
+      }
+      if (attempt < attempts) {
+        await this.delay(delayMs);
+      }
+    }
+
+    throw new Error(
+      `DigitalOcean database cluster ${clusterId} did not converge to the reviewed configuration after ${attempts} checks (last status: ${latest?.status ?? 'unknown'}, region: ${latest?.region ?? 'unknown'}, size: ${latest?.size ?? 'unknown'}).`
+    );
   }
 
   async waitForDatabaseOnline(
@@ -622,7 +736,11 @@ export class DigitalOceanClient {
     if (response.status === 204) {
       return {} as T;
     }
-    return response.json() as Promise<T>;
+    const text = await response.text();
+    if (text.trim().length === 0) {
+      return {} as T;
+    }
+    return JSON.parse(text) as T;
   }
 
   private safeApiError(text: string): string {

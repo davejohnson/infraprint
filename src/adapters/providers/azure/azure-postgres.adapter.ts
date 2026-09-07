@@ -3,11 +3,14 @@ import type { Component } from '../../../domain/entities/component.entity.js';
 import type { Environment } from '../../../domain/entities/environment.entity.js';
 import type {
   DatabaseCapabilities,
+  DatabaseTargetOptions,
   IDatabaseAdapter,
   ProvisionableType,
   ProvisionResult,
 } from '../../../domain/ports/database.port.js';
+import { databaseCreateMayHaveCommitted } from '../../../domain/ports/database.port.js';
 import type { ObservedDatabase } from '../../../domain/ports/observe.port.js';
+import { parseHostingBindings } from '../../../domain/ports/hosting.port.js';
 import type { Receipt, TemporaryDatabaseAccess, VerifyResult } from '../../../domain/ports/provider.port.js';
 import {
   providerRegistry,
@@ -22,10 +25,28 @@ import {
   type AzurePostgresServer,
 } from './azure-postgres.client.js';
 import { AzureResourceManagerClient } from './azure-resource-manager.client.js';
+import {
+  azureContainerAppsResourceGroupScopeFromBinding,
+  azureEnvironmentResourceGroupScope,
+  explicitAzureResourceGroupScope,
+  parseAzureResourceGroupScope,
+  type AzureEnvironmentResourceGroupScope,
+} from './azure-environment-scope.js';
 
 const PROVIDER = 'azure-postgres';
 const ADMIN_USERNAME = 'hypervibeadmin';
 const PUBLIC_IP_ENDPOINT = 'https://checkip.amazonaws.com/';
+const RESOURCE_GROUP_API_VERSION = '2024-11-01';
+const DEFAULT_LOCATION = 'canadacentral';
+const POSTGRES_SKU_NAME = 'Standard_B1ms';
+const POSTGRES_SKU_TIER = 'Burstable';
+const POSTGRES_VERSION = '16';
+const POSTGRES_STORAGE_SIZE_GB = 32;
+
+interface AzureResourceGroup {
+  id: string;
+  tags?: Record<string, string>;
+}
 
 export class AzurePostgresAdapter implements IDatabaseAdapter {
   readonly name = PROVIDER;
@@ -33,22 +54,36 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
   readonly capabilities: DatabaseCapabilities = {
     supportedDatabases: ['postgres'],
     supportsPooling: false,
-    supportsReadReplicas: true,
-    supportsPointInTimeRecovery: true,
+    supportsReadReplicas: false,
+    supportsPointInTimeRecovery: false,
     serverlessOptimized: false,
     supportsTemporaryDatabaseAccess: true,
     prefersTemporaryDatabaseAccess: true,
   };
 
   private credentials: AzurePostgresCredentials | null = null;
+  private arm: AzureResourceManagerClient | null = null;
   private client: AzurePostgresClient | null = null;
+  private target: DatabaseTargetOptions | null = null;
   private temporaryFirewallRules = new Map<string, { resourceId: string; ruleName: string }>();
 
   async connect(credentials: unknown): Promise<void> {
     this.credentials = AzurePostgresCredentialsSchema.parse(credentials);
-    this.client = new AzurePostgresClient(
-      new AzureResourceManagerClient(this.credentials)
-    );
+    this.arm = new AzureResourceManagerClient(this.credentials);
+    this.client = new AzurePostgresClient(this.arm);
+  }
+
+  configureTarget(target: DatabaseTargetOptions): void {
+    if (target.projectName !== undefined && target.projectName.trim().length === 0) {
+      throw new Error('Azure PostgreSQL target projectName cannot be empty.');
+    }
+    if (target.region !== undefined && !/^[a-z0-9]+$/.test(target.region)) {
+      throw new Error('Azure PostgreSQL region must be an Azure location slug.');
+    }
+    this.target = {
+      ...(target.projectName ? { projectName: target.projectName } : {}),
+      ...(target.region ? { region: target.region } : {}),
+    };
   }
 
   async verify(): Promise<VerifyResult> {
@@ -65,7 +100,9 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
 
   async disconnect(): Promise<void> {
     this.credentials = null;
+    this.arm = null;
     this.client = null;
+    this.target = null;
   }
 
   async provision(
@@ -78,7 +115,7 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
       resourceName?: string;
     }
   ): Promise<ProvisionResult> {
-    if (!this.client || !this.credentials) {
+    if (!this.client || !this.credentials || !this.arm) {
       throw new Error('Not connected. Call connect() first.');
     }
     if (type !== 'postgres') {
@@ -91,18 +128,19 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
       };
     }
 
-    const resourceName = this.resourceName(
-      options?.resourceName ?? `${environment.name}-postgres`
-    );
+    let resourceId: string | null = null;
+    const resourceName = this.resourceName(options?.resourceName ?? `${environment.name}-postgres`);
     const databaseName = options?.databaseName?.trim() || 'app';
-    const resourceId = this.client.serverResourceId(resourceName);
-    const password = this.generatePassword();
-    let mutationAttempted = false;
+    let createMayHaveCommitted = false;
 
     try {
+      const scope = this.environmentScope(environment, true);
+      await this.requireOwnedResourceGroup(scope, environment);
+      const client = this.scopedClient(scope.resourceGroup);
+      resourceId = client.serverResourceId(resourceName);
       let matches: AzurePostgresServer[];
       try {
-        matches = await this.client.findServersByName(resourceName);
+        matches = await client.findServersByName(resourceName);
       } catch (error) {
         throw new Error([
           `Could not check whether Azure PostgreSQL server "${resourceName}" already exists, so Hypervibe refused to create a server that might be a duplicate.`,
@@ -118,40 +156,53 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
         ].join(' '));
       }
 
-      mutationAttempted = true;
-      await this.client.createServer(resourceName, {
-        location: options?.region ?? this.credentials.location,
-        sku: {
-          name: options?.size ?? this.credentials.postgresSkuName,
-          tier: this.credentials.postgresSkuTier,
-        },
-        properties: {
-          administratorLogin: ADMIN_USERNAME,
-          administratorLoginPassword: password,
-          version: this.credentials.postgresVersion,
-          createMode: 'Create',
-          storage: {
-            storageSizeGB: this.credentials.postgresStorageSizeGb,
-            autoGrow: 'Enabled',
+      const location = options?.region ?? this.target?.region ?? DEFAULT_LOCATION;
+      if (!/^[a-z0-9]+$/.test(location)) {
+        throw new Error('Azure PostgreSQL region must be an Azure location slug.');
+      }
+      const password = this.generatePassword();
+      try {
+        await client.createServer(resourceName, {
+          location,
+          sku: {
+            name: options?.size ?? POSTGRES_SKU_NAME,
+            tier: POSTGRES_SKU_TIER,
           },
-          backup: {
-            backupRetentionDays: 7,
-            geoRedundantBackup: 'Disabled',
+          properties: {
+            administratorLogin: ADMIN_USERNAME,
+            administratorLoginPassword: password,
+            version: POSTGRES_VERSION,
+            createMode: 'Create',
+            storage: {
+              storageSizeGB: POSTGRES_STORAGE_SIZE_GB,
+              autoGrow: 'Enabled',
+            },
+            backup: {
+              backupRetentionDays: 7,
+              geoRedundantBackup: 'Disabled',
+            },
+            highAvailability: { mode: 'Disabled' },
+            network: { publicNetworkAccess: 'Enabled' },
+            authConfig: {
+              activeDirectoryAuth: 'Disabled',
+              passwordAuth: 'Enabled',
+            },
           },
-          highAvailability: { mode: 'Disabled' },
-          network: { publicNetworkAccess: 'Enabled' },
-          authConfig: {
-            activeDirectoryAuth: 'Disabled',
-            passwordAuth: 'Enabled',
-          },
-        },
-        tags: this.tags(environment),
+          tags: this.tags(environment),
+        });
+        createMayHaveCommitted = true;
+      } catch (error) {
+        createMayHaveCommitted = databaseCreateMayHaveCommitted(error);
+        throw error;
+      }
+      const ready = await this.waitForReady(client, resourceId, {
+        location,
+        skuName: options?.size ?? POSTGRES_SKU_NAME,
       });
-      const ready = await this.waitForReady(resourceId);
-      await this.client.createAzureServicesFirewallRule(ready.id);
-      await this.waitForFirewallRule(ready.id);
-      await this.client.createDatabase(ready.id, databaseName);
-      await this.waitForDatabase(ready.id, databaseName);
+      await client.createAzureServicesFirewallRule(ready.id);
+      await this.waitForFirewallRule(client, ready.id);
+      await client.createDatabase(ready.id, databaseName);
+      await this.waitForDatabase(client, ready.id, databaseName);
 
       const host = ready.properties?.fullyQualifiedDomainName;
       if (!host) {
@@ -200,16 +251,17 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
       };
     } catch (error) {
       return {
-        component: mutationAttempted
+        component: createMayHaveCommitted
+          && resourceId
           ? this.partialComponent(environment, resourceId, databaseName)
           : this.emptyComponent(environment, type),
         receipt: {
           success: false,
-          message: mutationAttempted
+          message: createMayHaveCommitted
             ? 'Azure created or accepted the PostgreSQL server, but provisioning did not complete'
             : 'Failed to provision Azure PostgreSQL server',
           error: this.formatError(error),
-          ...(mutationAttempted
+          ...(createMayHaveCommitted && resourceId
             ? {
                 data: {
                   serverId: resourceId,
@@ -235,6 +287,7 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
     if (!this.client || !component.externalId) {
       throw new Error('Azure PostgreSQL access requires a connected adapter and a tracked server.');
     }
+    this.assertComponentScope(component, component.externalId);
     const connectionUrl = await this.getConnectionUrl(component);
     if (!connectionUrl) throw new Error('Azure PostgreSQL bindings are missing database credentials.');
     const address = await this.resolvePublicIpv4();
@@ -269,6 +322,7 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
     const rule = this.temporaryFirewallRules.get(access.releaseToken);
     if (!rule) return;
     await this.client.deleteFirewallRule(rule.resourceId, rule.ruleName);
+    await this.waitForFirewallAbsence(rule.resourceId, rule.ruleName);
     this.temporaryFirewallRules.delete(access.releaseToken);
   }
 
@@ -280,6 +334,7 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
       return { success: false, message: 'No external ID for component' };
     }
     try {
+      this.assertComponentScope(component, component.externalId);
       const existing = await this.client.getServer(component.externalId);
       if (!existing) {
         return {
@@ -328,17 +383,23 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
     component?: Component | null,
     options?: { resourceName?: string }
   ): Promise<ObservedDatabase | null> {
-    if (!this.client) {
+    if (!this.client || !this.arm) {
       throw new Error('Not connected. Call connect() first.');
     }
     let server: AzurePostgresServer | null;
+    let client: AzurePostgresClient;
     if (component?.externalId) {
-      server = await this.client.getServer(component.externalId);
+      this.assertComponentScope(component, component.externalId);
+      client = this.client;
+      server = await client.getServer(component.externalId);
     } else {
+      const scope = this.environmentScope(environment, false);
+      if (!(await this.resourceGroupExists(scope, environment))) return null;
+      client = this.scopedClient(scope.resourceGroup);
       const name = this.resourceName(
         options?.resourceName ?? `${environment.name}-postgres`
       );
-      const matches = await this.client.findServersByName(name);
+      const matches = await client.findServersByName(name);
       if (matches.length > 1) {
         throw new Error(
           `Multiple Azure PostgreSQL servers match "${name}": ${matches
@@ -349,6 +410,13 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
       server = matches[0] ?? null;
     }
     if (!server) return null;
+    const databaseName = typeof component?.bindings.database === 'string'
+      ? component.bindings.database
+      : 'app';
+    await this.assertRuntimeContract(client, server, databaseName, {
+      ...(this.target ? { location: this.target.region ?? DEFAULT_LOCATION } : {}),
+      skuName: POSTGRES_SKU_NAME,
+    });
     return {
       provider: PROVIDER,
       engine: 'postgres',
@@ -362,12 +430,30 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
   async inspectDatabaseResources(
     request: ProviderInspectionRequest
   ): Promise<Record<string, unknown>> {
-    if (!this.client || !this.credentials) {
+    if (!this.client || !this.credentials || !this.arm) {
       throw new Error('Not connected. Call connect() first.');
     }
-    const servers = request.id
-      ? [await this.client.getServer(request.id)].filter((server): server is AzurePostgresServer => Boolean(server))
-      : (await this.client.listServers()).filter((server) => (
+    let servers: AzurePostgresServer[];
+    if (request.id) {
+      servers = [await this.client.getServer(request.id)]
+        .filter((server): server is AzurePostgresServer => Boolean(server));
+    } else {
+      const scope = request.scope
+        ? explicitAzureResourceGroupScope(request.scope, this.credentials.subscriptionId)
+        : azureContainerAppsResourceGroupScopeFromBinding(
+          request.binding,
+          this.credentials.subscriptionId
+        );
+      if (!scope) {
+        throw new Error('Azure PostgreSQL list/name inspection requires an explicit Azure resource-group scope or compatible Azure Container Apps environment binding.');
+      }
+      const exists = await this.arm.getNullable<AzureResourceGroup>(
+        scope.resourceGroupId,
+        RESOURCE_GROUP_API_VERSION
+      );
+      servers = exists ? await this.scopedClient(scope.resourceGroup).listServers() : [];
+    }
+    servers = servers.filter((server) => (
         !request.name || server.name.toLowerCase() === request.name.toLowerCase()
       ));
     const databases = servers.slice(0, request.limit).map((server) => ({
@@ -377,6 +463,9 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
       status: this.normalizedStatus(server.properties?.state),
       region: server.location,
       ...(server.properties?.version ? { databaseVersion: server.properties.version } : {}),
+      network: {
+        publicNetworkAccess: server.properties?.network?.publicNetworkAccess ?? 'unknown',
+      },
       providerScope: this.serverScope(server),
     }));
     const ambiguous = Boolean(request.name && servers.length > 1);
@@ -392,7 +481,111 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
     };
   }
 
-  private async waitForReady(resourceId: string): Promise<AzurePostgresServer> {
+  private scopedClient(resourceGroup: string): AzurePostgresClient {
+    if (!this.credentials) throw new Error('Not connected. Call connect() first.');
+    return new AzurePostgresClient(new AzureResourceManagerClient({
+      ...this.credentials,
+      resourceGroup,
+    }));
+  }
+
+  private environmentScope(
+    environment: Environment,
+    requireBound: boolean
+  ): AzureEnvironmentResourceGroupScope {
+    if (!this.credentials) throw new Error('Not connected. Call connect() first.');
+    const bindings = parseHostingBindings(environment);
+    const boundScope = azureContainerAppsResourceGroupScopeFromBinding(
+      bindings,
+      this.credentials.subscriptionId
+    );
+    if (boundScope) return boundScope;
+    if (requireBound) {
+      throw new Error(
+        'Azure PostgreSQL provisioning requires the same environment to have a durable Azure Container Apps project binding. Apply the hosting project action, then re-run hv_plan.'
+      );
+    }
+    if (!this.target?.projectName) {
+      throw new Error(
+        'Azure PostgreSQL observation requires an Azure Container Apps project binding or configured logical projectName.'
+      );
+    }
+    return azureEnvironmentResourceGroupScope({
+      subscriptionId: this.credentials.subscriptionId,
+      projectName: this.target.projectName,
+      environmentId: environment.projectId,
+      environmentName: environment.name,
+    });
+  }
+
+  private async resourceGroupExists(
+    scope: AzureEnvironmentResourceGroupScope,
+    environment: Environment
+  ): Promise<boolean> {
+    if (!this.arm) throw new Error('Not connected. Call connect() first.');
+    const group = await this.arm.getNullable<AzureResourceGroup>(
+      scope.resourceGroupId,
+      RESOURCE_GROUP_API_VERSION
+    );
+    if (!group) return false;
+    const observed = parseAzureResourceGroupScope(group.id, scope.subscriptionId);
+    if (observed.resourceGroup.toLowerCase() !== scope.resourceGroup.toLowerCase()) {
+      throw new Error(`Azure returned resource group ${group.id} for ${scope.resourceGroupId}.`);
+    }
+    if (
+      group.tags?.['managed-by'] !== 'hypervibe'
+      || group.tags?.['hypervibe-environment-id'] !== environment.id
+    ) {
+      throw new Error(
+        `Azure resource group ${scope.resourceGroupId} exists but is not owned by this Hypervibe environment.`
+      );
+    }
+    return true;
+  }
+
+  private async requireOwnedResourceGroup(
+    scope: AzureEnvironmentResourceGroupScope,
+    environment: Environment
+  ): Promise<void> {
+    if (!(await this.resourceGroupExists(scope, environment))) {
+      throw new Error(
+        `Bound Azure Container Apps resource group ${scope.resourceGroupId} is absent; Hypervibe will not create a datastore in a replacement scope.`
+      );
+    }
+  }
+
+  private assertComponentScope(component: Component, externalId: string): void {
+    if (!this.client) throw new Error('Not connected. Call connect() first.');
+    if (component.bindings.provider !== PROVIDER) {
+      throw new Error('Azure PostgreSQL component provider does not match this adapter.');
+    }
+    const identity = this.client.parseServerId(externalId);
+    const instanceId = component.bindings.instanceId;
+    if (typeof instanceId === 'string' && instanceId !== externalId) {
+      throw new Error('Azure PostgreSQL component instanceId does not match its externalId.');
+    }
+    const scope = component.bindings.providerScope;
+    if (!scope || typeof scope !== 'object' || Array.isArray(scope)) {
+      throw new Error(
+        'Azure PostgreSQL binding is missing its durable subscription/resource-group provider scope; inspect and explicitly import the exact server before using it.'
+      );
+    }
+    const record = scope as Record<string, unknown>;
+    if (
+      typeof record.subscriptionId !== 'string'
+      || record.subscriptionId.toLowerCase() !== identity.subscriptionId.toLowerCase()
+      || typeof record.resourceGroup !== 'string'
+      || record.resourceGroup.toLowerCase() !== identity.resourceGroup.toLowerCase()
+    ) {
+      throw new Error('Azure PostgreSQL durable provider scope does not match its ARM resource ID.');
+    }
+  }
+
+  private async waitForReady(
+    client: AzurePostgresClient,
+    resourceId: string,
+    desired: { location: string; skuName: string }
+  ): Promise<AzurePostgresServer> {
     const attempts = this.positiveIntegerEnv(
       'HYPERVIBE_AZURE_POSTGRES_POLL_ATTEMPTS',
       180
@@ -402,9 +595,12 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
       5000
     );
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      const server = await this.client!.getServer(resourceId);
+      const server = await client.getServer(resourceId);
       const state = server?.properties?.state?.toLowerCase();
-      if (server && state === 'ready') return server;
+      if (server && state === 'ready') {
+        this.assertServerShape(server, desired);
+        return server;
+      }
       if (['failed', 'disabled'].includes(state ?? '')) {
         throw new Error(
           `Azure PostgreSQL server ${resourceId} entered state ${state}.`
@@ -418,6 +614,7 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
   }
 
   private async waitForDatabase(
+    client: AzurePostgresClient,
     resourceId: string,
     databaseName: string
   ): Promise<void> {
@@ -430,7 +627,12 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
       5000
     );
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      if (await this.client!.getDatabase(resourceId, databaseName)) return;
+      const database = await client.getDatabase(resourceId, databaseName);
+      if (
+        database
+        && database.properties?.charset?.toUpperCase() === 'UTF8'
+        && database.properties?.collation === 'en_US.utf8'
+      ) return;
       if (attempt < attempts) await this.delay(interval);
     }
     throw new Error(
@@ -438,7 +640,10 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
     );
   }
 
-  private async waitForFirewallRule(resourceId: string): Promise<void> {
+  private async waitForFirewallRule(
+    client: AzurePostgresClient,
+    resourceId: string
+  ): Promise<void> {
     const attempts = this.positiveIntegerEnv(
       'HYPERVIBE_AZURE_POSTGRES_POLL_ATTEMPTS',
       180
@@ -449,7 +654,7 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
     );
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       const rule =
-        await this.client!.getAzureServicesFirewallRule(resourceId);
+        await client.getAzureServicesFirewallRule(resourceId);
       if (
         rule?.properties?.startIpAddress === '0.0.0.0'
         && rule.properties.endIpAddress === '0.0.0.0'
@@ -476,6 +681,84 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
       if (attempt < attempts) await this.delay(interval);
     }
     throw new Error(`Azure PostgreSQL operation-scoped firewall rule for ${resourceId} did not become observable.`);
+  }
+
+  private async waitForFirewallAbsence(
+    resourceId: string,
+    ruleName: string
+  ): Promise<void> {
+    const attempts = this.positiveIntegerEnv('HYPERVIBE_AZURE_POSTGRES_DELETE_ATTEMPTS', 180);
+    const interval = this.nonNegativeIntegerEnv('HYPERVIBE_AZURE_POSTGRES_POLL_INTERVAL_MS', 5000);
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      if (!(await this.client!.getFirewallRule(resourceId, ruleName))) return;
+      if (attempt < attempts) await this.delay(interval);
+    }
+    throw new Error(`Azure PostgreSQL firewall rule ${ruleName} still exists after deletion.`);
+  }
+
+  private async assertRuntimeContract(
+    client: AzurePostgresClient,
+    server: AzurePostgresServer,
+    databaseName: string,
+    desired: { location?: string; skuName: string }
+  ): Promise<void> {
+    if (server.properties?.state?.toLowerCase() !== 'ready') {
+      throw new Error(`Azure PostgreSQL server ${server.id} is not Ready.`);
+    }
+    this.assertServerShape(server, desired);
+    const [firewall, database] = await Promise.all([
+      client.getAzureServicesFirewallRule(server.id),
+      client.getDatabase(server.id, databaseName),
+    ]);
+    if (
+      firewall?.properties?.startIpAddress !== '0.0.0.0'
+      || firewall.properties.endIpAddress !== '0.0.0.0'
+    ) {
+      throw new Error(
+        `Azure PostgreSQL server ${server.id} is missing the exact Azure Container Apps connectivity firewall rule.`
+      );
+    }
+    if (
+      !database
+      || database.properties?.charset?.toUpperCase() !== 'UTF8'
+      || database.properties?.collation !== 'en_US.utf8'
+    ) {
+      throw new Error(
+        `Azure PostgreSQL logical database ${databaseName} is absent or has unsupported encoding drift.`
+      );
+    }
+  }
+
+  private assertServerShape(
+    server: AzurePostgresServer,
+    desired: { location?: string; skuName: string }
+  ): void {
+    if (server.properties?.network?.publicNetworkAccess?.toLowerCase() !== 'enabled') {
+      throw new Error(
+        `Azure PostgreSQL server ${server.id} no longer has publicNetworkAccess Enabled; Hypervibe will not report ACA runtime connectivity as converged.`
+      );
+    }
+    if (!server.properties.fullyQualifiedDomainName) {
+      throw new Error(`Azure PostgreSQL server ${server.id} has no observed runtime hostname.`);
+    }
+    if (server.properties.version !== POSTGRES_VERSION) {
+      throw new Error(
+        `Azure PostgreSQL server ${server.id} version is ${server.properties.version ?? 'unknown'}, expected ${POSTGRES_VERSION}.`
+      );
+    }
+    if (
+      server.sku?.name !== desired.skuName
+      || server.sku?.tier !== POSTGRES_SKU_TIER
+    ) {
+      throw new Error(
+        `Azure PostgreSQL server ${server.id} SKU drifted from ${POSTGRES_SKU_TIER}/${desired.skuName}.`
+      );
+    }
+    if (desired.location && server.location.toLowerCase() !== desired.location.toLowerCase()) {
+      throw new Error(
+        `Azure PostgreSQL server ${server.id} is in ${server.location}, expected ${desired.location}.`
+      );
+    }
   }
 
   private async resolvePublicIpv4(): Promise<string> {
@@ -548,8 +831,9 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
       bindings: {
         provider: PROVIDER,
         instanceId: resourceId,
-        providerScope: this.resourceScope(resourceId, this.credentials?.location),
+        providerScope: this.resourceScope(resourceId),
         database,
+        region: this.target?.region ?? DEFAULT_LOCATION,
       },
       externalId: resourceId,
       createdAt: new Date(),
@@ -582,16 +866,15 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
   }
 
   private serverScope(server: AzurePostgresServer): Record<string, string> {
-    return this.resourceScope(server.id, server.location);
+    return this.resourceScope(server.id);
   }
 
-  private resourceScope(resourceId: string, location?: string): Record<string, string> {
+  private resourceScope(resourceId: string): Record<string, string> {
     if (!this.client) throw new Error('Not connected. Call connect() first.');
     const identity = this.client.parseServerId(resourceId);
     return {
       subscriptionId: identity.subscriptionId,
       resourceGroup: identity.resourceGroup,
-      ...(location ? { location } : {}),
     };
   }
 
@@ -608,6 +891,8 @@ export class AzurePostgresAdapter implements IDatabaseAdapter {
 
   private tags(environment: Environment): Record<string, string> {
     return {
+      'managed-by': 'hypervibe',
+      'hypervibe-environment-id': environment.id,
       'hypervibe-managed': 'true',
       'hypervibe-environment': environment.name.slice(0, 256),
     };
@@ -665,8 +950,20 @@ providerRegistry.register({
         ['AZURE_CLIENT_SECRET', 'HYPERVIBE_AZURE_CLIENT_SECRET'],
       ],
     },
+    connectionAliases: ['azure-container-apps'],
+    maturity: {
+      lifecycle: {
+        database: {
+          status: 'ready-for-live',
+          reason: 'Mocked lifecycle contracts pass; promotion requires recent Azure Container Apps plus PostgreSQL live evidence.',
+        },
+      },
+    },
     lifecycle: {
       databaseEngines: ['postgres'],
+      databaseConnectivity: {
+        compatibleHostingProviders: ['azure-container-apps'],
+      },
     },
   },
   inspection: {
@@ -675,7 +972,8 @@ providerRegistry.register({
     selectors: {
       database: {
         mode: 'provider-resource',
-        optional: ['project', 'scope', 'id', 'name', 'limit'],
+        optional: ['id', 'name', 'limit'],
+        oneOf: [['id', 'scope']],
         mutuallyExclusive: [['id', 'name']],
         list: true,
         scopeKeys: ['subscriptionId', 'resourceGroup'],
@@ -685,10 +983,10 @@ providerRegistry.register({
       adapter as AzurePostgresAdapter
     ).inspectDatabaseResources(request),
   },
-  factory: (credentials) => {
+  factory: async (credentials) => {
     const validated = AzurePostgresCredentialsSchema.parse(credentials);
     const adapter = new AzurePostgresAdapter();
-    void adapter.connect(validated);
+    await adapter.connect(validated);
     return adapter;
   },
 });

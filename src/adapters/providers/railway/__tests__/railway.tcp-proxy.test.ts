@@ -88,16 +88,22 @@ describe('RailwayAdapter TCP proxy', () => {
     expect(request).toHaveBeenCalledTimes(1);
   });
 
-  it('getTcpProxy returns null when no proxy matches the port or the query fails', async () => {
+  it('getTcpProxy returns null when no proxy matches the port', async () => {
     const adapter = new RailwayAdapter();
     stubClient(adapter, vi.fn().mockResolvedValueOnce({
       tcpProxies: [{ id: 'proxy-other', domain: 'other.proxy.rlwy.net', proxyPort: 11111, applicationPort: 6379 }],
     }));
     expect(await adapter.getTcpProxy('rail-env-1', 'rail-svc-db-1', 5432)).toBeNull();
+  });
 
+  it('preserves a failed proxy observation instead of authorizing a create', async () => {
     const failing = new RailwayAdapter();
-    stubClient(failing, vi.fn().mockRejectedValueOnce(new Error('boom')));
-    expect(await failing.getTcpProxy('rail-env-1', 'rail-svc-db-1', 5432)).toBeNull();
+    const request = vi.fn().mockRejectedValueOnce(new Error('proxy observation unavailable'));
+    stubClient(failing, request);
+
+    await expect(failing.ensureTcpProxy('rail-env-1', 'rail-svc-db-1', 5432))
+      .rejects.toThrow('proxy observation unavailable');
+    expect(request).toHaveBeenCalledTimes(1);
   });
 
   it('deletes a TCP proxy and verifies that it is no longer active', async () => {

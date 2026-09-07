@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { PlanService } from '../domain/plan/plan.service.js';
 import { providerRegistry } from '../domain/registry/provider.registry.js';
 import { requiresProductionConfirm } from '../domain/services/policy.service.js';
-import { executeRollback, ROLLBACK_NOTE } from '../domain/services/rollback.service.js';
+import { executeRollback } from '../domain/services/rollback.service.js';
 import { CI_ROLLBACK_NOTE } from '../domain/services/ci-rollback.service.js';
 import { SpecStore } from '../domain/spec/spec.store.js';
 import { isProviderNativeDeploySourceAction } from '../domain/services/provider-native-deploy-source.service.js';
@@ -19,6 +19,7 @@ import {
 import { projectField, envField, confirmField } from './schemas.js';
 import { commandSuccess, commandError, wrapCommandHandler, HvError } from '../application/results.js';
 import { resolveDevOpsSelection } from '../domain/spec/devops-selection.js';
+import { firstProviderSpecValidationFailure } from '../domain/services/provider-spec-validation.js';
 
 function assertConfirmed(project: Project, environment: Environment, confirm: boolean | undefined, action: string): void {
   if (requiresProductionConfirm(project, environment.name) && !confirm) {
@@ -90,6 +91,14 @@ export function registerHvDeployTools(commands: CommandRegistrar, ctx: CommandCo
           next: ['hv_spec', 'hv_inspect', 'hv_import'],
         });
       }
+      const providerValidation = firstProviderSpecValidationFailure(specResult.spec);
+      if (providerValidation) {
+        return commandError('VALIDATION', providerValidation.message, {
+          hint: providerValidation.hint,
+          details: providerValidation.details,
+          next: ['hv_spec', 'hv_plan'],
+        });
+      }
       const envName = env?.trim() || 'staging';
       const envSpec = specResult.spec.environments[envName];
       if (!envSpec) {
@@ -147,6 +156,13 @@ export function registerHvDeployTools(commands: CommandRegistrar, ctx: CommandCo
         verifyHttpHealth: !deploySourceStage,
         alwaysRunBootstrap: !deploySourceStage,
       });
+      if (outcome.kind === 'invalid_spec') {
+        return commandError('VALIDATION', outcome.message, {
+          hint: outcome.hint,
+          details: outcome.details,
+          next: ['hv_spec', 'hv_plan'],
+        });
+      }
       if (outcome.kind === 'plan_not_found' || outcome.kind === 'env_missing') {
         return commandError('INTERNAL', 'Deploy plan could not be applied immediately after planning.', {
           details: outcome,
@@ -237,19 +253,19 @@ export function registerHvDeployTools(commands: CommandRegistrar, ctx: CommandCo
 
   commands.register(
     'hv_rollback',
-    'Rollback an environment through one plan-authorized command. Managed CI providers with a verified release-evidence implementation restore the previous exact-SHA release (or toSha) and return pending until verified with hv_ci_status; unsupported CI providers fail closed. Direct provider deploys retain toRunId rollback. Database migrations and provider-side manual configuration are never reversed implicitly. Protected environments require confirm=true.',
+    'Rollback a managed-CI environment through one plan-authorized command. Providers with a verified release-evidence implementation restore the previous exact-SHA release (or toSha) and return pending until verified with hv_ci_status; unsupported CI providers and direct-provider deployments fail closed without deploying current source. Database migrations and provider-side manual configuration are never reversed implicitly. Protected environments require confirm=true.',
     {
       project: projectField,
       env: envField,
-      toRunId: z.string().uuid().optional().describe('Specific successful direct-provider deploy run ID. Mutually exclusive with toSha.'),
+      toRunId: z.string().uuid().optional().describe('Legacy compatibility selector. Direct-provider runs lack verified immutable release evidence, so this input fails closed; managed CI uses toSha. Mutually exclusive with toSha.'),
       toSha: z.string().regex(/^[0-9a-f]{40}$/i).optional().describe('Specific previously verified exact Git SHA for a managed CI rollback. Mutually exclusive with toRunId.'),
-      services: z.array(z.string()).optional().describe('Specific services to rollback (default: all in target run)'),
+      services: z.array(z.string()).optional().describe('Legacy direct-provider selector. Managed CI restores the complete verified release and rejects per-service rollback; direct-provider rollback is unsupported.'),
       confirm: confirmField,
     },
     wrapCommandHandler(async ({ project: projectRef, env, toRunId, toSha, services, confirm }) => {
       if (toRunId && toSha) {
         throw new HvError('VALIDATION', 'Pass either toRunId or toSha, not both.', {
-          hint: 'Use toRunId for direct-provider deploys or toSha for managed CI deploys.',
+          hint: 'Use toSha for a managed-CI release. toRunId is retained only for compatibility and cannot authorize a direct-provider rollback.',
         });
       }
       const project = ctx.resolveProjectOrThrow({ project: projectRef });
@@ -280,34 +296,26 @@ export function registerHvDeployTools(commands: CommandRegistrar, ctx: CommandCo
         });
       }
 
-      if ('strategy' in result && result.strategy === 'managed-ci') {
-        const { ok: _ok, ...payload } = result;
-        if (!result.pending) {
-          return commandError('PROVIDER_ERROR', 'Rollback workflow was not dispatched.', {
-            details: { ...payload, note: CI_ROLLBACK_NOTE },
-            hint: 'Inspect the rollback plan/apply receipts and start a fresh hv_rollback only after resolving the blocker.',
-            next: ['hv_runs'],
-          });
+      const { ok: _ok, ...payload } = result;
+      if (!result.pending) {
+        return commandError('PROVIDER_ERROR', 'Rollback workflow was not dispatched.', {
+          details: { ...payload, note: CI_ROLLBACK_NOTE },
+          hint: 'Inspect the rollback plan/apply receipts and start a fresh hv_rollback only after resolving the blocker.',
+          next: ['hv_runs'],
+        });
+      }
+      return commandSuccess(
+        { ...payload, note: CI_ROLLBACK_NOTE },
+        {
+          hint: 'Rollback was dispatched but is not yet proven. Inspect the managed workflow with hv_ci_status; after success, verify the public endpoint with hv_health.',
+          warnings: [CI_ROLLBACK_NOTE],
+          next: ['hv_ci_status'],
+          agentInstruction: {
+            action: 'stop_and_report',
+            message: 'Stop here. Report the exact rollback SHA and pending workflow, then inspect it only through hv_ci_status before running hv_health after success.',
+          },
         }
-        return commandSuccess(
-          { ...payload, note: CI_ROLLBACK_NOTE },
-          {
-            hint: 'Rollback was dispatched but is not yet proven. Inspect the managed workflow with hv_ci_status; after success, verify the public endpoint with hv_health.',
-            warnings: [CI_ROLLBACK_NOTE],
-            next: ['hv_ci_status'],
-            agentInstruction: {
-              action: 'stop_and_report',
-              message: 'Stop here. Report the exact rollback SHA and pending workflow, then inspect it only through hv_ci_status before running hv_health after success.',
-            },
-          }
-        );
-      }
-
-      const { ok: _ok, success, ...payload } = result;
-      if (!success) {
-        return commandError('PROVIDER_ERROR', 'Rollback deployment had errors', { details: payload });
-      }
-      return commandSuccess({ ...payload, note: ROLLBACK_NOTE }, { next: ['hv_health'] });
+      );
     })
   );
 }

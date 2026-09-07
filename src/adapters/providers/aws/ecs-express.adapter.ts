@@ -10,8 +10,15 @@ import {
 } from '@aws-sdk/client-acm';
 import {
   CreateDefaultVpcCommand,
+  CreateSecurityGroupCommand,
+  DeleteSecurityGroupCommand,
+  DescribeSecurityGroupsCommand,
+  DescribeSubnetsCommand,
   DescribeVpcsCommand,
   EC2Client,
+  type SecurityGroup,
+  type Subnet,
+  type Vpc,
 } from '@aws-sdk/client-ec2';
 import {
   CreateRepositoryCommand,
@@ -90,6 +97,15 @@ import {
   ECS_EXPRESS_CI_REQUIRED_SECRETS,
 } from './ecs-express-ci.workflow.js';
 import { buildEcsExpressPortableRecipe } from './ecs-express-ci.recipe.js';
+import {
+  AWS_WORKLOAD_NETWORK_BINDING,
+  type AwsWorkloadNetwork,
+  hasWorkloadSecurityGroupTags,
+  parseAwsWorkloadNetworkBinding,
+  workloadNetworksMatch,
+  workloadSecurityGroupName,
+  workloadSecurityGroupTags,
+} from './aws-workload-network.js';
 
 const BOOTSTRAP_IMAGE = `public.ecr.aws/docker/library/node:${HYPERVIBE_MANAGED_NODE_VERSION}-alpine`;
 const BOOTSTRAP_COMMAND = [
@@ -148,6 +164,7 @@ type ProjectResources = {
   repositoryArn: string;
   repositoryName: string;
   repositoryUri: string;
+  workloadSecurityGroupName: string;
 };
 
 type ManagedDomainCertificate = CertificateDetail & { created: boolean };
@@ -290,7 +307,7 @@ export class EcsExpressAdapter implements IProviderAdapter {
         }
       }
 
-      await this.ensureDefaultVpc();
+      const workloadNetwork = await this.ensureWorkloadNetwork(resources, environment);
       await this.ensureRepository(resources, environment);
       await this.ensureRole(
         resources.executionRoleName,
@@ -332,6 +349,9 @@ export class EcsExpressAdapter implements IProviderAdapter {
           environmentId: resources.clusterArn,
           projectName: resources.clusterName,
           created,
+          providerBindings: {
+            [AWS_WORKLOAD_NETWORK_BINDING]: workloadNetwork,
+          },
         },
       };
     } catch (error) {
@@ -384,7 +404,7 @@ export class EcsExpressAdapter implements IProviderAdapter {
         this.parseClusterArn(clusterArn).accountId,
         this.parseClusterArn(clusterArn).clusterName
       );
-      await this.assertProjectResources(resources, environment.id);
+      const workloadNetwork = await this.assertProjectResources(resources, environment);
       const binding = parseHostingBindings(environment).services?.[service.name]?.serviceId;
       const environmentValues = this.containerEnvironment(service, envVars);
       let express: ECSExpressGatewayService;
@@ -420,6 +440,7 @@ export class EcsExpressAdapter implements IProviderAdapter {
                 ? { command: usingBootstrap ? BOOTSTRAP_COMMAND : undefined }
                 : { command: ['sh', '-lc', service.buildConfig.startCommand] }),
             },
+            networkConfiguration: this.expressNetworkConfiguration(workloadNetwork),
             scalingTarget: config.scalingTarget,
           })
         );
@@ -457,6 +478,7 @@ export class EcsExpressAdapter implements IProviderAdapter {
               command: BOOTSTRAP_COMMAND,
               environment: environmentValues,
             },
+            networkConfiguration: this.expressNetworkConfiguration(workloadNetwork),
             scalingTarget: { minTaskCount: 1, maxTaskCount: 4 },
             tags: this.tags(environment),
           })
@@ -512,15 +534,23 @@ export class EcsExpressAdapter implements IProviderAdapter {
     service: Service,
     keys: string[]
   ): Promise<Receipt> {
-    const serviceArn = parseHostingBindings(environment).services?.[service.name]?.serviceId;
+    const bindings = parseHostingBindings(environment);
+    const serviceArn = bindings.services?.[service.name]?.serviceId;
     if (!serviceArn) {
       return { success: true, message: 'ECS Express service has no retired environment variables to delete.' };
     }
     try {
+      if (!bindings.projectId) {
+        throw new Error('No bound AWS ECS project exists for environment-variable removal.');
+      }
+      const clusterIdentity = this.parseClusterArn(bindings.projectId);
+      const resources = this.projectResources(clusterIdentity.accountId, clusterIdentity.clusterName);
+      const workloadNetwork = await this.assertProjectResources(resources, environment);
       const express = await this.getExpressService(serviceArn);
       if (!express) {
         return this.failedReceipt('Failed to delete ECS Express environment variables', `Bound service ${serviceArn} was not found.`);
       }
+      this.assertExpressScope(express, bindings.projectId, serviceArn, environment.id);
       const config = this.currentConfiguration(express);
       if (!config?.primaryContainer?.image) throw new Error('ECS Express returned no active container configuration.');
       const retired = new Set(keys);
@@ -533,6 +563,7 @@ export class EcsExpressAdapter implements IProviderAdapter {
         memory: config.memory,
         healthCheckPath: config.healthCheckPath,
         primaryContainer: { ...config.primaryContainer, environment: environmentValues },
+        networkConfiguration: this.expressNetworkConfiguration(workloadNetwork),
         scalingTarget: config.scalingTarget,
       }));
       await this.waitForExpress(
@@ -595,6 +626,7 @@ export class EcsExpressAdapter implements IProviderAdapter {
       if (await this.getCluster(projectId)) {
         return { success: false, error: `ECS cluster ${projectId} remained observable after deletion.` };
       }
+      await this.deleteWorkloadSecurityGroup(resources);
       await this.deleteRepository(resources.repositoryName);
       await this.deleteRole(resources.executionRoleName, EXECUTION_POLICY);
       await this.deleteRole(resources.infrastructureRoleName, INFRASTRUCTURE_POLICY);
@@ -774,7 +806,7 @@ export class EcsExpressAdapter implements IProviderAdapter {
     const identity = this.parseClusterArn(bindings.projectId);
     const resources = this.projectResources(identity.accountId, identity.clusterName);
     const projectReady = this.hasManagedTags(cluster.tags, environment.id)
-      && await this.projectResourcesExist(resources, environment.id);
+      && await this.projectResourcesExist(resources, environment);
     const services: ObservedService[] = [];
     for (const [name, binding] of Object.entries(bindings.services ?? {})) {
       if (!binding.serviceId) continue;
@@ -922,6 +954,7 @@ export class EcsExpressAdapter implements IProviderAdapter {
       executionRoleArn: `arn:aws:iam::${accountId}:role/${executionRoleName}`,
       infrastructureRoleName,
       infrastructureRoleArn: `arn:aws:iam::${accountId}:role/${infrastructureRoleName}`,
+      workloadSecurityGroupName: workloadSecurityGroupName(clusterName),
     };
   }
 
@@ -960,25 +993,227 @@ export class EcsExpressAdapter implements IProviderAdapter {
       && (tag.value ?? tag.Value) === 'hypervibe');
   }
 
-  private async ensureDefaultVpc(): Promise<void> {
-    const { ec2 } = this.connected().clients;
-    const current = await ec2.send(new DescribeVpcsCommand({
-      Filters: [{ Name: 'is-default', Values: ['true'] }],
-    }));
-    if ((current.Vpcs ?? []).length === 1) return;
-    if ((current.Vpcs ?? []).length > 1) throw new Error('AWS returned multiple default VPCs for one region.');
-    const created = await ec2.send(new CreateDefaultVpcCommand({}));
-    if (!created.Vpc?.VpcId || !created.Vpc.IsDefault) {
-      throw new Error('AWS did not confirm creation of the default VPC required by ECS Express Mode.');
-    }
-  }
-
-  private async defaultVpcExists(): Promise<boolean> {
+  private async describeDefaultVpc(): Promise<Vpc | null> {
     const current = await this.connected().clients.ec2.send(new DescribeVpcsCommand({
       Filters: [{ Name: 'is-default', Values: ['true'] }],
     }));
-    if ((current.Vpcs ?? []).length > 1) throw new Error('AWS returned multiple default VPCs for one region.');
-    return (current.Vpcs ?? []).length === 1;
+    if (!Array.isArray(current.Vpcs)) {
+      throw new Error('AWS default-VPC observation returned an invalid VPC list.');
+    }
+    if (current.Vpcs.length > 1) throw new Error('AWS returned multiple default VPCs for one region.');
+    const vpc = current.Vpcs[0];
+    if (!vpc) return null;
+    if (!vpc.VpcId || vpc.IsDefault !== true) {
+      throw new Error('AWS default-VPC observation returned an incomplete or non-default VPC identity.');
+    }
+    return vpc;
+  }
+
+  private async ensureDefaultVpc(): Promise<Vpc> {
+    const current = await this.describeDefaultVpc();
+    if (current) return current;
+    const created = await this.connected().clients.ec2.send(new CreateDefaultVpcCommand({}));
+    if (!created.Vpc?.VpcId || !created.Vpc.IsDefault) {
+      throw new Error('AWS did not confirm creation of the default VPC required by ECS Express Mode.');
+    }
+    const observed = await this.describeDefaultVpc();
+    if (!observed || observed.VpcId !== created.Vpc.VpcId) {
+      throw new Error(`AWS default VPC ${created.Vpc.VpcId} could not be verified after creation.`);
+    }
+    return observed;
+  }
+
+  private async defaultVpcSubnets(vpcId: string): Promise<string[]> {
+    const output = await this.connected().clients.ec2.send(new DescribeSubnetsCommand({
+      Filters: [
+        { Name: 'vpc-id', Values: [vpcId] },
+        { Name: 'default-for-az', Values: ['true'] },
+      ],
+    }));
+    if (!Array.isArray(output.Subnets)) {
+      throw new Error(`AWS default-subnet observation returned an invalid subnet list for VPC ${vpcId}.`);
+    }
+    const availabilityZones = new Set<string>();
+    const subnetIds = output.Subnets.map((subnet: Subnet) => {
+      if (!subnet.SubnetId || subnet.VpcId !== vpcId || subnet.DefaultForAz !== true || !subnet.AvailabilityZone) {
+        throw new Error(`AWS default-subnet observation returned an incomplete or cross-VPC subnet for ${vpcId}.`);
+      }
+      availabilityZones.add(subnet.AvailabilityZone);
+      return subnet.SubnetId;
+    });
+    if (new Set(subnetIds).size !== subnetIds.length) {
+      throw new Error(`AWS returned duplicate default subnet identities for VPC ${vpcId}.`);
+    }
+    if (subnetIds.length < 2 || availabilityZones.size < 2) {
+      throw new Error(`AWS default VPC ${vpcId} needs default subnets in at least two availability zones for ECS Express and ElastiCache.`);
+    }
+    return subnetIds.sort();
+  }
+
+  private async findWorkloadSecurityGroups(
+    resources: ProjectResources,
+    vpcId: string
+  ): Promise<SecurityGroup[]> {
+    const output = await this.connected().clients.ec2.send(new DescribeSecurityGroupsCommand({
+      Filters: [
+        { Name: 'group-name', Values: [resources.workloadSecurityGroupName] },
+        { Name: 'vpc-id', Values: [vpcId] },
+      ],
+    }));
+    if (!Array.isArray(output.SecurityGroups)) {
+      throw new Error(`AWS workload security-group observation returned an invalid collection for ${resources.clusterArn}.`);
+    }
+    const groupIds = output.SecurityGroups.map((group) => {
+      if (!group.GroupId) throw new Error(`AWS returned a workload security group without an ID for ${resources.clusterArn}.`);
+      return group.GroupId;
+    });
+    if (new Set(groupIds).size !== groupIds.length || output.SecurityGroups.length > 1) {
+      throw new Error(`AWS returned duplicate workload security groups for ${resources.clusterArn}.`);
+    }
+    return output.SecurityGroups;
+  }
+
+  private async getSecurityGroup(groupId: string): Promise<SecurityGroup | null> {
+    try {
+      const output = await this.connected().clients.ec2.send(new DescribeSecurityGroupsCommand({
+        GroupIds: [groupId],
+      }));
+      if (!Array.isArray(output.SecurityGroups)) {
+        throw new Error(`AWS security-group observation returned an invalid collection for ${groupId}.`);
+      }
+      if (output.SecurityGroups.length !== 1) {
+        throw new Error(`AWS returned no exact security group and no InvalidGroup.NotFound response for ${groupId}.`);
+      }
+      const group = output.SecurityGroups[0]!;
+      if (group.GroupId !== groupId) {
+        throw new Error(`AWS returned security group ${group.GroupId ?? 'without an ID'} when ${groupId} was requested.`);
+      }
+      return group;
+    } catch (error) {
+      if (this.hasErrorName(error, 'InvalidGroup.NotFound')) return null;
+      throw error;
+    }
+  }
+
+  private assertWorkloadSecurityGroup(
+    group: SecurityGroup,
+    resources: ProjectResources,
+    vpcId: string,
+    environmentId?: string
+  ): void {
+    if (group.GroupName !== resources.workloadSecurityGroupName || group.VpcId !== vpcId) {
+      throw new Error(`AWS workload security group ${group.GroupId ?? 'without an ID'} resolved outside VPC ${vpcId} or the reviewed project identity.`);
+    }
+    if (!hasWorkloadSecurityGroupTags(group.Tags, resources.clusterArn, environmentId)) {
+      throw new Error(`AWS workload security group ${group.GroupId ?? 'without an ID'} is not owned by the reviewed Hypervibe project.`);
+    }
+  }
+
+  private workloadNetwork(
+    resources: ProjectResources,
+    vpcId: string,
+    subnetIds: string[],
+    workloadSecurityGroupId: string
+  ): AwsWorkloadNetwork {
+    return {
+      accountId: resources.accountId,
+      region: this.connected().credentials.region,
+      vpcId,
+      subnetIds: [...subnetIds].sort(),
+      workloadSecurityGroupId,
+    };
+  }
+
+  private async ensureWorkloadNetwork(
+    resources: ProjectResources,
+    environment: Environment
+  ): Promise<AwsWorkloadNetwork> {
+    const persisted = parseAwsWorkloadNetworkBinding(environment);
+    const vpc = await this.ensureDefaultVpc();
+    const vpcId = vpc.VpcId!;
+    const subnetIds = await this.defaultVpcSubnets(vpcId);
+
+    if (persisted) {
+      if (persisted.accountId !== resources.accountId
+        || persisted.region !== this.connected().credentials.region
+        || persisted.vpcId !== vpcId) {
+        throw new Error('The persisted AWS workload-network binding is outside the connected account, region, or default VPC.');
+      }
+      const group = await this.getSecurityGroup(persisted.workloadSecurityGroupId);
+      if (!group) {
+        throw new Error(`Bound AWS workload security group ${persisted.workloadSecurityGroupId} was not found. Hypervibe will not create a replacement from a stale binding.`);
+      }
+      this.assertWorkloadSecurityGroup(group, resources, vpcId, environment.id);
+      return this.workloadNetwork(resources, vpcId, subnetIds, persisted.workloadSecurityGroupId);
+    }
+
+    let matches = await this.findWorkloadSecurityGroups(resources, vpcId);
+    if (matches.length === 0) {
+      let returnedGroupId: string | undefined;
+      try {
+        const created = await this.connected().clients.ec2.send(new CreateSecurityGroupCommand({
+          GroupName: resources.workloadSecurityGroupName,
+          Description: `Hypervibe ECS workloads for ${resources.clusterArn}`,
+          VpcId: vpcId,
+          TagSpecifications: [{
+            ResourceType: 'security-group',
+            Tags: workloadSecurityGroupTags(environment.id, resources.clusterArn),
+          }],
+        }));
+        returnedGroupId = created.GroupId;
+      } catch (error) {
+        matches = await this.findWorkloadSecurityGroups(resources, vpcId);
+        if (matches.length === 0) throw error;
+      }
+      matches = await this.findWorkloadSecurityGroups(resources, vpcId);
+      if (matches.length !== 1 || (returnedGroupId && matches[0]?.GroupId !== returnedGroupId)) {
+        throw new Error(`AWS workload security group creation for ${resources.clusterArn} could not be verified exactly.`);
+      }
+    }
+    const group = matches[0]!;
+    this.assertWorkloadSecurityGroup(group, resources, vpcId, environment.id);
+    return this.workloadNetwork(resources, vpcId, subnetIds, group.GroupId!);
+  }
+
+  private async resolveWorkloadNetwork(
+    resources: ProjectResources,
+    environment: Environment
+  ): Promise<AwsWorkloadNetwork | null> {
+    const persisted = parseAwsWorkloadNetworkBinding(environment);
+    if (!persisted) return null;
+    if (persisted.accountId !== resources.accountId
+      || persisted.region !== this.connected().credentials.region) {
+      throw new Error('The persisted AWS workload-network binding is outside the connected account or region.');
+    }
+    const vpc = await this.describeDefaultVpc();
+    if (!vpc) return null;
+    if (vpc.VpcId !== persisted.vpcId) {
+      throw new Error(`The persisted AWS workload-network VPC ${persisted.vpcId} is not the connected region's exact default VPC.`);
+    }
+    const subnetIds = await this.defaultVpcSubnets(persisted.vpcId);
+    const group = await this.getSecurityGroup(persisted.workloadSecurityGroupId);
+    if (!group) return null;
+    this.assertWorkloadSecurityGroup(group, resources, persisted.vpcId, environment.id);
+    const observed = this.workloadNetwork(
+      resources,
+      persisted.vpcId,
+      subnetIds,
+      persisted.workloadSecurityGroupId
+    );
+    if (!workloadNetworksMatch(persisted, observed)) {
+      throw new Error('The AWS workload-network binding changed since it was reviewed; re-run hv_plan before mutating services or caches.');
+    }
+    return observed;
+  }
+
+  private expressNetworkConfiguration(network: AwsWorkloadNetwork): {
+    securityGroups: string[];
+    subnets: string[];
+  } {
+    return {
+      securityGroups: [network.workloadSecurityGroupId],
+      subnets: [...network.subnetIds],
+    };
   }
 
   private async ensureRepository(resources: ProjectResources, environment: Environment): Promise<void> {
@@ -1008,7 +1243,18 @@ export class EcsExpressAdapter implements IProviderAdapter {
     try {
       const output = await this.connected().clients.ecr.send(new DescribeRepositoriesCommand({ repositoryNames: [name] }));
       if ((output.repositories ?? []).length > 1) throw new Error(`AWS returned duplicate ECR repositories named ${name}.`);
-      return output.repositories?.[0] ?? null;
+      const repository = output.repositories?.[0];
+      if (!repository) {
+        throw new Error(
+          `AWS returned no ECR repository and no RepositoryNotFoundException for ${name}.`
+        );
+      }
+      if (repository.repositoryName !== name) {
+        throw new Error(
+          `AWS returned ECR repository ${repository.repositoryName ?? 'without a name'} when ${name} was requested.`
+        );
+      }
+      return repository;
     } catch (error) {
       if (this.hasErrorName(error, 'RepositoryNotFoundException')) return null;
       throw error;
@@ -1042,7 +1288,10 @@ export class EcsExpressAdapter implements IProviderAdapter {
       if (role?.Arn !== roleArn) throw new Error(`AWS returned IAM role ${role?.Arn ?? 'without an ARN'} outside ${roleArn}.`);
     }
     const policies = await this.connected().clients.iam.send(new ListAttachedRolePoliciesCommand({ RoleName: roleName }));
-    if (!(policies.AttachedPolicies ?? []).some((policy) => policy.PolicyArn === policyArn)) {
+    if (!Array.isArray(policies.AttachedPolicies)) {
+      throw new Error(`AWS IAM returned an invalid attached-policy list for role ${roleName}.`);
+    }
+    if (!policies.AttachedPolicies.some((policy) => policy.PolicyArn === policyArn)) {
       await this.connected().clients.iam.send(new AttachRolePolicyCommand({ RoleName: roleName, PolicyArn: policyArn }));
     }
     await this.connected().clients.iam.send(new TagRoleCommand({ RoleName: roleName, Tags: this.iamTags(environment) }));
@@ -1050,7 +1299,20 @@ export class EcsExpressAdapter implements IProviderAdapter {
 
   private async getRole(name: string) {
     try {
-      return (await this.connected().clients.iam.send(new GetRoleCommand({ RoleName: name }))).Role ?? null;
+      const role = (await this.connected().clients.iam.send(
+        new GetRoleCommand({ RoleName: name })
+      )).Role;
+      if (!role) {
+        throw new Error(
+          `AWS returned no IAM role and no NoSuchEntity error for ${name}.`
+        );
+      }
+      if (role.RoleName !== name) {
+        throw new Error(
+          `AWS returned IAM role ${role.RoleName ?? 'without a name'} when ${name} was requested.`
+        );
+      }
+      return role;
     } catch (error) {
       if (this.hasErrorName(error, 'NoSuchEntity', 'NoSuchEntityException')) return null;
       throw error;
@@ -1063,7 +1325,10 @@ export class EcsExpressAdapter implements IProviderAdapter {
     if (role.Arn !== arn) throw new Error(`IAM role ${name} resolved outside ${arn}.`);
     if (!this.hasManagedTags(role.Tags, environmentId)) return false;
     const policies = await this.connected().clients.iam.send(new ListAttachedRolePoliciesCommand({ RoleName: name }));
-    return (policies.AttachedPolicies ?? []).some((policy) => policy.PolicyArn === policyArn);
+    if (!Array.isArray(policies.AttachedPolicies)) {
+      throw new Error(`AWS IAM returned an invalid attached-policy list for role ${name}.`);
+    }
+    return policies.AttachedPolicies.some((policy) => policy.PolicyArn === policyArn);
   }
 
   private async repositoryReady(resources: ProjectResources, environmentId: string): Promise<boolean> {
@@ -1076,27 +1341,63 @@ export class EcsExpressAdapter implements IProviderAdapter {
     return this.hasManagedTags(tags.tags, environmentId);
   }
 
-  private async assertProjectResources(resources: ProjectResources, environmentId: string): Promise<void> {
-    if (!await this.projectResourcesExist(resources, environmentId)) {
-      throw new Error('The bound AWS project is missing its ECR repository, IAM roles, or default VPC. Re-run hv_plan before deploying.');
+  private async assertProjectResources(
+    resources: ProjectResources,
+    environment: Environment
+  ): Promise<AwsWorkloadNetwork> {
+    const workloadNetwork = await this.resolveWorkloadNetwork(resources, environment);
+    const [repository, execution, infrastructure] = await Promise.all([
+      this.repositoryReady(resources, environment.id),
+      this.roleReady(resources.executionRoleName, resources.executionRoleArn, EXECUTION_POLICY, environment.id),
+      this.roleReady(resources.infrastructureRoleName, resources.infrastructureRoleArn, INFRASTRUCTURE_POLICY, environment.id),
+    ]);
+    if (!repository || !execution || !infrastructure || !workloadNetwork) {
+      throw new Error('The bound AWS project is missing its ECR repository, IAM roles, default VPC/subnets, or workload security group. Re-run hv_plan before deploying.');
     }
+    return workloadNetwork;
   }
 
-  private async projectResourcesExist(resources: ProjectResources, environmentId: string): Promise<boolean> {
-    const [repository, execution, infrastructure, vpc] = await Promise.all([
-      this.repositoryReady(resources, environmentId),
-      this.roleReady(resources.executionRoleName, resources.executionRoleArn, EXECUTION_POLICY, environmentId),
-      this.roleReady(resources.infrastructureRoleName, resources.infrastructureRoleArn, INFRASTRUCTURE_POLICY, environmentId),
-      this.defaultVpcExists(),
+  private async projectResourcesExist(resources: ProjectResources, environment: Environment): Promise<boolean> {
+    const [repository, execution, infrastructure, workloadNetwork] = await Promise.all([
+      this.repositoryReady(resources, environment.id),
+      this.roleReady(resources.executionRoleName, resources.executionRoleArn, EXECUTION_POLICY, environment.id),
+      this.roleReady(resources.infrastructureRoleName, resources.infrastructureRoleArn, INFRASTRUCTURE_POLICY, environment.id),
+      this.resolveWorkloadNetwork(resources, environment),
     ]);
-    return repository && execution && infrastructure && vpc;
+    return repository && execution && infrastructure && Boolean(workloadNetwork);
   }
 
   private async getCluster(clusterArn: string) {
     const output = await this.connected().clients.ecs.send(new DescribeClustersCommand({ clusters: [clusterArn], include: ['TAGS'] }));
-    if ((output.failures ?? []).some((failure) => failure.arn === clusterArn)) return null;
-    if ((output.clusters ?? []).length > 1) throw new Error(`AWS returned duplicate ECS cluster identity ${clusterArn}.`);
-    return output.clusters?.[0] ?? null;
+    const failures = (output.failures ?? []).filter(
+      (failure) => failure.arn === clusterArn
+    );
+    if (failures.length > 1) {
+      throw new Error(`AWS returned duplicate failures for ECS cluster ${clusterArn}.`);
+    }
+    if (failures.length === 1) {
+      const failure = failures[0]!;
+      if (failure.reason === 'MISSING') return null;
+      throw new Error(
+        `AWS ECS cluster observation failed for ${clusterArn}: ${failure.reason ?? 'unknown failure'}${failure.detail ? ` (${failure.detail})` : ''}.`
+      );
+    }
+    const clusters = output.clusters ?? [];
+    if (clusters.length > 1) {
+      throw new Error(`AWS returned duplicate ECS cluster identity ${clusterArn}.`);
+    }
+    const cluster = clusters[0];
+    if (!cluster) {
+      throw new Error(
+        `AWS returned neither ECS cluster ${clusterArn} nor a provider-confirmed MISSING failure.`
+      );
+    }
+    if (cluster.clusterArn !== clusterArn) {
+      throw new Error(
+        `AWS returned ECS cluster ${cluster.clusterArn ?? 'without an ARN'} when ${clusterArn} was requested.`
+      );
+    }
+    return cluster;
   }
 
   private async findClusterArns(name: string): Promise<string[]> {
@@ -1104,7 +1405,10 @@ export class EcsExpressAdapter implements IProviderAdapter {
     let nextToken: string | undefined;
     do {
       const output = await this.connected().clients.ecs.send(new ListClustersCommand({ nextToken, maxResults: 100 }));
-      arns.push(...(output.clusterArns ?? []).filter((arn) => arn.split('/').at(-1) === name));
+      if (!Array.isArray(output.clusterArns)) {
+        throw new Error('AWS ECS cluster observation returned an invalid cluster list.');
+      }
+      arns.push(...output.clusterArns.filter((arn) => arn.split('/').at(-1) === name));
       nextToken = output.nextToken;
     } while (nextToken);
     return arns.sort();
@@ -1115,7 +1419,10 @@ export class EcsExpressAdapter implements IProviderAdapter {
     let nextToken: string | undefined;
     do {
       const output = await this.connected().clients.ecs.send(new ListServicesCommand({ cluster: clusterArn, nextToken, maxResults: 100 }));
-      arns.push(...(output.serviceArns ?? []));
+      if (!Array.isArray(output.serviceArns)) {
+        throw new Error(`AWS ECS service observation returned an invalid service list for ${clusterArn}.`);
+      }
+      arns.push(...output.serviceArns);
       nextToken = output.nextToken;
     } while (nextToken);
     return arns.sort();
@@ -1123,9 +1430,20 @@ export class EcsExpressAdapter implements IProviderAdapter {
 
   private async getExpressService(serviceArn: string): Promise<ECSExpressGatewayService | null> {
     try {
-      return (await this.connected().clients.ecs.send(
+      const service = (await this.connected().clients.ecs.send(
         new DescribeExpressGatewayServiceCommand({ serviceArn, include: ['TAGS'] })
-      )).service ?? null;
+      )).service;
+      if (!service) {
+        throw new Error(
+          `AWS returned no ECS Express service and no not-found error for ${serviceArn}.`
+        );
+      }
+      if (service.serviceArn !== serviceArn) {
+        throw new Error(
+          `AWS returned ECS Express service ${service.serviceArn ?? 'without an ARN'} when ${serviceArn} was requested.`
+        );
+      }
+      return service;
     } catch (error) {
       if (this.hasErrorName(error, 'ResourceNotFoundException', 'ServiceNotFoundException', 'ClusterNotFoundException')) return null;
       throw error;
@@ -1213,6 +1531,11 @@ export class EcsExpressAdapter implements IProviderAdapter {
   }
 
   private async assertProjectDeletionResourcesOwned(resources: ProjectResources): Promise<void> {
+    const defaultVpc = await this.describeDefaultVpc();
+    if (defaultVpc) {
+      const groups = await this.findWorkloadSecurityGroups(resources, defaultVpc.VpcId!);
+      if (groups[0]) this.assertWorkloadSecurityGroup(groups[0], resources, defaultVpc.VpcId!);
+    }
     const repository = await this.getRepository(resources.repositoryName);
     if (repository) {
       if (repository.repositoryArn !== resources.repositoryArn) {
@@ -1231,6 +1554,32 @@ export class EcsExpressAdapter implements IProviderAdapter {
       if (role && (role.Arn !== roleArn || !this.hasManagedTag(role.Tags))) {
         throw new Error(`IAM role ${roleName} is outside its reviewed Hypervibe identity.`);
       }
+    }
+  }
+
+  private async deleteWorkloadSecurityGroup(resources: ProjectResources): Promise<void> {
+    const defaultVpc = await this.describeDefaultVpc();
+    if (!defaultVpc) return;
+    const matches = await this.findWorkloadSecurityGroups(resources, defaultVpc.VpcId!);
+    const group = matches[0];
+    if (!group) return;
+    this.assertWorkloadSecurityGroup(group, resources, defaultVpc.VpcId!);
+    const groupId = group.GroupId!;
+    const attempts = this.attempts('HYPERVIBE_EC2_DELETE_ATTEMPTS', 60);
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const observed = await this.getSecurityGroup(groupId);
+      if (!observed) return;
+      this.assertWorkloadSecurityGroup(observed, resources, defaultVpc.VpcId!);
+      try {
+        await this.connected().clients.ec2.send(new DeleteSecurityGroupCommand({ GroupId: groupId }));
+      } catch (error) {
+        if (this.hasErrorName(error, 'InvalidGroup.NotFound')) return;
+        if (!this.hasErrorName(error, 'DependencyViolation')) throw error;
+      }
+      if (attempt < attempts) await this.delay();
+    }
+    if (await this.getSecurityGroup(groupId)) {
+      throw new Error(`AWS workload security group ${groupId} remained observable after deletion.`);
     }
   }
 
@@ -1292,7 +1641,10 @@ export class EcsExpressAdapter implements IProviderAdapter {
           'FAILED',
         ],
       }));
-      summaries.push(...(output.CertificateSummaryList ?? []).filter((item) => item.DomainName === domain));
+      if (!Array.isArray(output.CertificateSummaryList)) {
+        throw new Error('AWS ACM certificate observation returned an invalid certificate list.');
+      }
+      summaries.push(...output.CertificateSummaryList.filter((item) => item.DomainName === domain));
       NextToken = output.NextToken;
     } while (NextToken);
 
@@ -1323,9 +1675,20 @@ export class EcsExpressAdapter implements IProviderAdapter {
 
   private async getCertificate(certificateArn: string): Promise<CertificateDetail | null> {
     try {
-      return (await this.connected().clients.acm.send(new DescribeCertificateCommand({
+      const certificate = (await this.connected().clients.acm.send(new DescribeCertificateCommand({
         CertificateArn: certificateArn,
-      }))).Certificate ?? null;
+      }))).Certificate;
+      if (!certificate) {
+        throw new Error(
+          `AWS returned no ACM certificate and no ResourceNotFoundException for ${certificateArn}.`
+        );
+      }
+      if (certificate.CertificateArn !== certificateArn) {
+        throw new Error(
+          `AWS returned ACM certificate ${certificate.CertificateArn ?? 'without an ARN'} when ${certificateArn} was requested.`
+        );
+      }
+      return certificate;
     } catch (error) {
       if (this.hasErrorName(error, 'ResourceNotFoundException')) return null;
       throw error;
@@ -1564,6 +1927,11 @@ providerRegistry.register({
         ['HYPERVIBE_AWS_SECRET_ACCESS_KEY', 'AWS_SECRET_ACCESS_KEY'],
       ],
     },
+    maturity: {
+      lifecycle: {
+        hosting: { status: 'ready-for-live' },
+      },
+    },
     orchestration: {
       project: { shareAcrossEnvironments: false },
       diff: { workloadKindObservation: 'exact' },
@@ -1581,6 +1949,7 @@ providerRegistry.register({
     },
     lifecycle: {
       hosting: {
+        workloadKinds: ['web'],
         customDomains: 'managed',
         domainTrafficProxy: 'dns-only',
         maintenance: 'unsupported',
@@ -1588,9 +1957,9 @@ providerRegistry.register({
       },
     },
   },
-  factory: (credentials) => {
+  factory: async (credentials) => {
     const adapter = new EcsExpressAdapter();
-    void adapter.connect(credentials);
+    await adapter.connect(credentials);
     return adapter;
   },
   inspection: {

@@ -58,6 +58,8 @@ interface FakeQueueAdapter {
   getQueueSubscription: ReturnType<typeof vi.fn>;
   ensureQueue: ReturnType<typeof vi.fn>;
   destroyQueue: ReturnType<typeof vi.fn>;
+  queueResourceNames: ReturnType<typeof vi.fn>;
+  queueProviderScope: ReturnType<typeof vi.fn>;
 }
 
 function stubAdapter(capabilities: Record<string, unknown>): FakeQueueAdapter {
@@ -75,6 +77,12 @@ function stubAdapter(capabilities: Record<string, unknown>): FakeQueueAdapter {
       createdSubscription: true,
     }),
     destroyQueue: vi.fn().mockResolvedValue(undefined),
+    queueResourceNames: vi.fn((environment: Environment, queueName: string) => {
+      const projectId = String(environment.platformBindings.projectId ?? 'hypervibe');
+      const topicId = `${projectId}-${queueName}`;
+      return { topicId, subscriptionId: `${topicId}-sub` };
+    }),
+    queueProviderScope: vi.fn(() => ({ projectId: 'gcp-project' })),
   };
   vi.spyOn(adapterFactory, 'getProviderAdapter').mockResolvedValue({
     success: true,
@@ -94,18 +102,35 @@ function ensureAction(
     resource: { kind: 'queue', name, provider },
     verified: true,
     reason: 'test',
-    metadata: { operation: QUEUE_OPERATIONS.ensure, queueName: name, ...extraMetadata },
+    metadata: {
+      operation: QUEUE_OPERATIONS.ensure,
+      queueName: name,
+      backend: provider === 'cloudrun' ? 'pubsub' : 'postgres',
+      ...(provider === 'cloudrun' ? { providerScope: { projectId: 'gcp-project' } } : {}),
+      ...extraMetadata,
+    },
   };
 }
 
 function destroyAction(name: string, provider = 'cloudrun'): PlanAction {
+  const pubsub = provider === 'cloudrun';
   return {
     id: `queue:${name}:destroy`,
     type: 'destroy',
     resource: { kind: 'queue', name, provider },
     verified: true,
     reason: 'test',
-    metadata: { operation: QUEUE_OPERATIONS.destroy, queueName: name },
+    ...(pubsub ? { dataBearing: true, requiresConfirm: true } : {}),
+    metadata: pubsub
+      ? {
+          operation: QUEUE_OPERATIONS.destroy,
+          queueName: name,
+          backend: 'pubsub',
+          topicName: `projects/gcp-project/topics/gcp-project-${name}`,
+          subscriptionName: `projects/gcp-project/subscriptions/gcp-project-${name}-sub`,
+          providerScope: { projectId: 'gcp-project' },
+        }
+      : { operation: QUEUE_OPERATIONS.destroy, queueName: name, backend: 'postgres' },
   };
 }
 
@@ -140,6 +165,19 @@ describe('queue-plan.service', () => {
     return { project, environment };
   }
 
+  function bindPubsubQueue(environment: Environment, name = 'email-jobs', projectId = 'gcp-project'): void {
+    envRepo().updatePlatformBindings(environment.id, {
+      queues: {
+        [name]: {
+          backend: 'pubsub',
+          topicName: `projects/${projectId}/topics/${projectId}-${name}`,
+          subscriptionName: `projects/${projectId}/subscriptions/${projectId}-${name}-sub`,
+          providerScope: { projectId },
+        },
+      },
+    });
+  }
+
   describe('pubsub backend', () => {
     it('plans a verified create when the subscription does not exist', async () => {
       const { project, environment } = seedProject();
@@ -154,12 +192,58 @@ describe('queue-plan.service', () => {
         type: 'create',
         verified: true,
         resource: { kind: 'queue', name: 'email-jobs' },
-        metadata: { operation: QUEUE_OPERATIONS.ensure, queueName: 'email-jobs', ackDeadlineSeconds: 120 },
+        metadata: {
+          operation: QUEUE_OPERATIONS.ensure,
+          queueName: 'email-jobs',
+          backend: 'pubsub',
+          providerScope: { projectId: 'gcp-project' },
+          ackDeadlineSeconds: 120,
+        },
       });
       expect(isQueueAction(actions[0])).toBe(true);
     });
 
     it('plans a noop when the subscription matches the spec', async () => {
+      const { project, environment } = seedProject();
+      bindPubsubQueue(environment);
+      const adapter = stubAdapter({ queues: { backend: 'pubsub' } });
+      adapter.getQueueSubscription.mockResolvedValue({
+        name: 'projects/gcp-project/subscriptions/gcp-project-email-jobs-sub',
+        topic: 'projects/gcp-project/topics/gcp-project-email-jobs',
+        ackDeadlineSeconds: 120,
+      });
+
+      const { actions } = await planQueues({
+        project,
+        environmentSpec: pubsubSpec(),
+        environment: envRepo().findById(environment.id),
+      });
+      expect(actions).toHaveLength(1);
+      expect(actions[0]).toMatchObject({ id: 'queue:email-jobs', type: 'noop', verified: true });
+      expect(actions[0].diff).toBeUndefined();
+    });
+
+    it('plans an update with a field diff on ackDeadlineSeconds drift', async () => {
+      const { project, environment } = seedProject();
+      bindPubsubQueue(environment);
+      const adapter = stubAdapter({ queues: { backend: 'pubsub' } });
+      adapter.getQueueSubscription.mockResolvedValue({
+        name: 'projects/gcp-project/subscriptions/gcp-project-email-jobs-sub',
+        topic: 'projects/gcp-project/topics/gcp-project-email-jobs',
+        ackDeadlineSeconds: 10,
+      });
+
+      const { actions } = await planQueues({
+        project,
+        environmentSpec: pubsubSpec(),
+        environment: envRepo().findById(environment.id),
+      });
+      expect(actions[0].type).toBe('update');
+      expect(actions[0].diff).toEqual([{ field: 'ackDeadlineSeconds', from: '10', to: '120' }]);
+      expect(actions[0].reason).toContain('ackDeadlineSeconds');
+    });
+
+    it('blocks a live Pub/Sub queue that has no durable local binding', async () => {
       const { project, environment } = seedProject();
       const adapter = stubAdapter({ queues: { backend: 'pubsub' } });
       adapter.getQueueSubscription.mockResolvedValue({
@@ -168,31 +252,58 @@ describe('queue-plan.service', () => {
         ackDeadlineSeconds: 120,
       });
 
-      const { actions } = await planQueues({ project, environmentSpec: pubsubSpec(), environment });
+      const { actions, warnings } = await planQueues({ project, environmentSpec: pubsubSpec(), environment });
+
       expect(actions).toHaveLength(1);
-      expect(actions[0]).toMatchObject({ id: 'queue:email-jobs', type: 'noop', verified: true });
-      expect(actions[0].diff).toBeUndefined();
+      expect(actions[0]).toMatchObject({
+        type: 'update',
+        verified: true,
+        metadata: { blockedReason: 'queue_binding_missing' },
+      });
+      expect(warnings.join(' ')).toContain('silently adopt');
+
+      const result = await applyQueueAction({
+        project,
+        envName: 'production',
+        environmentSpec: pubsubSpec(),
+        action: actions[0],
+      });
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('blocked');
+      expect(adapter.ensureQueue).not.toHaveBeenCalled();
     });
 
-    it('plans an update with a field diff on ackDeadlineSeconds drift', async () => {
+    it('blocks replacement creation when a durable Pub/Sub binding is confirmed absent', async () => {
       const { project, environment } = seedProject();
+      bindPubsubQueue(environment);
       const adapter = stubAdapter({ queues: { backend: 'pubsub' } });
-      adapter.getQueueSubscription.mockResolvedValue({
-        name: 'projects/gcp-project/subscriptions/gcp-project-email-jobs-sub',
-        topic: 'projects/gcp-project/topics/gcp-project-email-jobs',
-        ackDeadlineSeconds: 10,
+      adapter.getQueueSubscription.mockResolvedValue(null);
+
+      const { actions } = await planQueues({
+        project,
+        environmentSpec: pubsubSpec(),
+        environment: envRepo().findById(environment.id),
       });
 
-      const { actions } = await planQueues({ project, environmentSpec: pubsubSpec(), environment });
-      expect(actions[0].type).toBe('update');
-      expect(actions[0].diff).toEqual([{ field: 'ackDeadlineSeconds', from: '10', to: '120' }]);
-      expect(actions[0].reason).toContain('ackDeadlineSeconds');
+      expect(actions).toHaveLength(1);
+      expect(actions[0]).toMatchObject({
+        type: 'update',
+        metadata: { blockedReason: 'queue_binding_identity_missing' },
+      });
+      expect(actions.some((action) => action.type === 'create')).toBe(false);
     });
 
     it('plans a confirm-gated destroy for bindings removed from the spec', async () => {
       const { project, environment } = seedProject();
       envRepo().updatePlatformBindings(environment.id, {
-        queues: { old: { backend: 'pubsub', topicName: 'projects/gcp-project/topics/gcp-project-old' } },
+        queues: {
+          old: {
+            backend: 'pubsub',
+            topicName: 'projects/gcp-project/topics/gcp-project-old',
+            subscriptionName: 'projects/gcp-project/subscriptions/gcp-project-old-sub',
+            providerScope: { projectId: 'gcp-project' },
+          },
+        },
       });
       const adapter = stubAdapter({ queues: { backend: 'pubsub' } });
       adapter.getQueueSubscription.mockResolvedValue({
@@ -212,7 +323,14 @@ describe('queue-plan.service', () => {
         verified: true,
         dataBearing: true,
         requiresConfirm: true,
-        metadata: { operation: QUEUE_OPERATIONS.destroy, queueName: 'old' },
+        metadata: expect.objectContaining({
+          operation: QUEUE_OPERATIONS.destroy,
+          queueName: 'old',
+          backend: 'pubsub',
+          topicName: 'projects/gcp-project/topics/gcp-project-old',
+          subscriptionName: 'projects/gcp-project/subscriptions/gcp-project-old-sub',
+          providerScope: { projectId: 'gcp-project' },
+        }),
       });
       expect(destroy.reason).toContain('undelivered messages');
     });
@@ -229,8 +347,18 @@ describe('queue-plan.service', () => {
         id: 'queue:email-jobs',
         type: 'update',
         verified: false,
-        metadata: { blockedReason: 'queue_observation_unknown' },
+        metadata: { blockedReason: 'queue_observation_unavailable' },
       });
+
+      const result = await applyQueueAction({
+        project,
+        envName: 'production',
+        environmentSpec: pubsubSpec(),
+        action: actions[0],
+      });
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('blocked');
+      expect(adapter.ensureQueue).not.toHaveBeenCalled();
     });
 
     it('warns and fails apply when the project is not queue-prepared', async () => {
@@ -273,7 +401,50 @@ describe('queue-plan.service', () => {
         backend: 'pubsub',
         topicName: 'projects/gcp-project/topics/gcp-project-email-jobs',
         subscriptionName: 'projects/gcp-project/subscriptions/gcp-project-email-jobs-sub',
+        providerScope: { projectId: 'gcp-project' },
       });
+    });
+
+    it('does not persist an ensure result from an unexpected Pub/Sub project', async () => {
+      const { project, environment } = seedProject();
+      const adapter = stubAdapter({ queues: { backend: 'pubsub' } });
+      adapter.ensureQueue.mockResolvedValue({
+        topicName: 'projects/other-project/topics/gcp-project-email-jobs',
+        subscriptionName: 'projects/other-project/subscriptions/gcp-project-email-jobs-sub',
+        createdTopic: true,
+        createdSubscription: true,
+      });
+
+      const result = await applyQueueAction({
+        project,
+        envName: 'production',
+        environmentSpec: pubsubSpec(),
+        action: ensureAction('email-jobs', { ackDeadlineSeconds: 120 }),
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('unexpected provider identity');
+      expect(parseQueueBindings(envRepo().findById(environment.id))['email-jobs']).toBeUndefined();
+    });
+
+    it('blocks Pub/Sub ensure when the connected provider project changes after planning', async () => {
+      const { project, environment } = seedProject();
+      const adapter = stubAdapter({ queues: { backend: 'pubsub' } });
+      const { actions } = await planQueues({ project, environmentSpec: pubsubSpec(), environment });
+      expect(actions[0].type).toBe('create');
+      adapter.queueProviderScope.mockReturnValue({ projectId: 'other-project' });
+
+      const result = await applyQueueAction({
+        project,
+        envName: 'production',
+        environmentSpec: pubsubSpec(),
+        action: actions[0],
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('stale mutation authority');
+      expect(adapter.ensureQueue).not.toHaveBeenCalled();
+      expect(parseQueueBindings(envRepo().findById(environment.id))['email-jobs']).toBeUndefined();
     });
 
     it('rejects a queue action for a different provider before resolving an adapter', async () => {
@@ -299,8 +470,18 @@ describe('queue-plan.service', () => {
       const { project, environment } = seedProject();
       envRepo().updatePlatformBindings(environment.id, {
         queues: {
-          'email-jobs': { backend: 'pubsub', topicName: 't' },
-          keep: { backend: 'pubsub', topicName: 't2' },
+          'email-jobs': {
+            backend: 'pubsub',
+            topicName: 'projects/gcp-project/topics/gcp-project-email-jobs',
+            subscriptionName: 'projects/gcp-project/subscriptions/gcp-project-email-jobs-sub',
+            providerScope: { projectId: 'gcp-project' },
+          },
+          keep: {
+            backend: 'pubsub',
+            topicName: 'projects/gcp-project/topics/gcp-project-keep',
+            subscriptionName: 'projects/gcp-project/subscriptions/gcp-project-keep-sub',
+            providerScope: { projectId: 'gcp-project' },
+          },
         },
       });
       const adapter = stubAdapter({ queues: { backend: 'pubsub' } });
@@ -317,6 +498,67 @@ describe('queue-plan.service', () => {
       const bindings = parseQueueBindings(envRepo().findById(environment.id));
       expect(bindings['email-jobs']).toBeUndefined();
       expect(bindings.keep).toMatchObject({ backend: 'pubsub' });
+    });
+
+    it('blocks Pub/Sub deletion when the bound project scope changed after planning', async () => {
+      const { project, environment } = seedProject();
+      envRepo().updatePlatformBindings(environment.id, {
+        queues: {
+          'email-jobs': {
+            backend: 'pubsub',
+            topicName: 'projects/other-project/topics/gcp-project-email-jobs',
+            subscriptionName: 'projects/other-project/subscriptions/gcp-project-email-jobs-sub',
+            providerScope: { projectId: 'other-project' },
+          },
+        },
+      });
+      const adapter = stubAdapter({ queues: { backend: 'pubsub' } });
+
+      const result = await applyQueueAction({
+        project,
+        envName: 'production',
+        environmentSpec: pubsubSpec({ queues: undefined }),
+        action: destroyAction('email-jobs'),
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('stale mutation authority');
+      expect(adapter.destroyQueue).not.toHaveBeenCalled();
+      expect(parseQueueBindings(envRepo().findById(environment.id))['email-jobs']).toBeDefined();
+    });
+
+    it('blocks Pub/Sub deletion when the environment project changes after planning', async () => {
+      const { project, environment } = seedProject();
+      envRepo().updatePlatformBindings(environment.id, {
+        queues: {
+          'email-jobs': {
+            backend: 'pubsub',
+            topicName: 'projects/gcp-project/topics/gcp-project-email-jobs',
+            subscriptionName: 'projects/gcp-project/subscriptions/gcp-project-email-jobs-sub',
+            providerScope: { projectId: 'gcp-project' },
+          },
+        },
+      });
+      const adapter = stubAdapter({ queues: { backend: 'pubsub' } });
+      const { actions } = await planQueues({
+        project,
+        environmentSpec: pubsubSpec({ queues: undefined }),
+        environment: envRepo().findById(environment.id),
+      });
+      const plannedDestroy = actions.find((action) => action.id === 'queue:email-jobs:destroy')!;
+
+      envRepo().updatePlatformBindings(environment.id, { projectId: 'new-gcp-project' });
+      const result = await applyQueueAction({
+        project,
+        envName: 'production',
+        environmentSpec: pubsubSpec({ queues: undefined }),
+        action: plannedDestroy,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('stale mutation authority');
+      expect(adapter.destroyQueue).not.toHaveBeenCalled();
+      expect(parseQueueBindings(envRepo().findById(environment.id))['email-jobs']).toBeDefined();
     });
   });
 
@@ -363,6 +605,11 @@ describe('queue-plan.service', () => {
       expect(destroy.type).toBe('destroy');
       expect(destroy.requiresConfirm).toBeUndefined();
       expect(destroy.dataBearing).toBeUndefined();
+      expect(destroy.metadata).toMatchObject({
+        operation: QUEUE_OPERATIONS.destroy,
+        queueName: 'email-jobs',
+        backend: 'postgres',
+      });
       expect(destroy.reason).toContain('app-managed');
     });
 

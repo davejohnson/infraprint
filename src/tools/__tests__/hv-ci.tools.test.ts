@@ -11,13 +11,12 @@ import { SqliteAdapter } from '../../adapters/db/sqlite.adapter.js';
 import '../../adapters/providers/railway/railway.adapter.js';
 import '../../adapters/providers/gcp/cloudrun.adapter.js';
 import { ProjectRepository } from '../../adapters/db/repositories/project.repository.js';
-import { EnvironmentRepository } from '../../adapters/db/repositories/environment.repository.js';
 import { ConnectionRepository } from '../../adapters/db/repositories/connection.repository.js';
 import { getSecretStore } from '../../adapters/secrets/secret-store.js';
 import { GitHubAdapter } from '../../adapters/providers/github/github.adapter.js';
 import { GitLabAdapter } from '../../adapters/providers/gitlab/gitlab.adapter.js';
 import '../../application/devops-providers.js';
-import { createToolContext } from '../context.js';
+import { createToolContext } from '../../application/context.js';
 import { registerHvCiTools } from '../hv-ci.tools.js';
 import { SpecStore } from '../../domain/spec/spec.store.js';
 import { AuditRepository } from '../../adapters/db/repositories/audit.repository.js';
@@ -209,22 +208,23 @@ describe('hv_ci_status', () => {
 
   it('honors runId when filtering legacy GitHub artifacts', async () => {
     seedProject();
-    vi.spyOn(GitHubAdapter.prototype, 'listArtifacts').mockResolvedValue({
-      total_count: 2,
-      artifacts: [7, 8].map((runId) => ({
-        id: runId,
-        name: `artifact-${runId}`,
+    const listArtifacts = vi.spyOn(GitHubAdapter.prototype, 'listArtifacts');
+    const listWorkflowRunArtifacts = vi.spyOn(GitHubAdapter.prototype, 'listWorkflowRunArtifacts').mockResolvedValue({
+      total_count: 1,
+      artifacts: [{
+        id: 8,
+        name: 'artifact-8',
         expired: false,
         created_at: '2026-07-01T00:00:00Z',
         updated_at: '2026-07-01T00:00:00Z',
         workflow_run: {
-          id: runId,
+          id: 8,
           repository_id: 1,
           head_repository_id: 1,
           head_branch: 'main',
           head_sha: 'b'.repeat(40),
         },
-      })),
+      }],
     });
     const t = await makeClient();
 
@@ -237,6 +237,43 @@ describe('hv_ci_status', () => {
     expect(res.ok).toBe(true);
     expect(res.data.artifacts).toHaveLength(1);
     expect(res.data.artifacts[0].id).toBe(8);
+    expect(listWorkflowRunArtifacts).toHaveBeenCalledWith('davejohnson', 'billforge', '8');
+    expect(listArtifacts).not.toHaveBeenCalled();
+    await t.close();
+  });
+
+  it('does not replace an unknown explicit jobId with another job', async () => {
+    seedProject();
+    vi.spyOn(GitHubAdapter.prototype, 'listWorkflowRunJobs').mockResolvedValue({
+      total_count: 1,
+      jobs: [{
+        id: 99,
+        run_id: 123,
+        name: 'deploy',
+        status: 'completed',
+        conclusion: 'failure',
+        started_at: '2026-06-26T20:16:30Z',
+        completed_at: '2026-06-26T20:17:00Z',
+        html_url: 'https://github.com/davejohnson/billforge/actions/runs/123/job/99',
+        steps: [],
+      }],
+    });
+    const getLogs = vi.spyOn(GitHubAdapter.prototype, 'getWorkflowJobLogs');
+    const t = await makeClient();
+
+    const res = await t.call('hv_ci_status', {
+      project: 'billforge',
+      include: ['logs'],
+      runId: '123',
+      jobId: '404',
+    });
+
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatchObject({
+      code: 'NOT_FOUND',
+      details: { available: ['99'] },
+    });
+    expect(getLogs).not.toHaveBeenCalled();
     await t.close();
   });
 
@@ -543,16 +580,17 @@ describe('hv_ci_status', () => {
 });
 
 describe('hv_ci_trigger', () => {
-  it('dispatches a workflow run', async () => {
+  it('dispatches a workflow run on the observed repository default branch', async () => {
     seedProject();
+    vi.spyOn(GitHubAdapter.prototype, 'getRepository').mockResolvedValue({ default_branch: 'trunk' });
     const trigger = vi.spyOn(GitHubAdapter.prototype, 'triggerWorkflow').mockResolvedValue();
     const t = await makeClient();
 
     const res = await t.call('hv_ci_trigger', { project: 'billforge', workflow: 'deploy.yml', inputs: { version: '1.2.3' } });
     expect(res.ok).toBe(true);
-    expect(res.data).toMatchObject({ repository: 'davejohnson/billforge', workflow: 'deploy.yml', ref: 'main' });
+    expect(res.data).toMatchObject({ repository: 'davejohnson/billforge', workflow: 'deploy.yml', ref: 'trunk' });
     expect(res.next).toContain('hv_ci_status');
-    expect(trigger).toHaveBeenCalledWith('davejohnson', 'billforge', 'deploy.yml', 'main', { version: '1.2.3' });
+    expect(trigger).toHaveBeenCalledWith('davejohnson', 'billforge', 'deploy.yml', 'trunk', { version: '1.2.3' });
     await t.close();
   });
 
@@ -651,6 +689,33 @@ describe('canonical provider-neutral CI routing', () => {
         definitions: [{ id: '.gitlab-ci.yml', state: 'active' }],
       },
     });
+    await t.close();
+  });
+
+  it('does not replace an unknown canonical jobId with another job', async () => {
+    seedGitLabProject();
+    vi.spyOn(GitLabAdapter.prototype, 'observeRepository').mockResolvedValue({ state: 'present', value: repository });
+    vi.spyOn(GitLabAdapter.prototype, 'listJobs').mockResolvedValue([{
+      id: '17',
+      name: 'deploy',
+      phase: 'failed',
+      nativeStatus: 'failed',
+    }]);
+    const getJobLog = vi.spyOn(GitLabAdapter.prototype, 'getJobLog');
+    const t = await makeClient();
+
+    const result = await t.call('hv_ci_status', {
+      project: 'gitlab-app',
+      include: ['logs'],
+      runId: '99',
+      jobId: '404',
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { code: 'NOT_FOUND', details: { available: ['17'] } },
+    });
+    expect(getJobLog).not.toHaveBeenCalled();
     await t.close();
   });
 

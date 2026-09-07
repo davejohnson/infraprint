@@ -131,6 +131,81 @@ describe('ConvergeExecutor staleness', () => {
     expect(runRepo().findByEnvironmentId(environmentId).filter((run) => run.type === 'apply')).toEqual([]);
   });
 
+  it('rejects persisted data-resource actions whose confirmation flags were stripped', async () => {
+    const handler = vi.fn();
+    const planId = storePlan([action({
+      id: 'database:railway:destroy',
+      type: 'destroy',
+      resource: { kind: 'database', name: 'postgres', provider: 'railway' },
+      dataBearing: true,
+      requiresConfirm: false,
+    })]);
+
+    const result = await new ConvergeExecutor().execute({
+      planRunId: planId,
+      currentSpecRevision: 1,
+      confirmActions: ['database:railway:destroy'],
+      handler,
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining('not a valid persisted hv_plan'),
+    });
+    expect(handler).not.toHaveBeenCalled();
+    expect(runRepo().findByEnvironmentId(environmentId).filter((run) => run.type === 'apply')).toEqual([]);
+  });
+
+  it('rejects a persisted queue destroy whose data-loss flags were stripped', async () => {
+    const handler = vi.fn();
+    const planId = storePlan([action({
+      id: 'queue:jobs:destroy',
+      type: 'destroy',
+      resource: { kind: 'queue', name: 'jobs', provider: 'cloudrun' },
+      dataBearing: false,
+      requiresConfirm: false,
+      metadata: { operation: 'queueDestroy', queueName: 'jobs', backend: 'pubsub' },
+    })]);
+
+    const result = await new ConvergeExecutor().execute({
+      planRunId: planId,
+      currentSpecRevision: 1,
+      confirmActions: ['queue:jobs:destroy'],
+      handler,
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining('not a valid persisted hv_plan'),
+    });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('rejects a persisted domain purchase whose billing confirmation flags were stripped', async () => {
+    const handler = vi.fn();
+    const planId = storePlan([action({
+      id: 'domain:example.com:register',
+      type: 'create',
+      resource: { kind: 'domain', name: 'example.com', provider: 'cloudflare' },
+      billable: false,
+      requiresConfirm: false,
+      metadata: { operation: 'cloudflareRegistrarRegistration', accountId: 'account-1' },
+    })]);
+
+    const result = await new ConvergeExecutor().execute({
+      planRunId: planId,
+      currentSpecRevision: 1,
+      confirmActions: ['domain:example.com:register'],
+      handler,
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining('not a valid persisted hv_plan'),
+    });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
   it.each([
     {
       label: 'an unrelated action',
@@ -585,6 +660,37 @@ describe('fingerprintObservedState', () => {
     expect(fingerprintObservedState(changed)).not.toBe(fingerprintObservedState(base));
   });
 
+  it('changes when service, database, or cache readiness changes', () => {
+    const withCache: ObservedState = {
+      ...base,
+      caches: [{ provider: 'railway', engine: 'redis', externalId: 'cache-1', status: 'running' }],
+    };
+    expect(fingerprintObservedState({
+      ...withCache,
+      services: [{ ...withCache.services[0], status: 'failed' }],
+    })).not.toBe(fingerprintObservedState(withCache));
+    expect(fingerprintObservedState({
+      ...withCache,
+      databases: [{ ...withCache.databases[0], status: 'error' }],
+    })).not.toBe(fingerprintObservedState(withCache));
+    expect(fingerprintObservedState({
+      ...withCache,
+      caches: [{ ...withCache.caches![0], status: 'provisioning' }],
+    })).not.toBe(fingerprintObservedState(withCache));
+  });
+
+  it('changes when a service origin URL changes', () => {
+    const before: ObservedState = {
+      ...base,
+      services: [{ ...base.services[0], url: 'https://old.example' }],
+    };
+    const after: ObservedState = {
+      ...base,
+      services: [{ ...base.services[0], url: 'https://new.example' }],
+    };
+    expect(fingerprintObservedState(before)).not.toBe(fingerprintObservedState(after));
+  });
+
   it('changes when deploy source changes', () => {
     const withSource: ObservedState = {
       ...base,
@@ -664,5 +770,65 @@ describe('fingerprintObservedState', () => {
 
     expect(fingerprintObservedState(reorderedScope)).toBe(fingerprintObservedState(scoped));
     expect(fingerprintObservedState(otherOrganization)).not.toBe(fingerprintObservedState(scoped));
+  });
+
+  it('includes cache and storage scope while remaining key-order stable', () => {
+    const scoped: ObservedState = {
+      ...base,
+      caches: [{
+        provider: 'railway',
+        engine: 'redis',
+        externalId: 'cache-1',
+        providerScope: { projectId: 'project-1', environmentId: 'environment-1' },
+        status: 'running',
+        config: { region: 'us-central1', tier: 'BASIC', size: '1gb' },
+      }],
+      storage: [{
+        provider: 'railway',
+        kind: 'object',
+        externalId: 'bucket-1',
+        instanceScope: { projectId: 'project-1', environmentId: 'environment-1' },
+        name: 'uploads',
+        status: 'ready',
+      }],
+    };
+    const reordered: ObservedState = {
+      ...scoped,
+      caches: [{
+        ...scoped.caches![0],
+        providerScope: { environmentId: 'environment-1', projectId: 'project-1' },
+        config: { size: '1gb', tier: 'BASIC', region: 'us-central1' },
+      }],
+      storage: [{
+        ...scoped.storage![0],
+        instanceScope: { environmentId: 'environment-1', projectId: 'project-1' },
+      }],
+    };
+    const changedCacheScope: ObservedState = {
+      ...scoped,
+      caches: [{
+        ...scoped.caches![0],
+        providerScope: { projectId: 'project-2', environmentId: 'environment-1' },
+      }],
+    };
+    const changedStorageScope: ObservedState = {
+      ...scoped,
+      storage: [{
+        ...scoped.storage![0],
+        instanceScope: { projectId: 'project-2', environmentId: 'environment-1' },
+      }],
+    };
+    const changedCacheConfig: ObservedState = {
+      ...scoped,
+      caches: [{
+        ...scoped.caches![0],
+        config: { region: 'us-central1', tier: 'STANDARD_HA', size: '1gb' },
+      }],
+    };
+
+    expect(fingerprintObservedState(reordered)).toBe(fingerprintObservedState(scoped));
+    expect(fingerprintObservedState(changedCacheScope)).not.toBe(fingerprintObservedState(scoped));
+    expect(fingerprintObservedState(changedStorageScope)).not.toBe(fingerprintObservedState(scoped));
+    expect(fingerprintObservedState(changedCacheConfig)).not.toBe(fingerprintObservedState(scoped));
   });
 });

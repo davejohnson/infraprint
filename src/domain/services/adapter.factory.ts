@@ -4,10 +4,10 @@ import { getSecretStore } from '../../adapters/secrets/secret-store.js';
 import { UNCONFIGURED_HOSTING_PROVIDER, type Project } from '../entities/project.entity.js';
 import type { IProviderAdapter } from '../ports/provider.port.js';
 import type { IHostingAdapter } from '../ports/hosting.port.js';
-import type { IDatabaseAdapter } from '../ports/database.port.js';
-import type { ICacheAdapter } from '../ports/cache.port.js';
-import type { IStorageAdapter } from '../ports/storage.port.js';
-import type { ILoadBalancerAdapter } from '../ports/load-balancer.port.js';
+import { supportsDatabaseLifecycle, type IDatabaseAdapter } from '../ports/database.port.js';
+import { supportsCacheLifecycle, type ICacheAdapter } from '../ports/cache.port.js';
+import { supportsStorageLifecycle, type IStorageAdapter } from '../ports/storage.port.js';
+import { supportsLoadBalancer, type ILoadBalancerAdapter } from '../ports/load-balancer.port.js';
 import { getProjectScopeHints } from './project-scope.js';
 import { formatConnectionGuidance } from './connection-guidance.js';
 
@@ -26,7 +26,13 @@ export interface AdapterResult<T> {
  */
 export class AdapterFactory {
   private connectionRepo = new ConnectionRepository();
-  private secretStore = getSecretStore();
+
+  // Constructing the command registry is side-effect free (CLI help/version
+  // and MCP capability discovery both do it). Do not create the encryption
+  // key until a command actually resolves provider credentials.
+  private get secretStore(): ReturnType<typeof getSecretStore> {
+    return getSecretStore();
+  }
 
   /**
    * Get a hosting adapter for a project based on its defaultPlatform.
@@ -48,6 +54,8 @@ export class AdapterFactory {
     providerName: string,
     project?: Project
   ): Promise<AdapterResult<IHostingAdapter>> {
+    const maturityBlock = this.lifecycleMutationBlock<IHostingAdapter>(providerName, 'hosting');
+    if (maturityBlock) return maturityBlock;
     return this.getAdapter<IHostingAdapter>(
       providerName,
       'deployment',
@@ -63,38 +71,44 @@ export class AdapterFactory {
     providerName: string,
     project?: Project
   ): Promise<AdapterResult<IDatabaseAdapter>> {
+    const maturityBlock = this.lifecycleMutationBlock<IDatabaseAdapter>(providerName, 'database');
+    if (maturityBlock) return maturityBlock;
     const provider = providerRegistry.get(providerName);
-    if (provider?.derivedAdapters?.database) {
-      return this.getDerivedAdapter<IDatabaseAdapter>(providerName, 'database', project);
-    }
-    return this.getAdapter<IDatabaseAdapter>(
-      providerName,
-      'database',
-      project ? getProjectScopeHints(project) : undefined
-    );
+    const result = provider?.derivedAdapters?.database
+      ? await this.getDerivedAdapter<IDatabaseAdapter>(providerName, 'database', project)
+      : await this.getAdapter<IDatabaseAdapter>(
+          providerName,
+          'database',
+          project ? getProjectScopeHints(project) : undefined
+        );
+    return this.requireLifecyclePort(result, supportsDatabaseLifecycle, providerName, 'database');
   }
 
   async getCacheAdapter(
     providerName: string,
     project?: Project
   ): Promise<AdapterResult<ICacheAdapter>> {
+    const maturityBlock = this.lifecycleMutationBlock<ICacheAdapter>(providerName, 'cache');
+    if (maturityBlock) return maturityBlock;
     const provider = providerRegistry.get(providerName);
-    if (provider?.derivedAdapters?.cache) {
-      return this.getDerivedAdapter<ICacheAdapter>(providerName, 'cache', project);
-    }
-    return this.getAdapter<ICacheAdapter>(
-      providerName,
-      'cache',
-      project ? getProjectScopeHints(project) : undefined
-    );
+    const result = provider?.derivedAdapters?.cache
+      ? await this.getDerivedAdapter<ICacheAdapter>(providerName, 'cache', project)
+      : await this.getAdapter<ICacheAdapter>(
+          providerName,
+          'cache',
+          project ? getProjectScopeHints(project) : undefined
+        );
+    return this.requireLifecyclePort(result, supportsCacheLifecycle, providerName, 'cache');
   }
 
   async getStorageAdapter(providerName: string, project?: Project): Promise<AdapterResult<IStorageAdapter>> {
+    const maturityBlock = this.lifecycleMutationBlock<IStorageAdapter>(providerName, 'storage');
+    if (maturityBlock) return maturityBlock;
     const provider = providerRegistry.get(providerName);
-    if (provider?.derivedAdapters?.storage) {
-      return this.getDerivedAdapter<IStorageAdapter>(providerName, 'storage', project);
-    }
-    return this.getAdapter<IStorageAdapter>(providerName, 'storage', project ? getProjectScopeHints(project) : undefined);
+    const result = provider?.derivedAdapters?.storage
+      ? await this.getDerivedAdapter<IStorageAdapter>(providerName, 'storage', project)
+      : await this.getAdapter<IStorageAdapter>(providerName, 'storage', project ? getProjectScopeHints(project) : undefined);
+    return this.requireLifecyclePort(result, supportsStorageLifecycle, providerName, 'storage');
   }
 
   async getLoadBalancerAdapter(
@@ -102,11 +116,14 @@ export class AdapterFactory {
     project?: Project,
     scopeHints?: string[]
   ): Promise<AdapterResult<ILoadBalancerAdapter>> {
-    return this.getAdapter<ILoadBalancerAdapter>(
+    const maturityBlock = this.lifecycleMutationBlock<ILoadBalancerAdapter>(providerName, 'load-balancer');
+    if (maturityBlock) return maturityBlock;
+    const result = await this.getAdapter<ILoadBalancerAdapter>(
       providerName,
       undefined,
       scopeHints ?? (project ? getProjectScopeHints(project) : undefined)
     );
+    return this.requireLifecyclePort(result, supportsLoadBalancer, providerName, 'load-balancer');
   }
 
   /**
@@ -138,7 +155,7 @@ export class AdapterFactory {
    * Get list of available hosting platforms (those with connections).
    */
   getAvailableHostingPlatforms(): string[] {
-    return providerRegistry.namesFor('hosting')
+    return providerRegistry.namesForMutation('hosting')
       .filter((providerName) => this.hasVerifiedConnection(providerName));
   }
 
@@ -146,13 +163,45 @@ export class AdapterFactory {
    * Get list of available database providers (those with connections).
    */
   getAvailableDatabaseProviders(): string[] {
-    return providerRegistry.namesFor('database')
+    return providerRegistry.namesForMutation('database')
       .filter((providerName) => this.hasVerifiedConnection(providerName));
   }
 
   getAvailableCacheProviders(): string[] {
-    return providerRegistry.namesFor('cache')
+    return providerRegistry.namesForMutation('cache')
       .filter((providerName) => this.hasVerifiedConnection(providerName));
+  }
+
+  private lifecycleMutationBlock<T>(
+    providerName: string,
+    capability: 'hosting' | 'database' | 'cache' | 'storage' | 'load-balancer'
+  ): AdapterResult<T> | undefined {
+    if (!providerRegistry.supports(providerName, capability)) {
+      return {
+        success: false,
+        error: `Provider ${providerName} does not declare ${capability} lifecycle support. Infrastructure mutation was blocked.`,
+      };
+    }
+    if (providerRegistry.supportsMutation(providerName, capability)) return undefined;
+    const maturity = providerRegistry.lifecycleMaturity(providerName, capability);
+    return {
+      success: false,
+      error: `${providerName} ${capability} lifecycle is ${maturity?.status ?? 'unclassified'} and cannot mutate infrastructure. ${maturity?.reason ?? 'Complete its live-readiness prerequisites before using it in desired state.'} Read-only hv_inspect and hv_connections remain available.`,
+    };
+  }
+
+  private requireLifecyclePort<T>(
+    result: AdapterResult<T>,
+    supports: (value: unknown) => value is T,
+    providerName: string,
+    capability: 'database' | 'cache' | 'storage' | 'load-balancer'
+  ): AdapterResult<T> {
+    if (!result.success || !result.adapter) return result;
+    if (supports(result.adapter)) return result;
+    return {
+      success: false,
+      error: `Provider ${providerName} advertises ${capability} lifecycle support but its adapter does not implement the complete runtime port. Infrastructure mutation was blocked.`,
+    };
   }
 
   /**
@@ -203,13 +252,7 @@ export class AdapterFactory {
     // Decrypt credentials and create adapter
     try {
       const credentials = this.secretStore.decryptObject(connection.credentialsEncrypted);
-      const adapter = providerRegistry.createAdapter<T>(providerName, credentials);
-
-      // Connect if the adapter has an async connect method
-      const adapterWithConnect = adapter as unknown as { connect?: (c: unknown) => Promise<void> };
-      if (adapter && typeof adapterWithConnect.connect === 'function') {
-        await adapterWithConnect.connect(credentials);
-      }
+      const adapter = await providerRegistry.createAdapter<T>(providerName, credentials);
 
       return { success: true, adapter };
     } catch (error) {

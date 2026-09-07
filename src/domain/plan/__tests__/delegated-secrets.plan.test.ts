@@ -14,7 +14,7 @@ import { SpecStore } from '../../spec/spec.store.js';
 import { adapterFactory } from '../../services/adapter.factory.js';
 import { getSecretStore } from '../../../adapters/secrets/secret-store.js';
 import type { ObservedState } from '../../ports/observe.port.js';
-import { createToolContext } from '../../../tools/context.js';
+import { createToolContext } from '../../../application/context.js';
 import { executePlanApply } from '../../../application/apply-plan.js';
 import { parseDelegatedSecretBindings } from '../../services/delegated-secret.service.js';
 import { hashEnvValue } from '../../ports/observe.port.js';

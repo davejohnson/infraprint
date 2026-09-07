@@ -35,10 +35,10 @@ export function resolveGitDeploySource(
   }
 
   const kind = classifyDeployEnvironment(environmentName);
-  if (!kind) {
+  if (!deploy.branch && deploy.branches && !kind) {
     return {
       source: null,
-      error: `Branch deploy strategy only supports staging/production environments; could not map "${environmentName}" to a deploy branch.`,
+      error: `Legacy staging/production branch mapping cannot select a branch for environment "${environmentName}". Set deploy.branch explicitly.`,
     };
   }
 
@@ -50,9 +50,10 @@ export function resolveGitDeploySource(
     };
   }
 
-  const branch = kind === 'production'
-    ? deploy?.branches?.production ?? 'main'
-    : deploy?.branches?.staging ?? 'main';
+  const branch = deploy.branch
+    ?? (kind === 'production' ? deploy.branches?.production : undefined)
+    ?? (kind === 'staging' ? deploy.branches?.staging : undefined)
+    ?? 'main';
 
   return {
     source: {

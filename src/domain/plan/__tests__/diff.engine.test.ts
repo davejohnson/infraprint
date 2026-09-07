@@ -6,6 +6,7 @@ import { environmentSpecSchema, type EnvironmentSpec } from '../../spec/spec.sch
 import type { LocalSnapshot } from '../plan.types.js';
 import type { Service } from '../../entities/service.entity.js';
 import type { Component } from '../../entities/component.entity.js';
+import { bindingIdentityFingerprint } from '../../services/binding-identity.js';
 
 function spec(overrides: Record<string, unknown> = {}): EnvironmentSpec {
   return environmentSpecSchema.parse({
@@ -136,6 +137,120 @@ describe('diffEnvironment — in sync', () => {
   });
 });
 
+describe('diffEnvironment — incomplete database provisioning', () => {
+  const incompleteBindings = {
+    provider: 'railway',
+    instanceId: 'db-1',
+    providerScope: { projectId: 'rail-proj-1' },
+    provisioningIncomplete: true,
+    previousProvider: 'cloudsql',
+    previousExternalId: 'projects/old/instances/postgres',
+    previousBindings: {
+      provider: 'cloudsql',
+      instanceId: 'projects/old/instances/postgres',
+      providerScope: { projectId: 'old', region: 'us-central1' },
+      connectionUrl: 'postgres://previous-local-secret',
+    },
+  };
+
+  it('never promotes a retained failed create to noop or old-provider cleanup', () => {
+    const result = diffEnvironment({
+      spec: spec(),
+      envName: 'production',
+      observed: observed({
+        databases: [{
+          provider: 'railway',
+          engine: 'postgres',
+          externalId: 'db-1',
+          providerScope: { projectId: 'rail-proj-1' },
+          status: 'running',
+        }],
+      }),
+      local: local({ components: [localComponent(incompleteBindings)] }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'database:railway')).toMatchObject({
+      type: 'update',
+      verified: false,
+      metadata: { blockedReason: 'database_provision_incomplete', externalId: 'db-1' },
+    });
+    expect(result.actions.some((action) => action.id === 'database:cloudsql:destroy')).toBe(false);
+    expect(result.actions.some((action) => action.type === 'noop' && action.resource.kind === 'database')).toBe(false);
+    expect(result.actions.find((action) => action.id === 'service:web')?.dependsOn)
+      .toContain('database:railway');
+  });
+
+  it('blocks another billable create while a provider-assigned database identity remains unresolved', () => {
+    const unresolved = localComponent({
+      provider: 'neon',
+      providerScope: { organizationId: 'neon-org' },
+      provisioningIncomplete: true,
+      unresolvedMutation: {
+        resourceKind: 'database',
+        operation: 'create',
+        resourceName: 'invoice-perfect-production-postgres',
+        providerScope: { organizationId: 'neon-org' },
+      },
+    });
+    unresolved.externalId = null;
+    const result = diffEnvironment({
+      spec: spec({ database: { provider: 'neon' } }),
+      envName: 'production',
+      observed: observed({ databases: [] }),
+      local: local({ components: [unresolved] }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'database:neon')).toMatchObject({
+      type: 'update',
+      verified: false,
+      metadata: {
+        blockedReason: 'database_unresolved_create_unknown',
+        resourceName: 'invoice-perfect-production-postgres',
+        providerScope: { organizationId: 'neon-org' },
+      },
+    });
+    expect(result.actions.some((action) => (
+      action.resource.kind === 'database' && action.type === 'create'
+    ))).toBe(false);
+    expect(result.actions.find((action) => action.id === 'service:web')?.dependsOn)
+      .toContain('database:neon');
+    expect(result.warnings).toContainEqual(expect.stringContaining(
+      'hv_import mode="retained-database-cleanup"'
+    ));
+  });
+
+  it('offers only exact confirm-gated cleanup when the incomplete database is removed from desired state', () => {
+    const result = diffEnvironment({
+      spec: spec({ database: undefined }),
+      envName: 'production',
+      observed: observed({
+        databases: [{
+          provider: 'railway',
+          engine: 'postgres',
+          externalId: 'db-1',
+          providerScope: { projectId: 'rail-proj-1' },
+          status: 'provisioning',
+        }],
+      }),
+      local: local({ components: [localComponent(incompleteBindings)] }),
+    });
+
+    const databaseActions = result.actions.filter((action) => action.resource.kind === 'database');
+    expect(databaseActions).toHaveLength(1);
+    expect(databaseActions[0]).toMatchObject({
+      id: 'database:railway:destroy',
+      type: 'destroy',
+      requiresConfirm: true,
+      dataBearing: true,
+      metadata: {
+        externalId: 'db-1',
+        providerScope: { projectId: 'rail-proj-1' },
+        incompleteProvision: true,
+      },
+    });
+  });
+});
+
 describe('diffEnvironment — creates', () => {
   it('creates project and services when nothing exists', () => {
     const result = diffEnvironment({
@@ -152,6 +267,32 @@ describe('diffEnvironment — creates', () => {
     expect(result.warnings).toContainEqual(expect.stringContaining(
       'cannot prove application code consumes it'
     ));
+  });
+
+  it('orders a same-cloud database behind a differently named hosting project', () => {
+    const result = diffEnvironment({
+      spec: spec({
+        hosting: { provider: 'azure-container-apps' },
+        database: { provider: 'azure-postgres' },
+      }),
+      envName: 'production',
+      observed: observed({
+        provider: 'azure-container-apps',
+        projectExists: false,
+        projectId: undefined,
+        environmentId: undefined,
+        services: [],
+        databases: [],
+      }),
+      local: local({ bindings: undefined, services: [], components: [] }),
+      databaseDependsOnHostingProject: true,
+    });
+
+    const database = result.actions.find((action) => action.id === 'database:azure-postgres');
+    expect(database).toMatchObject({
+      type: 'create',
+      dependsOn: ['project:azure-container-apps'],
+    });
   });
 
   it('confirmation-gates service creation when provider metadata marks it billable', () => {
@@ -189,7 +330,7 @@ describe('diffEnvironment — creates', () => {
     expect(confirmGatedActionIds(result.actions)).toContain('service:web');
   });
 
-  it('does not let stale local service and database bindings mask missing observed environment resources', () => {
+  it('recreates an absent stateless service but blocks replacement of an absent bound database', () => {
     const result = diffEnvironment({
       spec: spec(),
       envName: 'staging',
@@ -208,8 +349,38 @@ describe('diffEnvironment — creates', () => {
 
     const byId = new Map(result.actions.map((a) => [a.id, a]));
     expect(byId.get('service:web')?.type).toBe('create');
-    expect(byId.get('database:railway')?.type).toBe('create');
-    expect(byId.get('database:railway')?.reason).toBe('No postgres database exists');
+    expect(byId.get('database:railway')).toMatchObject({
+      type: 'update',
+      metadata: { blockedReason: 'database_binding_absent', boundExternalId: 'db-1' },
+    });
+  });
+});
+
+describe('diffEnvironment — private cache networking', () => {
+  it('plans service drift when live Direct VPC egress differs from the durable cache binding', () => {
+    const cacheNetwork = {
+      provider: 'cloudrun',
+      projectId: 'gcp-project',
+      region: 'us-central1',
+      network: 'projects/gcp-project/global/networks/default',
+      subnetwork: 'projects/gcp-project/regions/us-central1/subnetworks/default',
+      egress: 'PRIVATE_RANGES_ONLY',
+    };
+    const currentLocal = local();
+    const result = diffEnvironment({
+      spec: spec({ cache: { provider: 'memorystore' } }),
+      envName: 'production',
+      observed: observed({ services: [observedWeb()] }),
+      local: {
+        ...currentLocal,
+        bindings: { ...currentLocal.bindings!, cacheNetwork },
+      },
+    });
+
+    expect(result.actions.find((action) => action.id === 'service:web')).toMatchObject({
+      type: 'update',
+      diff: expect.arrayContaining([{ field: 'cacheNetwork' }]),
+    });
   });
 });
 
@@ -413,7 +584,12 @@ describe('diffEnvironment — config drift', () => {
       spec: spec({ hosting: { provider: 'cloudrun' } }),
       envName: 'production',
       observed: observed({ services: [live] }),
-      local: local({ bindings: { provider: 'cloudrun' } }),
+      local: local({
+        bindings: {
+          provider: 'cloudrun',
+          services: { web: { serviceId: 'svc-1' } },
+        },
+      }),
       managedDatabaseEnvVars: {
         DATABASE_URL: '${{postgres-db.DATABASE_URL}}',
       },
@@ -560,6 +736,42 @@ describe('diffEnvironment — provider switches', () => {
     expect(confirmGatedActionIds(result.actions)).toEqual([]);
   });
 
+  it('blocks provider-change creation when an unbound desired-provider database already exists', () => {
+    const result = diffEnvironment({
+      spec: spec({ database: { provider: 'cloudsql' } }),
+      envName: 'production',
+      observed: observed({
+        databases: [
+          { provider: 'railway', engine: 'postgres', externalId: 'db-1', status: 'running' },
+          {
+            provider: 'cloudsql',
+            engine: 'postgres',
+            externalId: 'cloudsql-existing',
+            name: 'existing-target',
+            providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+            status: 'running',
+          },
+        ],
+      }),
+      local: local(),
+    });
+
+    expect(result.actions.find((action) => action.id === 'database:cloudsql')).toMatchObject({
+      type: 'update',
+      metadata: {
+        blockedReason: 'database_adoption_required',
+        externalId: 'cloudsql-existing',
+      },
+    });
+    expect(result.actions.find((action) => (
+      action.id === 'database:cloudsql' && action.type === 'create'
+    ))).toBeUndefined();
+    expect(result.unmanaged).toContainEqual(expect.objectContaining({
+      kind: 'database',
+      detail: expect.stringContaining('cloudsql-existing'),
+    }));
+  });
+
   it('emits confirm-gated destroy for the previous database after cutover is recorded', () => {
     const result = diffEnvironment({
       spec: spec({ database: { provider: 'supabase' } }),
@@ -570,7 +782,17 @@ describe('diffEnvironment — provider switches', () => {
       local: local({
         components: [{
           id: 'c1', environmentId: 'e1', type: 'postgres',
-          bindings: { provider: 'supabase', previousProvider: 'cloudsql' }, externalId: 'supabase-1',
+          bindings: {
+            provider: 'supabase',
+            previousProvider: 'cloudsql',
+            previousExternalId: 'cloudsql-legacy-1',
+            previousBindings: {
+              provider: 'cloudsql',
+              instanceId: 'cloudsql-legacy-1',
+              providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+            },
+          },
+          externalId: 'supabase-1',
           createdAt: new Date(), updatedAt: new Date(),
         }],
       }),
@@ -581,8 +803,51 @@ describe('diffEnvironment — provider switches', () => {
     expect(destroy.type).toBe('destroy');
     expect(destroy.dataBearing).toBe(true);
     expect(destroy.requiresConfirm).toBe(true);
+    expect(destroy.metadata).toEqual({
+      externalId: 'cloudsql-legacy-1',
+      providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+      bindingsFingerprint: bindingIdentityFingerprint({
+        provider: 'cloudsql',
+        instanceId: 'cloudsql-legacy-1',
+        providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+      }),
+    });
+    expect(destroy.verified).toBe(false);
     expect(destroy.reason).toContain('confirm only after cutover is verified');
     expect(confirmGatedActionIds(result.actions)).toEqual(['database:cloudsql:destroy']);
+  });
+
+  it('blocks retained database cleanup when its provider scope is missing', () => {
+    const result = diffEnvironment({
+      spec: spec({ database: { provider: 'supabase' } }),
+      envName: 'production',
+      observed: observed({
+        databases: [{ provider: 'supabase', engine: 'postgres', externalId: 'supabase-1', status: 'running' }],
+      }),
+      local: local({
+        components: [{
+          id: 'c1', environmentId: 'e1', type: 'postgres',
+          bindings: {
+            provider: 'supabase',
+            previousProvider: 'cloudsql',
+            previousExternalId: 'cloudsql-legacy-1',
+            previousBindings: {
+              provider: 'cloudsql',
+              instanceId: 'cloudsql-legacy-1',
+            },
+          },
+          externalId: 'supabase-1',
+          createdAt: new Date(), updatedAt: new Date(),
+        }],
+      }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'database:cloudsql:destroy')).toMatchObject({
+      type: 'update',
+      verified: false,
+      metadata: { blockedReason: 'database_previous_binding_incomplete' },
+    });
+    expect(confirmGatedActionIds(result.actions)).not.toContain('database:cloudsql:destroy');
   });
 
   it('replaces services when the hosting provider changes', () => {
@@ -604,11 +869,23 @@ describe('diffEnvironment — provider switches', () => {
     const result = diffEnvironment({
       spec: spec({ database: undefined }),
       envName: 'production',
-      observed: observed(),
+      observed: observed({
+        databases: [{
+          provider: 'railway',
+          engine: 'postgres',
+          externalId: 'db-1',
+          providerScope: { projectId: 'rail-proj-1', environmentId: 'rail-env-1' },
+          status: 'running',
+        }],
+      }),
       local: local({
         components: [{
           id: 'c1', environmentId: 'e1', type: 'postgres',
-          bindings: { provider: 'railway' }, externalId: 'db-1',
+          bindings: {
+            provider: 'railway',
+            providerScope: { projectId: 'rail-proj-1', environmentId: 'rail-env-1' },
+          },
+          externalId: 'db-1',
           createdAt: new Date(), updatedAt: new Date(),
         }],
       }),
@@ -616,9 +893,114 @@ describe('diffEnvironment — provider switches', () => {
     const destroy = result.actions.find((a) => a.id === 'database:railway:destroy')!;
     expect(destroy.requiresConfirm).toBe(true);
     expect(destroy.dataBearing).toBe(true);
+    expect(destroy.metadata).toEqual({
+      externalId: 'db-1',
+      providerScope: { projectId: 'rail-proj-1', environmentId: 'rail-env-1' },
+      bindingsFingerprint: bindingIdentityFingerprint({
+        provider: 'railway',
+        providerScope: { projectId: 'rail-proj-1', environmentId: 'rail-env-1' },
+      }),
+    });
   });
 
-  it('does not plan a database destroy from stale local bindings when observation shows no live database', () => {
+  it('blocks database removal when the durable provider scope is missing', () => {
+    const result = diffEnvironment({
+      spec: spec({ database: undefined }),
+      envName: 'production',
+      observed: observed({
+        databases: [{
+          provider: 'railway',
+          engine: 'postgres',
+          externalId: 'db-1',
+          status: 'running',
+        }],
+      }),
+      local: local({
+        components: [{
+          id: 'c1', environmentId: 'e1', type: 'postgres',
+          bindings: { provider: 'railway' },
+          externalId: 'db-1',
+          createdAt: new Date(), updatedAt: new Date(),
+        }],
+      }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'database:railway:destroy')).toMatchObject({
+      type: 'update',
+      verified: false,
+      metadata: { blockedReason: 'database_binding_incomplete' },
+    });
+    expect(confirmGatedActionIds(result.actions)).not.toContain('database:railway:destroy');
+  });
+
+  it('destroys a retained previous database before the current database when both are removed', () => {
+    const previousBindings = {
+      provider: 'cloudsql',
+      instanceId: 'cloudsql-legacy-1',
+      providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+    };
+    const currentBindings = {
+      provider: 'supabase',
+      instanceId: 'supabase-current-1',
+      resourceKind: 'postgres',
+      providerScope: { organizationId: 'supabase-org', projectRef: 'supabase-project' },
+      previousProvider: 'cloudsql',
+      previousExternalId: 'cloudsql-legacy-1',
+      previousBindings,
+    };
+    const result = diffEnvironment({
+      spec: spec({ database: undefined }),
+      envName: 'production',
+      observed: observed({
+        databases: [{
+          provider: 'supabase',
+          engine: 'postgres',
+          externalId: 'supabase-current-1',
+          providerScope: { organizationId: 'supabase-org', projectRef: 'supabase-project' },
+          status: 'running',
+        }],
+      }),
+      local: local({
+        components: [{
+          id: 'c1', environmentId: 'e1', type: 'postgres',
+          bindings: currentBindings,
+          externalId: 'supabase-current-1',
+          createdAt: new Date(), updatedAt: new Date(),
+        }],
+      }),
+    });
+
+    const previousDestroy = result.actions.find((action) => action.id === 'database:cloudsql:destroy')!;
+    const currentDestroy = result.actions.find((action) => action.id === 'database:supabase:destroy')!;
+    expect(previousDestroy).toMatchObject({
+      type: 'destroy',
+      verified: false,
+      dataBearing: true,
+      requiresConfirm: true,
+      metadata: {
+        externalId: 'cloudsql-legacy-1',
+        providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+        bindingsFingerprint: bindingIdentityFingerprint(previousBindings),
+      },
+    });
+    expect(currentDestroy.dependsOn).toContain(previousDestroy.id);
+    expect(currentDestroy.metadata).toEqual({
+      externalId: 'supabase-current-1',
+      providerScope: { organizationId: 'supabase-org', projectRef: 'supabase-project' },
+      bindingsFingerprint: bindingIdentityFingerprint({
+        provider: 'supabase',
+        instanceId: 'supabase-current-1',
+        resourceKind: 'postgres',
+        providerScope: { organizationId: 'supabase-org', projectRef: 'supabase-project' },
+      }),
+    });
+    expect(confirmGatedActionIds(result.actions)).toEqual([
+      'database:cloudsql:destroy',
+      'database:supabase:destroy',
+    ]);
+  });
+
+  it('plans idempotent teardown for an exact local binding when observation confirms absence', () => {
     const result = diffEnvironment({
       spec: spec({ database: undefined }),
       envName: 'production',
@@ -626,12 +1008,24 @@ describe('diffEnvironment — provider switches', () => {
       local: local({
         components: [{
           id: 'c1', environmentId: 'e1', type: 'postgres',
-          bindings: { provider: 'railway' }, externalId: 'db-1',
+          bindings: {
+            provider: 'railway',
+            providerScope: { projectId: 'rail-proj-1', environmentId: 'rail-env-1' },
+          },
+          externalId: 'db-1',
           createdAt: new Date(), updatedAt: new Date(),
         }],
       }),
     });
-    expect(result.actions.find((a) => a.id === 'database:railway:destroy')).toBeUndefined();
+    expect(result.actions.find((action) => action.id === 'database:railway:destroy')).toMatchObject({
+      type: 'destroy',
+      verified: true,
+      requiresConfirm: true,
+      metadata: {
+        externalId: 'db-1',
+        providerScope: { projectId: 'rail-proj-1', environmentId: 'rail-env-1' },
+      },
+    });
   });
 });
 
@@ -743,6 +1137,68 @@ describe('diffEnvironment — unmanaged resources', () => {
       type: 'destroy',
       resource: expect.objectContaining({ kind: 'service', name: 'daily', provider: 'railway' }),
       verified: true,
+      metadata: { externalId: 'svc-daily' },
+    }));
+  });
+
+  it('plans one exact-target destroy and leaves a same-name duplicate unmanaged', () => {
+    const removed = observedWeb({ name: 'daily', externalId: 'svc-daily', workloadKind: 'cron' });
+    const duplicate = observedWeb({ name: 'daily', externalId: 'svc-replacement', workloadKind: 'cron' });
+    const result = diffEnvironment({
+      spec: spec(),
+      envName: 'production',
+      observed: observed({ services: [observedWeb(), removed, duplicate] }),
+      local: local({
+        services: [localService('web'), localService('daily')],
+        bindings: {
+          provider: 'railway',
+          projectId: 'rail-proj-1',
+          environmentId: 'rail-env-1',
+          services: { web: { serviceId: 'svc-1' }, daily: { serviceId: 'svc-daily' } },
+        },
+      }),
+    });
+
+    expect(result.actions.filter((action) => action.id === 'service:daily:destroy')).toEqual([
+      expect.objectContaining({
+        type: 'destroy',
+        metadata: { externalId: 'svc-daily' },
+      }),
+    ]);
+    expect(result.unmanaged).toContainEqual(expect.objectContaining({
+      kind: 'service',
+      name: 'daily',
+      detail: expect.stringContaining('absent from spec'),
+    }));
+  });
+
+  it('does not authorize deleting a same-name replacement for a removed bound service', () => {
+    const replacement = observedWeb({ name: 'daily', externalId: 'svc-replacement', workloadKind: 'cron' });
+    const result = diffEnvironment({
+      spec: spec(),
+      envName: 'production',
+      observed: observed({ services: [observedWeb(), replacement] }),
+      local: local({
+        services: [localService('web'), localService('daily')],
+        bindings: {
+          provider: 'railway',
+          projectId: 'rail-proj-1',
+          environmentId: 'rail-env-1',
+          services: { web: { serviceId: 'svc-1' }, daily: { serviceId: 'svc-original' } },
+        },
+      }),
+    });
+
+    expect(result.actions.filter((action) => action.id === 'service:daily:destroy')).toEqual([
+      expect.objectContaining({
+        type: 'destroy',
+        verified: true,
+        metadata: { externalId: 'svc-original' },
+      }),
+    ]);
+    expect(result.unmanaged).toContainEqual(expect.objectContaining({
+      kind: 'service',
+      name: 'daily',
     }));
   });
 
@@ -789,6 +1245,29 @@ describe('diffEnvironment — unmanaged resources', () => {
       },
     }));
   });
+
+  it('blocks ambiguous leftover task cleanup without emitting duplicate action ids', () => {
+    const result = diffEnvironment({
+      spec: spec(),
+      envName: 'production',
+      observed: observed({
+        services: [
+          observedWeb(),
+          observedWeb({ name: 'hv-task-123', externalId: 'task-svc-1' }),
+          observedWeb({ name: 'hv-task-123', externalId: 'task-svc-2' }),
+        ],
+      }),
+      local: local(),
+    });
+
+    expect(result.actions.filter((action) => action.id.includes('hv-task-123'))).toEqual([]);
+    expect(result.unmanaged).toContainEqual(expect.objectContaining({
+      kind: 'service',
+      name: 'hv-task-123',
+      detail: expect.stringContaining('automatic deletion is blocked'),
+    }));
+    expect(result.warnings).toContainEqual(expect.stringContaining('Multiple leftover task services'));
+  });
 });
 
 describe('diffEnvironment — reconciliation safety', () => {
@@ -812,13 +1291,125 @@ describe('diffEnvironment — reconciliation safety', () => {
     expect(result.actions.some((action) => action.resource.kind === 'database' && action.type === 'create')).toBe(false);
   });
 
-  it('blocks and reports every candidate when multiple PostgreSQL datastores exist', () => {
+  it('preserves a bound database and blocks dependent services when observation is unknown', () => {
+    const result = diffEnvironment({
+      spec: spec(),
+      envName: 'production',
+      observed: observed({
+        databases: [],
+        partial: true,
+        completeness: { databases: 'unknown' },
+      }),
+      local: local(),
+    });
+
+    expect(result.actions.find((action) => action.id === 'database:railway')).toMatchObject({
+      type: 'update',
+      verified: false,
+      metadata: { blockedReason: 'database_observation_unknown' },
+    });
+    expect(result.actions.find((action) => action.id === 'service:web')?.dependsOn)
+      .toContain('database:railway');
+  });
+
+  it('blocks dependent services while the bound database is not running', () => {
+    const result = diffEnvironment({
+      spec: spec(),
+      envName: 'production',
+      observed: observed({
+        databases: [{
+          provider: 'railway',
+          engine: 'postgres',
+          externalId: 'db-1',
+          status: 'error',
+        }],
+      }),
+      local: local(),
+    });
+
+    expect(result.actions.find((action) => action.id === 'database:railway')).toMatchObject({
+      type: 'update',
+      metadata: {
+        blockedReason: 'database_not_running',
+        observedStatus: 'error',
+        externalId: 'db-1',
+      },
+    });
+    expect(result.actions.find((action) => action.id === 'service:web')?.dependsOn)
+      .toContain('database:railway');
+  });
+
+  it.each(['failed', 'unknown'] as const)('does not report a %s service as in sync', (status) => {
+    const result = diffEnvironment({
+      spec: spec(),
+      envName: 'production',
+      observed: observed({ services: [observedWeb({ status })] }),
+      local: local(),
+    });
+
+    expect(result.actions.find((action) => action.id === 'service:web')).toMatchObject({
+      type: 'update',
+      verified: true,
+      metadata: {
+        blockedReason: `service_status_${status}`,
+        observedStatus: status,
+      },
+    });
+  });
+
+  it('blocks replacement when complete observation says the still-desired bound database vanished', () => {
+    const result = diffEnvironment({
+      spec: spec(),
+      envName: 'production',
+      observed: observed({ databases: [] }),
+      local: local({
+        components: [localComponent({
+          provider: 'railway',
+          providerScope: { projectId: 'rail-proj-1', environmentId: 'rail-env-1' },
+        })],
+      }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'database:railway')).toMatchObject({
+      type: 'update',
+      verified: true,
+      metadata: {
+        blockedReason: 'database_binding_absent',
+        boundExternalId: 'db-1',
+      },
+    });
+    expect(result.actions.some((action) => (
+      action.resource.kind === 'database' && action.type === 'create'
+    ))).toBe(false);
+    expect(result.warnings).toContainEqual(expect.stringContaining('was not found'));
+  });
+
+  it('still stages a new provider when the old provider binding is absent from current observation', () => {
+    const result = diffEnvironment({
+      spec: spec({ database: { provider: 'cloudsql' } }),
+      envName: 'production',
+      observed: observed({ databases: [] }),
+      local: local({
+        components: [localComponent({
+          provider: 'railway',
+          providerScope: { projectId: 'rail-proj-1', environmentId: 'rail-env-1' },
+        })],
+      }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'database:cloudsql')).toMatchObject({
+      type: 'create',
+      resource: { provider: 'cloudsql' },
+    });
+  });
+
+  it('resolves the durable database id before reporting same-engine extras as unmanaged', () => {
     const result = diffEnvironment({
       spec: spec(),
       envName: 'production',
       observed: observed({
         databases: [
-          { provider: 'railway', engine: 'postgres', externalId: 'db-original', name: 'Postgres', status: 'running' },
+          { provider: 'railway', engine: 'postgres', externalId: 'db-1', name: 'Postgres', status: 'running' },
           { provider: 'railway', engine: 'postgres', externalId: 'db-duplicate', name: 'postgres-db-production', status: 'running' },
         ],
       }),
@@ -828,25 +1419,170 @@ describe('diffEnvironment — reconciliation safety', () => {
     });
 
     expect(result.actions.find((action) => action.id === 'database:railway')).toMatchObject({
-      type: 'update',
-      metadata: {
-        blockedReason: 'ambiguous_database_identity',
-        externalIds: ['db-duplicate', 'db-original'],
-      },
+      type: 'noop',
     });
     expect(result.unmanaged).toContainEqual(expect.objectContaining({
       kind: 'database',
-      detail: expect.stringContaining('additional PostgreSQL candidate'),
+      detail: expect.stringContaining('db-duplicate'),
     }));
   });
 
-  it('blocks ambiguous logical service identities instead of choosing the last one', () => {
+  it('includes provider scope when resolving a durable database id', () => {
+    const result = diffEnvironment({
+      spec: spec(),
+      envName: 'production',
+      observed: observed({
+        databases: [{
+          provider: 'railway',
+          engine: 'postgres',
+          externalId: 'db-1',
+          providerScope: { projectId: 'other-project' },
+          status: 'running',
+        }],
+      }),
+      local: local({
+        components: [localComponent({
+          provider: 'railway',
+          providerScope: { projectId: 'rail-proj-1' },
+        })],
+      }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'database:railway')).toMatchObject({
+      type: 'update',
+      metadata: {
+        blockedReason: 'database_binding_identity_mismatch',
+        boundExternalId: 'db-1',
+        externalIds: ['db-1'],
+      },
+    });
+    expect(result.actions.some((action) => action.resource.kind === 'database' && action.type === 'create')).toBe(false);
+  });
+
+  it('does not match a scoped local database binding to an unscoped observation', () => {
+    const result = diffEnvironment({
+      spec: spec(),
+      envName: 'production',
+      observed: observed({
+        databases: [{
+          provider: 'railway',
+          engine: 'postgres',
+          externalId: 'db-1',
+          status: 'running',
+        }],
+      }),
+      local: local({
+        components: [localComponent({
+          provider: 'railway',
+          providerScope: { projectId: 'rail-proj-1' },
+        })],
+      }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'database:railway')).toMatchObject({
+      type: 'update',
+      metadata: {
+        blockedReason: 'database_binding_identity_mismatch',
+        boundExternalId: 'db-1',
+        externalIds: ['db-1'],
+      },
+    });
+    expect(result.actions.some((action) => action.resource.kind === 'database' && action.type === 'create')).toBe(false);
+  });
+
+  it('resolves the durable service id before reporting same-name extras as unmanaged', () => {
     const duplicate = observedWeb({ externalId: 'svc-duplicate' });
     const result = diffEnvironment({
       spec: spec(),
       envName: 'production',
       observed: observed({ services: [observedWeb(), duplicate] }),
       local: local(),
+    });
+
+    expect(result.actions.find((action) => action.id === 'service:web')).toMatchObject({ type: 'noop' });
+    expect(result.unmanaged).toContainEqual(expect.objectContaining({
+      kind: 'service',
+      detail: expect.stringContaining('svc-duplicate'),
+    }));
+  });
+
+  it('blocks an unbound same-name service instead of silently adopting it', () => {
+    const result = diffEnvironment({
+      spec: spec({ database: undefined }),
+      envName: 'production',
+      observed: observed({ databases: [] }),
+      local: local({
+        components: [],
+        bindings: {
+          provider: 'railway',
+          projectId: 'rail-proj-1',
+          environmentId: 'rail-env-1',
+          services: {},
+        },
+      }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'service:web')).toMatchObject({
+      type: 'update',
+      metadata: {
+        blockedReason: 'service_adoption_required',
+        externalIds: ['svc-1'],
+      },
+    });
+    expect(result.unmanaged).toContainEqual(expect.objectContaining({
+      kind: 'service',
+      detail: expect.stringContaining('requires explicit adoption'),
+    }));
+  });
+
+  it('blocks a same-name replacement whose id differs from the durable service binding', () => {
+    const result = diffEnvironment({
+      spec: spec({ database: undefined }),
+      envName: 'production',
+      observed: observed({
+        databases: [],
+        services: [observedWeb({ externalId: 'svc-replacement' })],
+      }),
+      local: local({
+        components: [],
+        bindings: {
+          provider: 'railway',
+          projectId: 'rail-proj-1',
+          environmentId: 'rail-env-1',
+          services: { web: { serviceId: 'svc-original' } },
+        },
+      }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'service:web')).toMatchObject({
+      type: 'update',
+      metadata: {
+        blockedReason: 'service_binding_identity_mismatch',
+        externalIds: ['svc-replacement'],
+      },
+    });
+  });
+
+  it('blocks multiple same-name services when no durable service binding disambiguates them', () => {
+    const result = diffEnvironment({
+      spec: spec({ database: undefined }),
+      envName: 'production',
+      observed: observed({
+        databases: [],
+        services: [
+          observedWeb(),
+          observedWeb({ externalId: 'svc-duplicate' }),
+        ],
+      }),
+      local: local({
+        components: [],
+        bindings: {
+          provider: 'railway',
+          projectId: 'rail-proj-1',
+          environmentId: 'rail-env-1',
+          services: {},
+        },
+      }),
     });
 
     expect(result.actions.find((action) => action.id === 'service:web')).toMatchObject({
@@ -856,6 +1592,140 @@ describe('diffEnvironment — reconciliation safety', () => {
         externalIds: ['svc-1', 'svc-duplicate'],
       },
     });
+  });
+
+  it('blocks a service create when exact unresolved create recovery state is retained', () => {
+    const result = diffEnvironment({
+      spec: spec({ database: undefined }),
+      envName: 'staging',
+      observed: observed({ environmentId: 'rail-env-1', services: [], databases: [] }),
+      local: local({
+        components: [],
+        bindings: {
+          provider: 'railway',
+          projectId: 'rail-proj-1',
+          environmentId: 'rail-env-1',
+          services: {},
+          serviceCreateRecovery: {
+            web: {
+              provider: 'railway',
+              operation: 'create',
+              resourceName: 'web-staging',
+              providerScope: { projectId: 'rail-proj-1', environmentId: 'rail-env-1' },
+              state: 'unresolved',
+            },
+          },
+        },
+      }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'service:web')).toMatchObject({
+      type: 'update',
+      verified: false,
+      metadata: {
+        blockedReason: 'service_create_recovery_required',
+        serviceCreateRecovery: { state: 'unresolved', resourceName: 'web-staging' },
+      },
+    });
+    expect(result.actions[0]?.id).toBe('service:web');
+    expect(result.actions.some((action) => action.resource.kind === 'service' && action.type === 'create')).toBe(false);
+  });
+
+  it('blocks a service create when its retained recovery marker is malformed', () => {
+    const result = diffEnvironment({
+      spec: spec({ database: undefined }),
+      envName: 'staging',
+      observed: observed({ services: [], databases: [] }),
+      local: local({
+        components: [],
+        bindings: {
+          provider: 'railway',
+          projectId: 'rail-proj-1',
+          environmentId: 'rail-env-1',
+          services: {},
+          serviceCreateRecovery: { web: { provider: 'railway', state: 'identified' } },
+        },
+      }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'service:web')).toMatchObject({
+      type: 'update',
+      metadata: { blockedReason: 'service_create_recovery_invalid' },
+    });
+    expect(result.actions.some((action) => action.resource.kind === 'service' && action.type === 'create')).toBe(false);
+  });
+
+  it('blocks rather than re-scoping a retained service-create identity', () => {
+    const result = diffEnvironment({
+      spec: spec({ database: undefined }),
+      envName: 'staging',
+      observed: observed({ services: [], databases: [] }),
+      local: local({
+        components: [],
+        bindings: {
+          provider: 'railway',
+          projectId: 'rail-proj-1',
+          environmentId: 'rail-env-1',
+          services: {},
+          serviceCreateRecovery: {
+            web: {
+              provider: 'railway',
+              operation: 'create',
+              resourceName: 'web-staging',
+              providerScope: { projectId: 'different-project', environmentId: 'rail-env-1' },
+              state: 'identified',
+              serviceId: 'svc-partial',
+              returnedName: 'web-staging',
+            },
+          },
+        },
+      }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'service:web')).toMatchObject({
+      type: 'update',
+      metadata: { blockedReason: 'service_create_recovery_invalid' },
+    });
+  });
+
+  it('surfaces retained create recovery for a service removed from the spec without treating it as delete authority', () => {
+    const result = diffEnvironment({
+      spec: spec({ services: {}, database: undefined }),
+      envName: 'staging',
+      observed: observed({ services: [], databases: [] }),
+      local: local({
+        services: [],
+        components: [],
+        bindings: {
+          provider: 'railway',
+          projectId: 'rail-proj-1',
+          environmentId: 'rail-env-1',
+          services: {},
+          serviceCreateRecovery: {
+            removed: {
+              provider: 'railway',
+              operation: 'create',
+              resourceName: 'removed-staging',
+              providerScope: { projectId: 'rail-proj-1', environmentId: 'rail-env-1' },
+              state: 'identified',
+              serviceId: 'svc-possible-orphan',
+              returnedName: 'removed-staging',
+            },
+          },
+        },
+      }),
+    });
+
+    expect(result.actions.find((action) => action.id === 'service:removed:recovery')).toMatchObject({
+      type: 'update',
+      verified: false,
+      metadata: {
+        blockedReason: 'orphaned_service_create_recovery',
+        serviceCreateRecovery: { serviceId: 'svc-possible-orphan' },
+      },
+    });
+    expect(result.actions[0]?.id).toBe('service:removed:recovery');
+    expect(result.actions.some((action) => action.id === 'service:removed:destroy')).toBe(false);
   });
 
   it('requires explicit adoption for an observed database missing from component state', () => {

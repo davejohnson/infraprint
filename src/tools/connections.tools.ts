@@ -1,7 +1,10 @@
 import type { CommandRegistrar } from '../application/commands.js';
 import { readFileSync } from 'fs';
 import { z } from 'zod';
-import { providerRegistry } from '../domain/registry/provider.registry.js';
+import {
+  providerRegistry,
+  type ProviderMetadata,
+} from '../domain/registry/provider.registry.js';
 import { secretManagerRegistry } from '../domain/registry/secretmanager.registry.js';
 import { runCloudPrepare } from '../domain/services/cloud-prepare.execute.js';
 import { saveConnection, verifyConnection, deleteConnection } from '../domain/services/connection-ops.service.js';
@@ -234,24 +237,21 @@ type ProviderDiscoveryEntry = {
   credentialFields?: CredentialFieldDescriptor[];
   defaultScalarKey?: string;
   environmentVariableAliases?: string[][];
+  maturity?: ProviderMetadata['maturity'];
+  lifecycle?: ProviderMetadata['lifecycle'];
 };
 
-function providerDiscoveryEntry(metadata: {
-  name: string;
-  displayName: string;
-  setupHelpUrl?: string;
-  credentialsSchema: z.ZodTypeAny;
-  credentials?: {
-    defaultScalarKey?: string;
-    environmentVariableAliases?: string[][];
-    supportsNativeCliAuth?: boolean;
-  };
-}): ProviderDiscoveryEntry {
+function providerDiscoveryEntry(metadata: Pick<
+  ProviderMetadata,
+  'name' | 'displayName' | 'setupHelpUrl' | 'credentialsSchema' | 'credentials' | 'maturity' | 'lifecycle'
+>): ProviderDiscoveryEntry {
   const guidance = getConnectionGuidance(metadata.name);
   const credentialFields = credentialFieldsFromSchema(metadata.credentialsSchema);
   return {
     name: metadata.name,
     displayName: metadata.displayName,
+    ...(metadata.maturity ? { maturity: metadata.maturity } : {}),
+    ...(metadata.lifecycle ? { lifecycle: metadata.lifecycle } : {}),
     ...(credentialFields !== undefined ? { credentialFields } : {}),
     ...(metadata.credentials?.defaultScalarKey ? { defaultScalarKey: metadata.credentials.defaultScalarKey } : {}),
     ...(metadata.credentials?.environmentVariableAliases?.length

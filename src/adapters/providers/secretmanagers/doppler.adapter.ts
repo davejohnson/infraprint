@@ -55,7 +55,13 @@ export class DopplerAdapter implements ISecretManagerAdapter {
     }
   }
 
-  async getSecret(path: string, key?: string, _version?: string): Promise<ResolvedSecret> {
+  async getSecret(path: string, key?: string, version?: string): Promise<ResolvedSecret> {
+    if (key !== undefined) {
+      throw new Error('Doppler secrets are scalar values; select the secret by path instead of key.');
+    }
+    if (version !== undefined) {
+      throw new Error('Doppler secret reads do not support selecting a historical version.');
+    }
     // In Doppler, "path" is just the secret name
     // Optionally with project/config prefix: project/config/SECRET_NAME
     const { project, config, secretName } = this.parsePath(path);
@@ -65,6 +71,11 @@ export class DopplerAdapter implements ISecretManagerAdapter {
       'GET',
       endpoint
     );
+    if (response.secret?.name !== secretName) {
+      throw new Error(
+        `Doppler returned secret ${response.secret?.name ?? '(missing)'}, not requested secret ${secretName}.`
+      );
+    }
 
     return {
       value: response.secret.value.computed,
@@ -73,14 +84,14 @@ export class DopplerAdapter implements ISecretManagerAdapter {
 
   async listSecrets(pathPrefix?: string): Promise<SecretListItem[]> {
     const parsed = pathPrefix ? this.parsePath(pathPrefix) : { project: undefined, config: undefined, secretName: '' };
-    const { project, config } = parsed;
+    const { project, config, secretName } = parsed;
 
     const endpoint = this.buildEndpoint('/configs/config/secrets', project, config);
     const response = await this.request<DopplerSecretsResponse>('GET', endpoint);
 
-    return Object.keys(response.secrets).map((name) => ({
-      path: name,
-    }));
+    return Object.keys(response.secrets)
+      .filter((name) => !secretName || name.startsWith(secretName))
+      .map((name) => ({ path: name }));
   }
 
   /**
@@ -180,7 +191,7 @@ secretManagerRegistry.register({
       defaultScalarKey: 'token',
     },
   },
-  factory: (credentials) => {
+  factory: (_credentials) => {
     const adapter = new DopplerAdapter();
     return adapter;
   },

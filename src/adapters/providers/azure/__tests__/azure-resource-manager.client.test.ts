@@ -167,7 +167,7 @@ describe('AzureResourceManagerClient', () => {
   it('rejects durable ids outside the configured scope before auth', () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
-    const client = new AzureResourceManagerClient(credentials);
+    const client = new AzureResourceManagerClient({ ...credentials, resourceGroup: RESOURCE_GROUP });
 
     expect(() => client.parseResourceId(
       `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/other`
@@ -185,12 +185,16 @@ describe('AzureResourceManagerClient', () => {
       clientId: credentials.clientId,
       clientSecret: credentials.clientSecret,
     };
-    vi.stubGlobal('fetch', vi.fn()
+    const fetchMock = vi.fn()
       .mockResolvedValueOnce(principalTokenResponse())
-      .mockResolvedValueOnce(jsonResponse({ id: `/subscriptions/${SUBSCRIPTION_ID}` })));
+      .mockResolvedValueOnce(jsonResponse({ id: `/subscriptions/${SUBSCRIPTION_ID}` }));
+    vi.stubGlobal('fetch', fetchMock);
     const client = new AzureResourceManagerClient(subscriptionCredentials);
 
     await expect(client.verifySubscription()).resolves.toBeUndefined();
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      `https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}?api-version=2022-12-01`
+    );
     await expect(client.servicePrincipalId()).resolves.toBe(
       '44444444-4444-4444-8444-444444444444'
     );

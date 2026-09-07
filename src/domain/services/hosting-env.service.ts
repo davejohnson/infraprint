@@ -3,6 +3,7 @@ import { UNCONFIGURED_HOSTING_PROVIDER, type Project } from '../entities/project
 import type { Service } from '../entities/service.entity.js';
 import { parseHostingBindings, type IHostingAdapter } from '../ports/hosting.port.js';
 import type { Receipt } from '../ports/provider.port.js';
+import { providerRegistry } from '../registry/provider.registry.js';
 import { adapterFactory } from './adapter.factory.js';
 
 export const HOSTING_ENV_REMOVE_OPERATION = 'hostingEnvRemove';
@@ -26,14 +27,7 @@ export function hostingProviderForEnvironment(project: Project, environment: Env
 }
 
 export function providerDisplayName(provider: string): string {
-  switch (provider.toLowerCase()) {
-    case 'cloudrun':
-      return 'Cloud Run';
-    case 'railway':
-      return 'Railway';
-    default:
-      return provider;
-  }
+  return providerRegistry.getMetadata(provider.toLowerCase())?.displayName ?? provider;
 }
 
 export function serviceHasHostingBinding(environment: Environment, serviceName: string): boolean {

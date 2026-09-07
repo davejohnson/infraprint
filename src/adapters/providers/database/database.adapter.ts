@@ -1,6 +1,18 @@
 import pg from 'pg';
 import { z } from 'zod';
 import { providerRegistry } from '../../../domain/registry/provider.registry.js';
+import type {
+  DatabaseQueryOptions,
+  DatabaseQueryResult,
+  IDatabaseQueryAdapter,
+} from '../../../domain/ports/database-query.port.js';
+import {
+  analyzeSqlQuery,
+  isMultiStatementQuery,
+  isMutationQuery,
+} from '../../../domain/services/sql-query-analysis.js';
+
+export { stripSqlLiteralsAndComments } from '../../../domain/services/sql-query-analysis.js';
 
 const { Client } = pg;
 
@@ -12,108 +24,15 @@ export const DatabaseCredentialsSchema = z.object({
 
 export type DatabaseCredentials = z.infer<typeof DatabaseCredentialsSchema>;
 
-// Patterns that indicate a destructive/mutating query
-const MUTATION_PATTERNS = [
-  /^\s*INSERT\s+/i,
-  /^\s*UPDATE\s+/i,
-  /^\s*DELETE\s+/i,
-  /^\s*DROP\s+/i,
-  /^\s*TRUNCATE\s+/i,
-  /^\s*ALTER\s+/i,
-  /^\s*CREATE\s+/i,
-  /^\s*GRANT\s+/i,
-  /^\s*REVOKE\s+/i,
-];
-
-/**
- * Strip string literals and comments so safety checks can't be evaded by
- * hiding keywords in comments/strings or prefixing statements with comments.
- * Handles -- line comments, nested block comments, '...' (with '' escapes),
- * "..." identifiers, and $tag$...$tag$ dollar quoting.
- */
-export function stripSqlLiteralsAndComments(sql: string): string {
-  let result = '';
-  let i = 0;
-  const n = sql.length;
-  while (i < n) {
-    const ch = sql[i];
-    const next = sql[i + 1];
-    if (ch === '-' && next === '-') {
-      while (i < n && sql[i] !== '\n') i++;
-      continue;
-    }
-    if (ch === '/' && next === '*') {
-      let depth = 1;
-      i += 2;
-      while (i < n && depth > 0) {
-        if (sql[i] === '/' && sql[i + 1] === '*') { depth++; i += 2; continue; }
-        if (sql[i] === '*' && sql[i + 1] === '/') { depth--; i += 2; continue; }
-        i++;
-      }
-      result += ' ';
-      continue;
-    }
-    if (ch === "'") {
-      i++;
-      while (i < n) {
-        if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue; }
-        if (sql[i] === "'") { i++; break; }
-        i++;
-      }
-      result += "''";
-      continue;
-    }
-    if (ch === '"') {
-      i++;
-      while (i < n) {
-        if (sql[i] === '"' && sql[i + 1] === '"') { i += 2; continue; }
-        if (sql[i] === '"') { i++; break; }
-        i++;
-      }
-      result += '""';
-      continue;
-    }
-    if (ch === '$') {
-      const match = sql.slice(i).match(/^\$[A-Za-z_]*\$/);
-      if (match) {
-        const tag = match[0];
-        const end = sql.indexOf(tag, i + tag.length);
-        i = end === -1 ? n : end + tag.length;
-        result += "''";
-        continue;
-      }
-    }
-    result += ch;
-    i++;
-  }
-  return result;
-}
-
-export interface QueryResult {
-  success: boolean;
-  rows?: Record<string, unknown>[];
-  rowCount?: number;
-  fields?: Array<{ name: string; dataType: string }>;
-  error?: string;
-  warning?: string;
-}
-
-export interface QueryOptions {
-  /** Enforce PostgreSQL transaction-level read-only mode. */
-  readOnly?: boolean;
-  /** Reject results larger than this row count. Default 500. */
-  maxRows?: number;
-  /** Reject model-visible results larger than this many UTF-8 bytes. Default 512 KiB. */
-  maxResponseBytes?: number;
-  /** PostgreSQL statement timeout, capped at 30 seconds. */
-  statementTimeoutMs?: number;
-}
+/** Compatibility aliases for existing adapter consumers. */
+export type QueryResult = DatabaseQueryResult;
+export type QueryOptions = DatabaseQueryOptions;
 
 export const DEFAULT_MAX_QUERY_ROWS = 500;
 export const DEFAULT_MAX_QUERY_RESPONSE_BYTES = 512 * 1024;
 export const MAX_QUERY_STATEMENT_TIMEOUT_MS = 30_000;
 
-export class DatabaseAdapter {
+export class DatabaseAdapter implements IDatabaseQueryAdapter {
   private credentials: DatabaseCredentials | null = null;
 
   connect(credentials: DatabaseCredentials): void {
@@ -143,51 +62,21 @@ export class DatabaseAdapter {
    * hidden behind a leading comment or inside a data-modifying CTE.
    */
   isMutationQuery(sql: string): boolean {
-    const stripped = stripSqlLiteralsAndComments(sql).trim();
-    if (MUTATION_PATTERNS.some(pattern => pattern.test(stripped))) return true;
-    // Data-modifying CTEs: WITH x AS (DELETE ... RETURNING *) SELECT ...
-    if (/^WITH\b/i.test(stripped) && /\b(INSERT|UPDATE|DELETE)\b/i.test(stripped)) return true;
-    // SELECT ... INTO creates a new table
-    if (/^SELECT\b/i.test(stripped) && /\bINTO\b/i.test(stripped)) return true;
-    return false;
+    return isMutationQuery(sql);
   }
 
   /**
    * Check if SQL contains more than one statement (e.g. "SELECT 1; DROP TABLE x").
    */
   isMultiStatement(sql: string): boolean {
-    const stripped = stripSqlLiteralsAndComments(sql);
-    const semi = stripped.indexOf(';');
-    if (semi === -1) return false;
-    return stripped.slice(semi + 1).trim().length > 0;
+    return isMultiStatementQuery(sql);
   }
 
   /**
    * Analyze a query and return warnings
    */
   analyzeQuery(sql: string): { isMutation: boolean; multiStatement: boolean; warnings: string[] } {
-    const warnings: string[] = [];
-    const isMutation = this.isMutationQuery(sql);
-    const multiStatement = this.isMultiStatement(sql);
-
-    if (isMutation) {
-      const trimmed = stripSqlLiteralsAndComments(sql).trim().toLowerCase();
-
-      if (trimmed.startsWith('delete') && !trimmed.includes('where')) {
-        warnings.push('DELETE without WHERE clause will affect all rows');
-      }
-      if (trimmed.startsWith('update') && !trimmed.includes('where')) {
-        warnings.push('UPDATE without WHERE clause will affect all rows');
-      }
-      if (trimmed.startsWith('drop')) {
-        warnings.push('DROP is destructive and cannot be undone');
-      }
-      if (trimmed.startsWith('truncate')) {
-        warnings.push('TRUNCATE will remove all data from the table');
-      }
-    }
-
-    return { isMutation, multiStatement, warnings };
+    return analyzeSqlQuery(sql);
   }
 
   /**

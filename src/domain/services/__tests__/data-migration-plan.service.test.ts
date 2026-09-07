@@ -92,6 +92,11 @@ describe('planDataMigration', () => {
       DATA_MIGRATION_OPERATIONS.storageCopy,
     ]);
     expect(result.actions.every((action) => action.dataBearing && action.requiresConfirm)).toBe(true);
+    expect(result.actions.find((action) => action.resource.kind === 'storage')?.metadata)
+      .toMatchObject({
+        sourceExternalId: 'source-bucket',
+        sourceInstanceScope: { projectId: 'railway-project', environmentId: 'staging-env' },
+      });
   });
 
   it('keeps database and storage copy provider-neutral when Vercel hosts both environments', () => {

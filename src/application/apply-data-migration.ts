@@ -48,6 +48,21 @@ function stringField(record: Record<string, unknown> | undefined, key: string): 
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+function exactStringRecord(left: unknown, right: unknown): boolean {
+  const leftRecord = asRecord(left);
+  const rightRecord = asRecord(right);
+  if (!leftRecord || !rightRecord) return false;
+  const leftEntries = Object.entries(leftRecord).sort(([a], [b]) => a.localeCompare(b));
+  const rightEntries = Object.entries(rightRecord).sort(([a], [b]) => a.localeCompare(b));
+  return leftEntries.length === rightEntries.length
+    && leftEntries.every(([key, value], index) => (
+      typeof value === 'string'
+      && value.length > 0
+      && rightEntries[index]?.[0] === key
+      && rightEntries[index]?.[1] === value
+    ));
+}
+
 function candidateResourceName(project: string, environment: string, resource: string, migrationId: string): string {
   const suffix = createHash('sha256').update(migrationId).digest('hex').slice(0, 8);
   return `${project}-${environment}-${resource}-migration-${suffix}`
@@ -270,6 +285,10 @@ async function applyDatabaseMigration(params: {
   if (!adapterResult.success || !adapterResult.adapter || adapterResult.adapter.name !== identity.targetProvider) {
     return { success: false, status: 'blocked', message: 'Target database adapter is unavailable', error: 'No database binding was changed.' };
   }
+  await adapterResult.adapter.configureTarget?.({
+    projectName: params.project.name,
+    region: targetSpec.hosting.region,
+  });
   const provisioned = await adapterResult.adapter.provision(targetSpec.database.engine, targetEnvironment, {
     databaseName: 'app',
     resourceName: candidateResourceName(params.project.name, params.targetEnvironmentName, targetSpec.database.engine, identity.migrationId),
@@ -533,14 +552,15 @@ async function applyStorageMigration(params: {
     };
   }
   const sourceBindings = parseStorageBindings(sourceEnvironment);
-  const sourceContexts = parseStorageProviderContexts(sourceEnvironment);
   const sourceBinding = sourceBindings[storageName];
-  const sourceContext = sourceContexts[identity.sourceProvider];
+  const sourceContext = sourceBinding?.instanceScope;
+  const plannedSourceScope = asRecord(params.action.metadata)?.sourceInstanceScope;
   if (
     !sourceBinding
     || !sourceContext
     || sourceBinding.provider !== identity.sourceProvider
     || sourceBinding.externalId !== stringField(asRecord(params.action.metadata), 'sourceExternalId')
+    || !exactStringRecord(sourceContext, plannedSourceScope)
   ) return stale(params.action, 'The tracked source bucket identity changed.');
 
   const sourceAdapterResult = await adapterFactory.getStorageAdapter(identity.sourceProvider, params.project);
@@ -655,6 +675,7 @@ async function applyStorageMigration(params: {
   const sourceChanged = !latestSourceBinding
     || latestSourceBinding.provider !== sourceBinding.provider
     || latestSourceBinding.externalId !== sourceBinding.externalId
+    || !exactStringRecord(latestSourceBinding.instanceScope, sourceBinding.instanceScope)
     || latestSourceBinding.updatedAt !== sourceBinding.updatedAt;
   const targetChanged = reviewedTargetBinding
     ? !latestTargetBinding

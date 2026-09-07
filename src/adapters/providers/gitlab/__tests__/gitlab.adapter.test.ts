@@ -329,6 +329,37 @@ describe('GitLab runner trust observation', () => {
 });
 
 describe('GitLab pipeline dispatch', () => {
+  it('honors the artifact limit when one job exposes multiple files', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(json([{
+      id: 7,
+      status: 'success',
+      name: 'release',
+      ref: 'main',
+      web_url: `${project.web_url}/-/jobs/7`,
+      artifacts: [
+        { file_type: 'archive', filename: 'release.zip' },
+        { file_type: 'metadata', filename: 'metadata.gz' },
+      ],
+    }]));
+
+    await expect(adapter().listArtifacts({
+      provider: 'gitlab',
+      nativeId: '42',
+      instanceScope: 'https://gitlab.example.com/gitlab',
+      canonicalScope: project.web_url,
+      path: project.path_with_namespace,
+      defaultBranch: 'main',
+      webUrl: project.web_url,
+      cloneUrls: [project.http_url_to_repo],
+    }, '99', 1)).resolves.toEqual([
+      expect.objectContaining({ id: '7:archive', name: 'release.zip' }),
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://gitlab.example.com/gitlab/api/v4/projects/42/pipelines/99/jobs?per_page=1&include_retried=true',
+      expect.objectContaining({ method: 'GET' })
+    );
+  });
+
   it('dispatches only the active definition and verifies the exact ref SHA', async () => {
     const sha = 'a'.repeat(40);
     const fetchMock = vi.spyOn(globalThis, 'fetch')

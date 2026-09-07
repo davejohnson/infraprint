@@ -28,13 +28,6 @@ export interface BootstrapParams {
   runtime?: ProjectRuntimeSpec;
 }
 
-function classifyEnvName(name: string): 'staging' | 'production' | null {
-  const normalized = name.trim().toLowerCase();
-  if (normalized.includes('prod')) return 'production';
-  if (normalized.includes('stag')) return 'staging';
-  return null;
-}
-
 /**
  * Env-level migrations.mode="releaseCommand" is carried by a web service:
  * derive its releaseCommand so both diff and bootstrap converge the
@@ -116,13 +109,10 @@ export function specToBootstrapParams(
 
   let deploy: DesiredState['deploy'];
   if (env.deploy?.strategy) {
-    const kind = classifyEnvName(environmentName);
     deploy = {
       strategy: env.deploy.strategy,
       ...(env.deploy.trigger ? { trigger: env.deploy.trigger } : {}),
-      ...(env.deploy.branch && kind
-        ? { branches: { [kind]: env.deploy.branch } }
-        : {}),
+      ...(env.deploy.branch ? { branch: env.deploy.branch } : {}),
     };
   }
 

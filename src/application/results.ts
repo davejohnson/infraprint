@@ -90,6 +90,12 @@ function isSensitiveKey(key: string): boolean {
   if (SENSITIVE_KEYS.has(normalized)) {
     return true;
   }
+  if (normalized.endsWith('token') || normalized.endsWith('secret')) {
+    return true;
+  }
+  if (normalized === 'secretaccesskey') {
+    return true;
+  }
   if (/^(database|db|pg).*(url|password)$/.test(normalized)) {
     return true;
   }
@@ -100,10 +106,6 @@ function isSensitiveKey(key: string): boolean {
 }
 
 function redactSensitiveString(value: string): string {
-  if (value.includes(REDACTED) || value.includes('***')) {
-    return value;
-  }
-
   return value
     .replace(/-----BEGIN [^-]+PRIVATE KEY-----[\s\S]*?-----END [^-]+PRIVATE KEY-----/g, REDACTED)
     .replace(/([a-z][a-z0-9+.-]*:\/\/)([^@\s/]+:[^@\s/]+)@/gi, `$1${REDACTED}@`)
@@ -123,7 +125,7 @@ function redactSensitiveString(value: string): string {
 function redactForResponse(value: unknown, keyHint?: string, seen = new WeakSet<object>()): unknown {
   if (typeof value === 'string') {
     if (keyHint && isSensitiveKey(keyHint)) {
-      return value.includes(REDACTED) || value.includes('***') ? value : REDACTED;
+      return value === REDACTED || /^\*+$/.test(value) ? value : REDACTED;
     }
     return redactSensitiveString(value);
   }

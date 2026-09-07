@@ -173,6 +173,79 @@ describe('S3StorageAdapter', () => {
     expect(s3.send.mock.calls.some(([command]) => command instanceof CreateBucketCommand)).toBe(false);
   });
 
+  it('retains the exact bucket id when post-create configuration and rollback both fail', async () => {
+    let createCount = 0;
+    const s3 = { send: vi.fn(async (command: unknown) => {
+      if (command instanceof HeadBucketCommand) {
+        if (createCount === 0) {
+          throw Object.assign(new Error('missing'), { name: 'NotFound', $metadata: { httpStatusCode: 404 } });
+        }
+        return {};
+      }
+      if (command instanceof CreateBucketCommand) {
+        createCount += 1;
+        return {};
+      }
+      if (command instanceof PutBucketTaggingCommand) throw new Error('tagging denied');
+      if (command instanceof DeleteBucketCommand) throw new Error('rollback denied');
+      if (command instanceof GetBucketTaggingCommand) return { TagSet: [] };
+      throw new Error(`unexpected ${(command as object).constructor.name}`);
+    }), destroy: vi.fn() };
+    const sts = { send: vi.fn(async () => ({ Account: '123456789012' })), destroy: vi.fn() };
+    const adapter = new S3StorageAdapter(() => ({ s3, sts }));
+    await adapter.connect(credentials);
+    const context = (await adapter.ensureContext('friend-app', environment(), {}, region)).context!;
+
+    const first = await adapter.ensureBucket(environment(), context, 'documents', region);
+
+    expect(first).toMatchObject({
+      receipt: {
+        success: false,
+        error: expect.stringContaining('rollback failed: rollback denied'),
+        data: {
+          externalId: expect.stringMatching(/^hv-friend-app-production-documents-/),
+          created: true,
+          rollback: 'failed',
+          recoveryRequired: true,
+        },
+      },
+      externalId: expect.stringMatching(/^hv-friend-app-production-documents-/),
+      context,
+    });
+    const rollback = s3.send.mock.calls.find(([command]) => command instanceof DeleteBucketCommand)?.[0] as DeleteBucketCommand;
+    expect(rollback.input).toMatchObject({ ExpectedBucketOwner: '123456789012' });
+
+    const retry = await adapter.ensureBucket(environment(), context, 'documents', region);
+
+    expect(retry.receipt).toMatchObject({ success: false, error: expect.stringContaining('not owned') });
+    expect(createCount).toBe(1);
+  });
+
+  it('reapplies private configuration when retrying an existing owned bucket', async () => {
+    const s3 = { send: vi.fn(async (command: unknown) => {
+      if (command instanceof HeadBucketCommand) return {};
+      if (command instanceof GetBucketTaggingCommand) {
+        return { TagSet: [
+          { Key: 'hypervibe-environment-id', Value: 'environment-1' },
+          { Key: 'hypervibe-storage-name', Value: 'documents' },
+        ] };
+      }
+      return {};
+    }), destroy: vi.fn() };
+    const sts = { send: vi.fn(async () => ({ Account: '123456789012' })), destroy: vi.fn() };
+    const adapter = new S3StorageAdapter(() => ({ s3, sts }));
+    await adapter.connect(credentials);
+    const context = (await adapter.ensureContext('friend-app', environment(), {}, region)).context!;
+
+    const result = await adapter.ensureBucket(environment(), context, 'documents', region);
+
+    expect(result.receipt).toMatchObject({ success: true, data: { created: false } });
+    expect(s3.send.mock.calls.some(([command]) => command instanceof CreateBucketCommand)).toBe(false);
+    expect(s3.send.mock.calls.some(([command]) => command instanceof PutBucketTaggingCommand)).toBe(false);
+    expect(s3.send.mock.calls.some(([command]) => command instanceof PutPublicAccessBlockCommand)).toBe(true);
+    expect(s3.send.mock.calls.some(([command]) => command instanceof PutBucketEncryptionCommand)).toBe(true);
+  });
+
   it('returns the established S3 runtime contract without exposing it in receipts', async () => {
     const s3 = { send: vi.fn(), destroy: vi.fn() };
     const sts = { send: vi.fn(), destroy: vi.fn() };

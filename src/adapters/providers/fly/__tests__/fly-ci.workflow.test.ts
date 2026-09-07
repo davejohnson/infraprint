@@ -114,6 +114,7 @@ describe('Fly.io exact-SHA workflow', () => {
       category: 'deployment',
       lifecycle: {
         hosting: {
+          workloadKinds: ['web', 'worker'],
           customDomains: 'managed',
           maintenance: 'unsupported',
           teardownBoundary: 'services',

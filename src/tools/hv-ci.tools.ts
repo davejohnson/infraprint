@@ -1,6 +1,5 @@
 import type { CommandRegistrar } from '../application/commands.js';
 import { z } from 'zod';
-import type { GitHubAdapter } from '../adapters/providers/github/github.adapter.js';
 import { parseGitHubRepoFromRemote } from '../lib/git-remote.js';
 import {
   getGitHubAdapter,
@@ -12,13 +11,18 @@ import { providerRegistry } from '../domain/registry/provider.registry.js';
 import type { CiWorkflowDiagnostic } from '../domain/ports/ci-deploy.port.js';
 import type { CommandContext } from '../application/context.js';
 import { projectField } from './schemas.js';
-import { commandSuccess, commandError, wrapCommandHandler, HvError } from '../application/results.js';
+import { commandSuccess, wrapCommandHandler, HvError } from '../application/results.js';
 import { SpecStore } from '../domain/spec/spec.store.js';
 import { devOpsProviderRegistry } from '../domain/registry/devops.registry.js';
 import { getSecretStore } from '../adapters/secrets/secret-store.js';
 import { normalizeGitRemoteIdentity } from '../lib/git-remote.js';
 import type { CiOperationsPort, CodeRepositoryIdentity } from '../domain/ports/devops.port.js';
 import { ignoredOptionWarnings } from '../application/command-options.js';
+
+type ConnectedGitHubAdapter = Extract<
+  ReturnType<typeof getGitHubAdapter>,
+  { adapter: unknown }
+>['adapter'];
 
 const repoField = z
   .string()
@@ -149,7 +153,7 @@ function resolveRepoOrThrow(ctx: CommandContext, projectRef: string | undefined,
   return { project: project.name, owner: parts[0], repo: parts[1] };
 }
 
-function githubAdapterOrThrow({ project, owner, repo }: RepoRef): GitHubAdapter {
+function githubAdapterOrThrow({ project, owner, repo }: RepoRef): ConnectedGitHubAdapter {
   const result = getGitHubAdapter(`${owner}/${repo}`);
   if ('error' in result) {
     throw new HvError('MISSING_CONNECTION', result.error, {
@@ -351,6 +355,12 @@ export function registerHvCiTools(commands: CommandRegistrar, ctx: CommandContex
               const selectedJobs = jobId
                 ? jobs.filter((job) => job.id === jobId)
                 : jobs.filter((job) => ['failed', 'canceled', 'unknown'].includes(job.phase)).slice(0, 3);
+              if (jobId && selectedJobs.length === 0) {
+                throw new HvError('NOT_FOUND', `CI job ${jobId} was not found in run ${runId}.`, {
+                  details: { available: jobs.map((job) => job.id) },
+                  hint: 'List jobs for this run with hv_ci_status include=["jobs"], then pass an exact returned jobId.',
+                });
+              }
               const jobsForLogs = selectedJobs.length > 0 ? selectedJobs : jobs.slice(0, 1);
               const entries = await Promise.all(jobsForLogs.map(async (job) => {
                 try {
@@ -438,11 +448,15 @@ export function registerHvCiTools(commands: CommandRegistrar, ctx: CommandContex
               const targetJobs = jobId
                 ? jobs.jobs.filter((job) => String(job.id) === jobId)
                 : jobs.jobs.filter(isUnsuccessfulJob).slice(0, 3);
+              if (jobId && targetJobs.length === 0) {
+                throw new HvError('NOT_FOUND', `GitHub Actions job ${jobId} was not found in run ${runId}.`, {
+                  details: { available: jobs.jobs.map((job) => String(job.id)) },
+                  hint: 'List jobs for this run with hv_ci_status include=["jobs"], then pass an exact returned jobId.',
+                });
+              }
               const jobsForLogs = targetJobs.length > 0
                 ? targetJobs
-                : (jobId
-                    ? [{ id: Number(jobId), name: `job ${jobId}`, status: 'unknown', conclusion: null }]
-                    : jobs.jobs.slice(0, 1));
+                : jobs.jobs.slice(0, 1);
               const resolvedLogLines = logLines ?? 120;
               const logEntries = await Promise.all(jobsForLogs.map(async (job) => {
                 try {
@@ -482,9 +496,10 @@ export function registerHvCiTools(commands: CommandRegistrar, ctx: CommandContex
               break;
             }
             case 'artifacts': {
-              const artifacts = await adapter.listArtifacts(owner, repo, 100);
+              const artifacts = runId
+                ? await adapter.listWorkflowRunArtifacts(owner, repo, runId)
+                : await adapter.listArtifacts(owner, repo, 100);
               data.artifacts = artifacts.artifacts
-                .filter((artifact) => !runId || String(artifact.workflow_run?.id) === runId)
                 .map((artifact) => ({
                 id: artifact.id,
                 name: artifact.name,
@@ -606,16 +621,22 @@ export function registerHvCiTools(commands: CommandRegistrar, ctx: CommandContex
         });
       }
 
-      await adapter.triggerWorkflow(owner, repo, selectedDefinition, ref ?? 'main', inputs);
+      const selectedRef = ref ?? (await adapter.getRepository(owner, repo)).default_branch;
+      if (!selectedRef?.trim()) {
+        throw new HvError('PROVIDER_ERROR', `GitHub did not return a default branch for ${owner}/${repo}.`, {
+          hint: 'Pass ref explicitly, or verify the repository default branch before dispatching.',
+        });
+      }
+      await adapter.triggerWorkflow(owner, repo, selectedDefinition, selectedRef, inputs);
       ctx.repos.audit.create({
         action: 'hv.ci_trigger',
         resourceType: 'github_workflow',
         resourceId: `${owner}/${repo}/${selectedDefinition}`,
-        details: { workflow: selectedDefinition, ref: ref ?? 'main', inputNames: Object.keys(inputs ?? {}).sort() },
+        details: { workflow: selectedDefinition, ref: selectedRef, inputNames: Object.keys(inputs ?? {}).sort() },
       });
 
       return commandSuccess(
-        { repository: `${owner}/${repo}`, workflow: selectedDefinition, ref: ref ?? 'main' },
+        { repository: `${owner}/${repo}`, workflow: selectedDefinition, ref: selectedRef },
         { hint: 'Workflow dispatched. Check progress with hv_ci_status include=["runs"].', next: ['hv_ci_status'] }
       );
     })

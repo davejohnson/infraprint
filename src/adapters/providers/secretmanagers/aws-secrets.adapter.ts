@@ -7,6 +7,13 @@ import {
   AwsSecretsCredentialsSchema,
 } from '../../../domain/ports/secretmanager.port.js';
 import { secretManagerRegistry } from '../../../domain/registry/secretmanager.registry.js';
+import { defaultProvider } from '@aws-sdk/credential-provider-node';
+
+interface AwsResolvedCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+}
 
 // AWS Signature V4 signing helper
 async function signRequest(
@@ -142,18 +149,29 @@ export class AwsSecretsAdapter implements ISecretManagerAdapter {
 
   private credentials: AwsSecretsCredentials | null = null;
 
-  async connect(credentials: unknown): Promise<void> {
-    this.credentials = credentials as AwsSecretsCredentials;
+  constructor(
+    private readonly resolveDefaultCredentials: () => Promise<AwsResolvedCredentials> = defaultProvider()
+  ) {}
 
-    // If no explicit credentials, check environment
-    if (!this.credentials.accessKeyId) {
-      this.credentials.accessKeyId = process.env.AWS_ACCESS_KEY_ID;
-      this.credentials.secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
-      this.credentials.sessionToken = process.env.AWS_SESSION_TOKEN;
-    }
+  async connect(credentials: unknown): Promise<void> {
+    this.credentials = AwsSecretsCredentialsSchema.parse(credentials ?? {});
 
     if (!this.credentials.accessKeyId || !this.credentials.secretAccessKey) {
-      throw new Error('AWS credentials required (accessKeyId + secretAccessKey or AWS_ACCESS_KEY_ID env vars)');
+      try {
+        const resolved = await this.resolveDefaultCredentials();
+        this.credentials = {
+          ...this.credentials,
+          accessKeyId: resolved.accessKeyId,
+          secretAccessKey: resolved.secretAccessKey,
+          ...(resolved.sessionToken ? { sessionToken: resolved.sessionToken } : {}),
+        };
+      } catch (error) {
+        throw new Error(
+          'Unable to resolve AWS credentials. Pass accessKeyId + secretAccessKey '
+          + 'or configure the AWS SDK default provider chain (environment, shared profile/SSO, web identity, ECS, or EC2 role). '
+          + `Resolver error: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
     }
   }
 
@@ -180,6 +198,9 @@ export class AwsSecretsAdapter implements ISecretManagerAdapter {
     }
 
     const response = await this.request<AwsSecretValue>('GetSecretValue', params);
+    if (version !== undefined && response.VersionId !== version) {
+      throw new Error(`AWS Secrets Manager returned version ${response.VersionId}, not requested version ${version}.`);
+    }
 
     let value: string;
     let secretData: Record<string, string> | null = null;
@@ -210,6 +231,9 @@ export class AwsSecretsAdapter implements ISecretManagerAdapter {
         }
       }
     } else if (response.SecretBinary) {
+      if (key !== undefined) {
+        throw new Error(`Cannot select key '${key}' from binary secret at ${path}`);
+      }
       value = Buffer.from(response.SecretBinary, 'base64').toString('utf-8');
     } else {
       throw new Error(`Secret ${path} has no value`);
@@ -239,6 +263,7 @@ export class AwsSecretsAdapter implements ISecretManagerAdapter {
       const response = await this.request<AwsSecretList>('ListSecrets', params);
 
       for (const secret of response.SecretList) {
+        if (pathPrefix && !secret.Name.startsWith(pathPrefix)) continue;
         secrets.push({
           path: secret.Name,
           updatedAt: secret.LastChangedDate
@@ -300,8 +325,11 @@ secretManagerRegistry.register({
     displayName: 'AWS Secrets Manager',
     credentialsSchema: AwsSecretsCredentialsSchema,
     setupHelpUrl: 'https://docs.aws.amazon.com/secretsmanager/',
+    credentials: {
+      supportsNativeCliAuth: true,
+    },
   },
-  factory: (credentials) => {
+  factory: (_credentials) => {
     const adapter = new AwsSecretsAdapter();
     return adapter;
   },

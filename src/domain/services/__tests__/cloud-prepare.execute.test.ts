@@ -110,8 +110,8 @@ describe('runCloudPrepare', () => {
       memorystoreAccess: string;
     };
     expect(inspectPlan).toMatchObject({ memorystoreAccess: 'inspect' });
-    expect(inspectPlan.enableApis).toEqual(['redis.googleapis.com']);
-    expect(inspectPlan.grantRoles).toEqual(['roles/redis.viewer']);
+    expect(inspectPlan.enableApis).toEqual(['compute.googleapis.com', 'redis.googleapis.com']);
+    expect(inspectPlan.grantRoles).toEqual(['roles/compute.networkViewer', 'roles/redis.viewer']);
 
     const queue = await runCloudPrepare({
       project,
@@ -233,10 +233,12 @@ describe('runCloudPrepare', () => {
       cloudrun: { requiredApis: string[]; requiredRoles: string[] };
     };
     expect(preparation.cloudrun.requiredApis).toEqual(expect.arrayContaining([
+      'compute.googleapis.com',
       'storage.googleapis.com',
       'redis.googleapis.com',
     ]));
     expect(preparation.cloudrun.requiredRoles).toEqual(expect.arrayContaining([
+      'roles/compute.networkViewer',
       'roles/storage.viewer',
       'roles/redis.viewer',
     ]));

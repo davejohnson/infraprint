@@ -8,6 +8,8 @@ import { SqliteAdapter } from '../../../adapters/db/sqlite.adapter.js';
 import '../../../adapters/providers/railway/railway.adapter.js';
 import '../../../adapters/providers/gcp/cloudrun.adapter.js';
 import '../../../adapters/providers/aws/s3.adapter.js';
+import '../../../adapters/providers/azure/azure-container-apps.adapter.js';
+import '../../../adapters/providers/azure/azure-managed-redis.adapter.js';
 import { ProjectRepository } from '../../../adapters/db/repositories/project.repository.js';
 import { EnvironmentRepository } from '../../../adapters/db/repositories/environment.repository.js';
 import { ServiceRepository } from '../../../adapters/db/repositories/service.repository.js';
@@ -29,8 +31,10 @@ import type { Environment } from '../../entities/environment.entity.js';
 import { buildBranchDeployWorkflow } from '../../services/github-ops.service.js';
 import { StripeAdapter } from '../../../adapters/providers/stripe/stripe.adapter.js';
 import { executePlanApply } from '../../../application/apply-plan.js';
-import { createToolContext } from '../../../tools/context.js';
+import { createToolContext } from '../../../application/context.js';
 import * as environmentMaintenanceService from '../../services/environment-maintenance.service.js';
+import { applyStorageAction, STORAGE_OPERATIONS } from '../../services/storage-plan.service.js';
+import { CACHE_OPERATIONS } from '../../services/cache-plan.service.js';
 
 let project: Project;
 
@@ -106,6 +110,59 @@ describe('PlanService.plan', () => {
   it('errors when the environment is not in the spec', async () => {
     const result = await new PlanService().plan(project, 'production');
     expect(result).toMatchObject({ error: expect.stringContaining('production') });
+  });
+
+  it('rejects unsupported application-managed queue options before observation or plan persistence', async () => {
+    new SpecStore().replace(project, {
+      version: 1,
+      project: project.name,
+      environments: {
+        staging: {
+          hosting: { provider: 'railway' },
+          database: { provider: 'railway' },
+          services: { jobs: { workloadKind: 'worker' } },
+          queues: { jobs: { ackDeadlineSeconds: 120 } },
+        },
+      },
+    });
+    const providerAdapter = vi.spyOn(adapterFactory, 'getProviderAdapter');
+    const hostingAdapter = vi.spyOn(adapterFactory, 'getHostingAdapter');
+    const databaseAdapter = vi.spyOn(adapterFactory, 'getDatabaseAdapter');
+
+    const result = await new PlanService().plan(project, 'staging');
+
+    expect(result).toEqual({
+      error: expect.stringContaining('do not support ackDeadlineSeconds'),
+    });
+    expect(providerAdapter).not.toHaveBeenCalled();
+    expect(hostingAdapter).not.toHaveBeenCalled();
+    expect(databaseAdapter).not.toHaveBeenCalled();
+    expect(new EnvironmentRepository().findByProjectId(project.id)).toEqual([]);
+    expect(new RunRepository().findByProjectId(project.id)).toEqual([]);
+  });
+
+  it('orders a compatible same-cloud cache behind a differently named hosting project', async () => {
+    new SpecStore().replace(project, {
+      version: 1,
+      project: project.name,
+      environments: {
+        production: {
+          hosting: { provider: 'azure-container-apps' },
+          cache: { provider: 'azure-managed-redis', engine: 'redis' },
+          services: {},
+        },
+      },
+    });
+
+    const result = await new PlanService().plan(project, 'production');
+
+    expect(result).not.toHaveProperty('error');
+    const plan = result as Exclude<typeof result, { error: string }>;
+    expect(plan.actions.find((action) => action.id === 'cache:azure-managed-redis'))
+      .toMatchObject({
+        type: 'create',
+        dependsOn: ['project:azure-container-apps'],
+      });
   });
 
   it('plans GitHub collaboration only on the canonical environment and blocks missing GitHub connection', async () => {
@@ -197,7 +254,10 @@ describe('PlanService.plan', () => {
         staging: {
           hosting: { provider: 'railway' },
           services: { web: { startCommand: 'npm start' } },
-          cache: { provider: 'railway', engine: 'redis' },
+          cache: {
+            provider: 'railway', engine: 'redis', region: 'ca-central-1',
+            network: 'default', subnetwork: 'default', tier: 'BASIC', size: '1gb',
+          },
           envVars: { NODE_ENV: 'staging' },
         },
       },
@@ -223,6 +283,24 @@ describe('PlanService.plan', () => {
       credentialsEncrypted: getSecretStore().encryptObject({ apiToken: 'railway-token' }),
     });
     new ConnectionRepository().updateStatus(connection.id, 'verified');
+    const configureCacheTarget = vi.fn();
+    const observeCache = vi.fn(async () => null);
+    vi.spyOn(adapterFactory, 'getCacheAdapter').mockResolvedValue({
+      success: true,
+      adapter: {
+        name: 'railway',
+        capabilities: {
+          supportedCaches: ['redis'], supportsTls: true, supportsHighAvailability: false,
+          supportsPersistence: true, serverlessOptimized: false,
+        },
+        connect: async () => {}, verify: async () => ({ success: true }),
+        configureTarget: configureCacheTarget,
+        provision: async () => { throw new Error('unused'); },
+        getConnectionUrl: async () => null,
+        destroy: async () => ({ success: true, message: 'unused' }),
+        observeCache,
+      },
+    });
     mockObservingAdapter({
       provider: 'railway',
       observedAt: new Date().toISOString(),
@@ -241,6 +319,7 @@ describe('PlanService.plan', () => {
       }],
       databases: [],
       caches: [],
+      completeness: { caches: 'unknown' },
       partial: false,
       warnings: [],
     });
@@ -254,12 +333,27 @@ describe('PlanService.plan', () => {
       verified: true,
       billable: true,
       resource: { kind: 'cache', name: 'redis', provider: 'railway' },
+      metadata: {
+        operation: CACHE_OPERATIONS.ensure,
+        region: 'ca-central-1', network: 'default', subnetwork: 'default',
+        tier: 'BASIC', size: '1gb',
+      },
     });
     expect(plan.actions.find((action) => action.id === 'service:web')).toMatchObject({
       type: 'update',
       dependsOn: expect.arrayContaining(['cache:railway']),
     });
     expect(plan.blocked).toEqual([]);
+    expect(configureCacheTarget).toHaveBeenCalledWith({
+      projectName: project.name,
+      region: 'ca-central-1', network: 'default', subnetwork: 'default',
+      tier: 'BASIC', size: '1gb',
+    });
+    expect(observeCache).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'staging' }),
+      undefined,
+      expect.objectContaining({ projectName: project.name, region: 'ca-central-1' })
+    );
   });
 
   it('persists hash-only Stripe environment drift with service dependencies', async () => {
@@ -862,9 +956,9 @@ describe('PlanService.plan', () => {
       project: project.name,
       environments: {
         staging: {
-          hosting: { provider: 'derived-host' },
+          hosting: { provider: 'railway' },
           services: {},
-          database: { provider: 'derived-postgres', engine: 'postgres' },
+          database: { provider: 'railway', engine: 'postgres' },
         },
       },
     });
@@ -872,7 +966,7 @@ describe('PlanService.plan', () => {
       projectId: project.id,
       name: 'staging',
       platformBindings: {
-        provider: 'derived-host',
+        provider: 'railway',
         projectId: 'tea-owner-1',
         services: {},
       },
@@ -882,12 +976,12 @@ describe('PlanService.plan', () => {
       type: 'postgres',
       externalId: 'database-1',
       bindings: {
-        provider: 'derived-postgres',
+        provider: 'railway',
         instanceId: 'database-1',
       },
     });
     const connection = new ConnectionRepository().create({
-      provider: 'derived-postgres',
+      provider: 'railway',
       credentialsEncrypted: getSecretStore().encryptObject({
         apiKey: 'derived-provider-key',
       }),
@@ -896,7 +990,7 @@ describe('PlanService.plan', () => {
     vi.spyOn(adapterFactory, 'getProviderAdapter').mockResolvedValue({
       success: true,
       adapter: {
-        name: 'derived-host',
+        name: 'railway',
         capabilities: {
           supportedBuilders: ['dockerfile'],
           supportedComponents: [],
@@ -915,7 +1009,7 @@ describe('PlanService.plan', () => {
         deploy: async () => { throw new Error('unused'); },
         setEnvVars: async () => ({ success: true, message: 'ok' }),
         observe: async () => ({
-          provider: 'derived-host',
+          provider: 'railway',
           observedAt: new Date().toISOString(),
           projectExists: true,
           projectId: 'tea-owner-1',
@@ -941,7 +1035,7 @@ describe('PlanService.plan', () => {
     ) => {
       expect(observedComponent?.externalId).toBe('database-1');
       return {
-        provider: 'derived-postgres',
+        provider: 'railway',
         engine: 'postgres',
         externalId: 'database-1',
         name: 'plan-test-staging-postgres',
@@ -951,7 +1045,7 @@ describe('PlanService.plan', () => {
     vi.spyOn(adapterFactory, 'getDatabaseAdapter').mockResolvedValue({
       success: true,
       adapter: {
-        name: 'derived-postgres',
+        name: 'railway',
         capabilities: {
           supportedDatabases: ['postgres'],
           supportsPooling: true,
@@ -972,7 +1066,7 @@ describe('PlanService.plan', () => {
 
     expect(result).not.toHaveProperty('error');
     const plan = result as Exclude<typeof result, { error: string }>;
-    expect(plan.actions.find((action) => action.id === 'database:derived-postgres'))
+    expect(plan.actions.find((action) => action.id === 'database:railway'))
       .toMatchObject({ type: 'noop', verified: true });
     expect(observeDatabase).toHaveBeenCalledOnce();
   });
@@ -1284,6 +1378,179 @@ describe('PlanService.plan', () => {
     expect(resolveObservationContext).toHaveBeenCalledWith(project.name, environment, 'us-west-2');
     expect(observe).toHaveBeenCalledWith(environment, { accountId: '123456789012', region: 'us-west-2' });
     expect(result.observed?.completeness?.storage).toBe('complete');
+    expect(result.observed?.completeness?.storageByProvider).toEqual({ s3: 'complete' });
+  });
+
+  it('observes a removed persisted storage provider and records its failure as provider-unknown', async () => {
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'staging',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'rp',
+        environmentId: 're',
+        storageProviders: { s3: { accountId: '123456789012', region: 'us-west-2' } },
+        storage: {
+          archives: {
+            provider: 's3',
+            externalId: 'plan-test-archives',
+            region: 'us-west-2',
+            services: [],
+            envKeys: [],
+          },
+        },
+      },
+    });
+    const environmentSpec = environmentSpecSchema.parse({
+      hosting: { provider: 'railway' },
+      services: { web: {} },
+    });
+    mockObservingAdapter({
+      provider: 'railway', observedAt: new Date().toISOString(), projectExists: true,
+      projectId: 'rp', environmentId: 're', services: [], databases: [], storage: [],
+      completeness: {
+        project: 'complete', environment: 'complete', services: 'complete',
+        databases: 'complete', caches: 'complete', storage: 'complete',
+      },
+      partial: false, warnings: [],
+    });
+    const observe = vi.fn(async () => {
+      throw new Error('AWS inventory unavailable');
+    });
+    vi.spyOn(adapterFactory, 'getStorageAdapter').mockResolvedValue({
+      success: true,
+      adapter: { name: 's3', observe },
+    } as never);
+
+    const result = await new PlanService().observeEnvironment(project, environment, environmentSpec);
+
+    expect(observe).toHaveBeenCalledWith(environment, { accountId: '123456789012', region: 'us-west-2' });
+    expect(result.observed?.completeness?.storage).toBe('unknown');
+    expect(result.observed?.completeness?.storageByProvider).toEqual({ s3: 'unknown' });
+    expect(result.observed?.warnings).toContain('Storage observation failed (s3): AWS inventory unavailable');
+  });
+
+  it('keeps equal storage ids in different provider scopes as distinct observations', async () => {
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'staging',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'current-project',
+        environmentId: 'current-environment',
+        storage: {
+          first: {
+            provider: 'railway', externalId: 'bucket-reused', region: 'sjc', services: [], envKeys: [],
+            instanceScope: { projectId: 'project-one', environmentId: 'environment-one' },
+          },
+          second: {
+            provider: 'railway', externalId: 'bucket-reused', region: 'sjc', services: [], envKeys: [],
+            instanceScope: { projectId: 'project-two', environmentId: 'environment-two' },
+          },
+        },
+      },
+    });
+    const environmentSpec = environmentSpecSchema.parse({
+      hosting: { provider: 'railway' },
+      services: { web: {} },
+    });
+    mockObservingAdapter({
+      provider: 'railway', observedAt: new Date().toISOString(), projectExists: true,
+      projectId: 'current-project', environmentId: 'current-environment', services: [], databases: [], storage: [],
+      completeness: {
+        project: 'complete', environment: 'complete', services: 'complete',
+        databases: 'complete', caches: 'complete', storage: 'complete',
+      },
+      partial: false, warnings: [],
+    });
+    const observe = vi.fn(async (_environment: Environment, context: Record<string, string>) => (
+      context.projectId === 'current-project'
+        ? []
+        : [{
+            provider: 'railway',
+            kind: 'object' as const,
+            externalId: 'bucket-reused',
+            instanceScope: context,
+            name: `bucket-${context.projectId}`,
+            region: 'sjc',
+            status: 'ready' as const,
+          }]
+    ));
+    vi.spyOn(adapterFactory, 'getStorageAdapter').mockResolvedValue({
+      success: true,
+      adapter: { name: 'railway', observe },
+    } as never);
+
+    const result = await new PlanService().observeEnvironment(project, environment, environmentSpec);
+
+    expect(result.observed?.storage).toHaveLength(2);
+    expect(result.observed?.storage?.map((item) => item.instanceScope)).toEqual(expect.arrayContaining([
+      { projectId: 'project-one', environmentId: 'environment-one' },
+      { projectId: 'project-two', environmentId: 'environment-two' },
+    ]));
+    expect(result.observed?.completeness?.storageByProvider).toEqual({ railway: 'complete' });
+  });
+
+  it('preserves a partial storage create id and scope in the failed apply receipt', async () => {
+    new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'staging',
+      platformBindings: { provider: 'railway', projectId: 'rp', environmentId: 're' },
+    });
+    const environmentSpec = environmentSpecSchema.parse({
+      hosting: { provider: 'railway' },
+      services: { web: {} },
+      storage: {
+        documents: { provider: 's3', type: 'bucket', region: 'us-west-2', injectInto: [] },
+      },
+    });
+    const instanceScope = { accountId: '123456789012', region: 'us-west-2' };
+    vi.spyOn(adapterFactory, 'getStorageAdapter').mockResolvedValue({
+      success: true,
+      adapter: {
+        name: 's3',
+        runtimeEnvKeys: () => [],
+        ensureContext: async () => ({
+          receipt: { success: true, message: 'context ready' },
+          context: instanceScope,
+        }),
+        ensureBucket: async () => ({
+          receipt: {
+            success: false,
+            message: 'configuration and rollback failed',
+            error: 'rollback denied',
+            data: { externalId: 'partial-bucket', recoveryRequired: true },
+          },
+          externalId: 'partial-bucket',
+          context: instanceScope,
+        }),
+      },
+    } as never);
+
+    const result = await applyStorageAction({
+      project,
+      envName: 'staging',
+      environmentSpec,
+      action: {
+        id: 'storage:documents',
+        type: 'create',
+        resource: { kind: 'storage', name: 'documents', provider: 's3' },
+        verified: true,
+        reason: 'Create documents bucket',
+        billable: true,
+        metadata: { operation: STORAGE_OPERATIONS.ensure, storageName: 'documents' },
+      },
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      error: 'rollback denied',
+      data: {
+        externalId: 'partial-bucket',
+        instanceScope,
+        recoveryRequired: true,
+      },
+    });
   });
 
   it('does not guess the shared provider project when sibling environment bindings disagree', async () => {
@@ -1529,6 +1796,20 @@ describe('PlanService.plan', () => {
     expect(plan.warnings.some((w) => w.includes('github.com/apps/railway-app'))).toBe(true);
     expect(plan.warnings.some((w) => w.includes('project member has connected GitHub'))).toBe(true);
     expect(plan.warnings.some((w) => w.includes('pending Railway GitHub App permission updates'))).toBe(true);
+  });
+
+  it('resolves an explicit native deploy branch for an arbitrary environment name', () => {
+    project = new ProjectRepository().update(project.id, {
+      gitRemoteUrl: 'git@github.com:dave/preview-app.git',
+    })!;
+
+    expect(new PlanService().expectedDeploySource(project, 'qa-7', {
+      hosting: { provider: 'railway' },
+      services: { web: { workloadKind: 'web' } },
+      deploy: { strategy: 'branch', trigger: 'native', branch: 'release/qa-7' },
+      email: { enabled: false },
+      envVars: {},
+    })).toEqual({ repo: 'dave/preview-app', branch: 'release/qa-7' });
   });
 
   it('warns when branch strategy is set but the project has no GitHub remote', async () => {

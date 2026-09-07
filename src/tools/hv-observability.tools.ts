@@ -25,7 +25,7 @@ import {
 } from '../domain/services/health.service.js';
 import type { CommandContext } from '../application/context.js';
 import { projectField, envField } from './schemas.js';
-import { commandSuccess, commandError, wrapCommandHandler, HvError } from '../application/results.js';
+import { commandSuccess, wrapCommandHandler, HvError } from '../application/results.js';
 import { SpecStore } from '../domain/spec/spec.store.js';
 import { connectionSetupOptions } from '../domain/services/connection-guidance.js';
 import { getProjectScopeHints } from '../domain/services/project-scope.js';
@@ -45,7 +45,11 @@ function resolveEnvOrThrow(ctx: CommandContext, projectRef: string | undefined, 
 
 function tailBuildLog(buildLogs: string, requestedLines: number | undefined) {
   const normalized = buildLogs.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  const lines = normalized.split('\n');
+  const lines = normalized.length === 0 ? [] : normalized.split('\n');
+  // A terminal newline terminates the preceding line; it is not an extra
+  // empty log line. Counting it made `limit: 1` return an empty string for
+  // the overwhelmingly common `"last line\n"` response shape.
+  if (lines.at(-1) === '') lines.pop();
   const tail = requestedLines === undefined ? lines : lines.slice(-requestedLines);
   return {
     buildLogs: tail.join('\n'),
@@ -150,6 +154,12 @@ export function registerHvObservabilityTools(commands: CommandRegistrar, ctx: Co
 
       const { project, environment, bindings, provider } = resolveEnvOrThrow(ctx, projectRef, env);
       const boundServices = Object.keys(bindings.services ?? {});
+      if (service && !bindings.services?.[service]) {
+        throw new HvError('NOT_FOUND', `Service "${service}" is not bound in ${environment.name}.`, {
+          details: { available: boundServices },
+          hint: 'Choose a bound service, or converge its desired-state binding with hv_plan and hv_apply first.',
+        });
+      }
       const serviceName = service ?? boundServices[0];
 
       if (source === 'deployments') {

@@ -15,7 +15,7 @@ import type { ISecretManagerAdapter } from '../../domain/ports/secretmanager.por
 import { secretManagerRegistry } from '../../domain/registry/secretmanager.registry.js';
 import * as hostingEnv from '../../domain/services/hosting-env.service.js';
 import { createMcpCommandRegistrar } from '../../interfaces/mcp/adapter.js';
-import { createToolContext } from '../context.js';
+import { createToolContext } from '../../application/context.js';
 import { registerHvSecretsTools } from '../hv-secrets.tools.js';
 import { expectActionableConnectionSetup, parseToolEnvelope } from './tool-result.js';
 
@@ -42,6 +42,9 @@ async function makeClient() {
   return {
     async call(name: string, args: Record<string, unknown> = {}) {
       return parseToolEnvelope(await client.callTool({ name, arguments: args })) as Record<string, any>;
+    },
+    async rawCall(name: string, args: Record<string, unknown> = {}) {
+      return client.callTool({ name, arguments: args });
     },
     async names() {
       return (await client.listTools()).tools.map((tool) => tool.name);
@@ -239,11 +242,12 @@ describe('secret reads', () => {
       credentialsEncrypted: getSecretStore().encryptObject({ address: 'https://vault.example', token: 'token' }),
     });
     repo.updateStatus(connection.id, 'verified');
+    const getSecret = vi.fn(async () => ({ value: 'manager-secret-value', version: '3' }));
     const adapter: ISecretManagerAdapter = {
       name: 'vault',
       async connect() {},
       async verify() { return { success: true }; },
-      async getSecret() { return { value: 'manager-secret-value', version: '3' }; },
+      getSecret,
       async listSecrets() { return []; },
     };
     vi.spyOn(secretManagerRegistry, 'createAdapter').mockReturnValue(adapter);
@@ -253,16 +257,30 @@ describe('secret reads', () => {
       provider: 'vault',
       path: 'apps/prod',
       key: 'API_KEY',
+      version: '3',
     });
 
     expect(result.data).toEqual({
-      secretRef: 'vault://apps/prod#API_KEY',
+      secretRef: 'vault://apps/prod#API_KEY@3',
       value: '[redacted]',
       present: true,
       version: '3',
     });
+    expect(getSecret).toHaveBeenCalledWith('apps/prod', 'API_KEY', '3');
     expect(JSON.stringify(result)).not.toContain('manager-secret-value');
     expect('setSecret' in adapter).toBe(false);
+    await client.close();
+  });
+
+  it('rejects empty manager selectors instead of treating them as omitted', async () => {
+    const client = await makeClient();
+
+    const result = await client.rawCall('hv_secrets', {
+      provider: 'vault',
+      path: '',
+    });
+
+    expect(result.isError).toBe(true);
     await client.close();
   });
 });

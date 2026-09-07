@@ -29,6 +29,22 @@ describe('spec bootstrap env vars', () => {
     expect(params.hostingRegion).toBe('us-east-1');
   });
 
+  it('preserves an explicit deploy branch for an arbitrary environment name', () => {
+    const params = specToBootstrapParams('preview-app', 'qa-7', {
+      hosting: { provider: 'railway' },
+      services: { web: { workloadKind: 'web' } },
+      deploy: { strategy: 'branch', trigger: 'native', branch: 'release/qa-7' },
+      email: { enabled: false },
+      envVars: {},
+    });
+
+    expect(params.deploy).toEqual({
+      strategy: 'branch',
+      trigger: 'native',
+      branch: 'release/qa-7',
+    });
+  });
+
   it('merges deploy env files below spec envVars and explicit overrides above both', () => {
     const params = specToBootstrapParams('env-app', 'production', {
       hosting: { provider: 'railway' },

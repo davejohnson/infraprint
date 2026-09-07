@@ -7,14 +7,16 @@ import {
   summarizeBuild,
 } from '../domain/services/appstore-ops.service.js';
 import { connectionSetupOptions, formatConnectionGuidance } from '../domain/services/connection-guidance.js';
-import type {
-  AppStoreConnectAdapter,
-} from '../adapters/providers/appstoreconnect/appstoreconnect.adapter.js';
 import { SpecStore } from '../domain/spec/spec.store.js';
 import { parseGitHubRepoFromRemote } from '../lib/git-remote.js';
 import { getGitHubAdapter } from '../domain/services/github-ops.service.js';
 import { projectField } from './schemas.js';
 import { ignoredOptionWarnings } from '../application/command-options.js';
+
+type ConnectedAppStoreAdapter = Extract<
+  ReturnType<typeof getAppStoreConnectAdapter>,
+  { adapter: unknown }
+>['adapter'];
 
 const SETUP_HINT =
   `${formatConnectionGuidance('appstoreconnect')} For multiple apps/teams use a scoped connection (scope="<bundle id>"). Uploads additionally require the Xcode command line tools (xcode-select --install).`;
@@ -22,7 +24,7 @@ const SETUP_HINT =
 const platformField = z.enum(['IOS', 'MAC_OS', 'TV_OS']).optional().describe('Platform (default: IOS)');
 type AscPlatform = 'IOS' | 'MAC_OS' | 'TV_OS' | undefined;
 
-function adapterOrThrow(scopeHint?: string, project?: string): AppStoreConnectAdapter {
+function adapterOrThrow(scopeHint?: string, project?: string): ConnectedAppStoreAdapter {
   const result = getAppStoreConnectAdapter(scopeHint);
   if ('error' in result) {
     throw new HvError('MISSING_CONNECTION', result.error, {
@@ -38,7 +40,7 @@ function adapterOrThrow(scopeHint?: string, project?: string): AppStoreConnectAd
  * (build attached, localization metadata, screenshots).
  */
 async function computeReadiness(
-  adapter: AppStoreConnectAdapter,
+  adapter: ConnectedAppStoreAdapter,
   appId: string,
   options: { platform?: AscPlatform; locale: string; screenshotDisplayType: string },
 ): Promise<Record<string, unknown>> {
@@ -117,6 +119,7 @@ export function registerHvAppstoreTools(commands: CommandRegistrar, ctx: Command
       const adapter = adapterOrThrow(appIdentifier);
       const sections = new Set<StatusSection>(include?.length ? include : STATUS_SECTIONS);
       const selectedSections = [...sections];
+      const resolvedPlatform = platform ?? 'IOS';
       const resolvedLocale = locale ?? 'en-US';
       const resolvedScreenshotDisplayType = screenshotDisplayType ?? 'APP_IPHONE_65';
       const warnings: string[] = [
@@ -146,13 +149,20 @@ export function registerHvAppstoreTools(commands: CommandRegistrar, ctx: Command
       };
 
       await section('builds', async () => {
-        const builds = await adapter.listBuilds({ appId: app!.id, limit: limit ?? 10 });
-        return builds.map(summarizeBuild);
+        const requestedLimit = limit ?? 10;
+        const builds = await adapter.listBuilds({ appId: app!.id, limit: requestedLimit });
+        // Provider pagination is an optimization, not the public command
+        // boundary. Keep the result bounded if the API/adapter over-returns.
+        return builds.slice(0, requestedLimit).map(summarizeBuild);
       });
       await section('groups', () => adapter.listBetaGroups(app!.id));
-      await section('testers', () => adapter.listBetaTesters({ appId: app!.id, limit: limit ?? 200 }));
+      await section('testers', async () => {
+        const requestedLimit = limit ?? 200;
+        const testers = await adapter.listBetaTesters({ appId: app!.id, limit: requestedLimit });
+        return testers.slice(0, requestedLimit);
+      });
       await section('readiness', () => computeReadiness(adapter, app!.id, {
-        platform,
+        platform: resolvedPlatform,
         locale: resolvedLocale,
         screenshotDisplayType: resolvedScreenshotDisplayType,
       }));
@@ -176,6 +186,7 @@ export function registerHvAppstoreTools(commands: CommandRegistrar, ctx: Command
       platform: platformField,
     },
     wrapCommandHandler(async ({ project: projectRef, environment: environmentName, appIdentifier, platform }) => {
+      const resolvedPlatform = platform ?? 'IOS';
       const project = ctx.resolveProjectOrThrow({ project: projectRef });
       const stored = new SpecStore().get(project);
       if (!stored) {
@@ -273,9 +284,9 @@ export function registerHvAppstoreTools(commands: CommandRegistrar, ctx: Command
         });
       }
 
-      const version = await adapter.getEditableAppStoreVersion(app.id, platform as AscPlatform);
+      const version = await adapter.getEditableAppStoreVersion(app.id, resolvedPlatform);
       if (!version) {
-        const versions = await adapter.listAppStoreVersions(app.id, { platform: platform as AscPlatform, limit: 5 });
+        const versions = await adapter.listAppStoreVersions(app.id, { platform: resolvedPlatform, limit: 5 });
         return commandError('VALIDATION', 'No version ready for submission. Create a new version in App Store Connect with state PREPARE_FOR_SUBMISSION.', {
           details: { currentVersions: versions.map((v) => ({ version: v.versionString, state: v.appStoreState, platform: v.platform })) },
         });

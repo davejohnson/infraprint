@@ -160,6 +160,205 @@ describe('EcsExpressAdapter lifecycle boundaries', () => {
     expect(calls.some((name) => /^(Create|Update|Delete|Attach|Detach|Tag|Modify|Add|Remove)/.test(name))).toBe(false);
   });
 
+  it('does not interpret a non-missing DescribeClusters failure as absence', async () => {
+    const calls: string[] = [];
+    const adapter = await adapterWithSend(async (command) => {
+      const name = commandName(command);
+      calls.push(name);
+      if (name === 'DescribeClustersCommand') {
+        return {
+          failures: [{
+            arn: CLUSTER_ARN,
+            reason: 'ACCESS_DENIED',
+            detail: 'not authorized to observe tags',
+          }],
+          clusters: [],
+        };
+      }
+      throw new Error(`Unexpected ${name}`);
+    });
+
+    const receipt = await adapter.ensureProject('app', environment());
+
+    expect(receipt).toMatchObject({ success: false });
+    expect(receipt.error).toContain('ACCESS_DENIED');
+    expect(receipt.error).not.toContain('will not create a replacement');
+    expect(calls).toEqual(['DescribeClustersCommand']);
+  });
+
+  it('does not interpret an incomplete DescribeClusters response as absence', async () => {
+    const calls: string[] = [];
+    const adapter = await adapterWithSend(async (command) => {
+      const name = commandName(command);
+      calls.push(name);
+      if (name === 'DescribeClustersCommand') {
+        return { failures: [], clusters: [] };
+      }
+      throw new Error(`Unexpected ${name}`);
+    });
+
+    const receipt = await adapter.ensureProject('app', environment());
+
+    expect(receipt).toMatchObject({ success: false });
+    expect(receipt.error).toContain('neither ECS cluster');
+    expect(calls).toEqual(['DescribeClustersCommand']);
+  });
+
+  it('does not report service deletion success for an incomplete exact lookup', async () => {
+    const calls: string[] = [];
+    const adapter = await adapterWithSend(async (command) => {
+      const name = commandName(command);
+      calls.push(name);
+      if (name === 'DescribeExpressGatewayServiceCommand') return {};
+      throw new Error(`Unexpected ${name}`);
+    });
+
+    const result = await adapter.deleteService(SERVICE_ARN);
+
+    expect(result).toMatchObject({ success: false });
+    expect(result.error).toContain('no ECS Express service');
+    expect(calls).toEqual(['DescribeExpressGatewayServiceCommand']);
+  });
+
+  it.each([
+    ['ECR repository', 'getRepository', 'repository-name', 'DescribeRepositoriesCommand'],
+    ['IAM role', 'getRole', 'role-name', 'GetRoleCommand'],
+    ['ACM certificate', 'getCertificate', 'arn:aws:acm:us-west-2:123456789012:certificate/example', 'DescribeCertificateCommand'],
+  ])('does not interpret an incomplete exact %s response as absence', async (_label, method, identity, expectedCommand) => {
+    const calls: string[] = [];
+    const adapter = await adapterWithSend(async (command) => {
+      calls.push(commandName(command));
+      return {};
+    });
+
+    await expect((adapter as any)[method](identity)).rejects.toThrow(/returned no/);
+    expect(calls).toEqual([expectedCommand]);
+  });
+
+  it.each([
+    ['cluster', 'findClusterArns', ['hv-app-production-0123456789'], 'ListClustersCommand'],
+    ['service', 'listServiceArns', [CLUSTER_ARN], 'ListServicesCommand'],
+    ['certificate', 'findManagedDomainCertificate', ['app.example.com', SERVICE_ARN], 'ListCertificatesCommand'],
+    ['default VPC', 'ensureDefaultVpc', [], 'DescribeVpcsCommand'],
+  ])('rejects an incomplete AWS %s list before mutation', async (_label, method, args, expectedCommand) => {
+    const calls: string[] = [];
+    const adapter = await adapterWithSend(async (command) => {
+      calls.push(commandName(command));
+      return {};
+    });
+
+    await expect((adapter as any)[method](...args)).rejects.toThrow(/invalid .* list/i);
+    expect(calls).toEqual([expectedCommand]);
+  });
+
+  it('does not attach a role policy after an incomplete policy observation', async () => {
+    const calls: string[] = [];
+    const roleName = 'hv-execution-role';
+    const roleArn = `arn:aws:iam::${ACCOUNT_ID}:role/${roleName}`;
+    const adapter = await adapterWithSend(async (command) => {
+      const name = commandName(command);
+      calls.push(name);
+      if (name === 'GetRoleCommand') {
+        return {
+          Role: {
+            RoleName: roleName,
+            Arn: roleArn,
+            Tags: [
+              { Key: 'managed-by', Value: 'hypervibe' },
+              { Key: 'hypervibe-environment-id', Value: 'environment-local' },
+            ],
+          },
+        };
+      }
+      if (name === 'ListAttachedRolePoliciesCommand') return {};
+      throw new Error(`Unexpected ${name}`);
+    });
+
+    await expect((adapter as any).ensureRole(
+      roleName,
+      roleArn,
+      'ecs-tasks.amazonaws.com',
+      'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy',
+      environment()
+    )).rejects.toThrow('invalid attached-policy list');
+    expect(calls).toEqual(['GetRoleCommand', 'ListAttachedRolePoliciesCommand']);
+  });
+
+  it('does not mutate project resources after malformed default-subnet observation', async () => {
+    const calls: string[] = [];
+    const adapter = await adapterWithSend(async (command) => {
+      const name = commandName(command);
+      calls.push(name);
+      if (name === 'ListClustersCommand') return { clusterArns: [] };
+      if (name === 'DescribeVpcsCommand') return { Vpcs: [{ VpcId: 'vpc-default', IsDefault: true }] };
+      if (name === 'DescribeSubnetsCommand') return {};
+      throw new Error(`No mutation may follow malformed subnet observation: ${name}`);
+    });
+
+    const receipt = await adapter.ensureProject('app', environment({}));
+
+    expect(receipt).toMatchObject({
+      success: false,
+      error: expect.stringContaining('invalid subnet list'),
+    });
+    expect(calls.some((name) => name.startsWith('Create'))).toBe(false);
+  });
+
+  it('does not mutate a service after its persisted workload-network identity goes stale', async () => {
+    const calls: string[] = [];
+    const adapter = await adapterWithSend(async (command) => {
+      const name = commandName(command);
+      const input = (command as { input: Record<string, any> }).input;
+      calls.push(name);
+      if (name === 'DescribeVpcsCommand') return { Vpcs: [{ VpcId: 'vpc-default', IsDefault: true }] };
+      if (name === 'DescribeSubnetsCommand') {
+        return {
+          Subnets: [
+            { SubnetId: 'subnet-a', VpcId: 'vpc-default', DefaultForAz: true, AvailabilityZone: `${REGION}a` },
+            { SubnetId: 'subnet-b', VpcId: 'vpc-default', DefaultForAz: true, AvailabilityZone: `${REGION}b` },
+          ],
+        };
+      }
+      if (name === 'DescribeSecurityGroupsCommand' && input.GroupIds?.[0] === 'sg-workloads') {
+        return {
+          SecurityGroups: [{
+            GroupId: 'sg-workloads',
+            GroupName: 'hv-app-production-0123456789-hypervibe-workloads',
+            VpcId: 'vpc-default',
+            Tags: [
+              { Key: 'managed-by', Value: 'hypervibe' },
+              { Key: 'hypervibe-environment-id', Value: 'environment-local' },
+              { Key: 'hypervibe-ecs-cluster-arn', Value: CLUSTER_ARN },
+            ],
+          }],
+        };
+      }
+      throw new Error(`No mutation may follow stale network observation: ${name}`);
+    });
+    const bound = environment({
+      provider: 'ecs',
+      projectId: CLUSTER_ARN,
+      environmentId: CLUSTER_ARN,
+      services: {},
+      awsNetwork: {
+        accountId: ACCOUNT_ID,
+        region: REGION,
+        vpcId: 'vpc-default',
+        subnetIds: ['subnet-a', 'subnet-stale'],
+        workloadSecurityGroupId: 'sg-workloads',
+      },
+    });
+
+    const result = await adapter.deploy(service(), bound, {}, { deferDeployment: true });
+
+    expect(result.receipt).toMatchObject({
+      success: false,
+      error: expect.stringContaining('binding changed since it was reviewed'),
+    });
+    expect(calls.some((name) => name === 'CreateExpressGatewayServiceCommand'
+      || name === 'UpdateExpressGatewayServiceCommand')).toBe(false);
+  });
+
   it('refuses to delete an exact but unowned service binding', async () => {
     const calls: string[] = [];
     const adapter = await adapterWithSend(async (command) => {
@@ -194,6 +393,8 @@ describe('EcsExpressAdapter lifecycle boundaries', () => {
     let clusterArn: string | null = null;
     let repository: { name: string; arn: string; uri: string } | null = null;
     let expressService: Record<string, any> | null = null;
+    let workloadGroup: Record<string, any> | null = null;
+    let serviceRevision = 0;
     const roles = new Map<string, { arn: string; policies: Set<string> }>();
     const adapter = await adapterWithSend(async (command) => {
       const name = commandName(command);
@@ -208,6 +409,35 @@ describe('EcsExpressAdapter lifecycle boundaries', () => {
             : { clusters: [], failures: [{ arn: input.clusters[0], reason: 'MISSING' }] };
         case 'DescribeVpcsCommand':
           return { Vpcs: [{ VpcId: 'vpc-default', IsDefault: true }] };
+        case 'DescribeSubnetsCommand':
+          return {
+            Subnets: [
+              { SubnetId: 'subnet-a', VpcId: 'vpc-default', DefaultForAz: true, AvailabilityZone: `${REGION}a` },
+              { SubnetId: 'subnet-b', VpcId: 'vpc-default', DefaultForAz: true, AvailabilityZone: `${REGION}b` },
+            ],
+          };
+        case 'DescribeSecurityGroupsCommand': {
+          if (input.GroupIds) {
+            if (workloadGroup && input.GroupIds[0] === workloadGroup.GroupId) {
+              return { SecurityGroups: [workloadGroup] };
+            }
+            const error = new Error('absent');
+            error.name = 'InvalidGroup.NotFound';
+            throw error;
+          }
+          return { SecurityGroups: workloadGroup ? [workloadGroup] : [] };
+        }
+        case 'CreateSecurityGroupCommand':
+          workloadGroup = {
+            GroupId: 'sg-workloads',
+            GroupName: input.GroupName,
+            VpcId: input.VpcId,
+            Tags: input.TagSpecifications[0].Tags,
+          };
+          return { GroupId: 'sg-workloads' };
+        case 'DeleteSecurityGroupCommand':
+          workloadGroup = null;
+          return {};
         case 'DescribeRepositoriesCommand': {
           if (!repository) {
             const error = new Error('absent');
@@ -256,7 +486,8 @@ describe('EcsExpressAdapter lifecycle boundaries', () => {
           return { serviceArns: expressService ? [expressService.serviceArn] : [] };
         case 'CreateExpressGatewayServiceCommand': {
           const serviceArn = String(input.cluster).replace(':cluster/', ':service/') + `/${input.serviceName}`;
-          const revisionArn = `${serviceArn}:revision/1`;
+          serviceRevision += 1;
+          const revisionArn = `${serviceArn}:revision/${serviceRevision}`;
           expressService = {
             cluster: input.cluster,
             serviceArn,
@@ -270,11 +501,34 @@ describe('EcsExpressAdapter lifecycle boundaries', () => {
               memory: input.memory,
               healthCheckPath: input.healthCheckPath,
               primaryContainer: input.primaryContainer,
+              networkConfiguration: input.networkConfiguration,
               scalingTarget: input.scalingTarget,
               ingressPaths: [{ accessType: 'PUBLIC', endpoint: 'https://web.ecs.us-west-2.on.aws' }],
               createdAt: new Date(),
             }],
             tags: input.tags,
+          };
+          return { service: expressService };
+        }
+        case 'UpdateExpressGatewayServiceCommand': {
+          if (!expressService) throw new Error('service absent');
+          serviceRevision += 1;
+          const revisionArn = `${input.serviceArn}:revision/${serviceRevision}`;
+          expressService = {
+            ...expressService,
+            currentDeployment: revisionArn,
+            activeConfigurations: [{
+              serviceRevisionArn: revisionArn,
+              executionRoleArn: input.executionRoleArn,
+              cpu: input.cpu,
+              memory: input.memory,
+              healthCheckPath: input.healthCheckPath,
+              primaryContainer: input.primaryContainer,
+              networkConfiguration: input.networkConfiguration,
+              scalingTarget: input.scalingTarget,
+              ingressPaths: [{ accessType: 'PUBLIC', endpoint: 'https://web.ecs.us-west-2.on.aws' }],
+              createdAt: new Date(),
+            }],
           };
           return { service: expressService };
         }
@@ -310,6 +564,14 @@ describe('EcsExpressAdapter lifecycle boundaries', () => {
     expect(created).toMatchObject({ success: true, data: { created: true } });
     const projectId = String(created.data?.projectId);
     expect(projectId).toBe(clusterArn);
+    const awsNetwork = (created.data?.providerBindings as Record<string, any>).awsNetwork;
+    expect(awsNetwork).toEqual({
+      accountId: ACCOUNT_ID,
+      region: REGION,
+      vpcId: 'vpc-default',
+      subnetIds: ['subnet-a', 'subnet-b'],
+      workloadSecurityGroupId: 'sg-workloads',
+    });
     expect(repository).not.toBeNull();
     expect(roles.size).toBe(2);
     expect(calls.indexOf('CreateClusterCommand')).toBeGreaterThan(calls.indexOf('CreateRepositoryCommand'));
@@ -320,6 +582,7 @@ describe('EcsExpressAdapter lifecycle boundaries', () => {
       projectId,
       environmentId: projectId,
       services: {},
+      awsNetwork,
     });
     const deployed = await adapter.deploy(service(), bound, { APP_MODE: 'test' }, { deferDeployment: true });
     expect(deployed).toMatchObject({
@@ -328,12 +591,33 @@ describe('EcsExpressAdapter lifecycle boundaries', () => {
     });
     expect(deployed.receipt.data?.runtimeRolloutRequired).toBeUndefined();
     const serviceId = String(deployed.externalId);
+    const createService = calls.lastIndexOf('CreateExpressGatewayServiceCommand');
+    expect(createService).toBeGreaterThan(-1);
+    expect((expressService as any).activeConfigurations[0].networkConfiguration).toEqual({
+      subnets: ['subnet-a', 'subnet-b'],
+      securityGroups: ['sg-workloads'],
+    });
+    await expect(adapter.deploy(service(), environment({
+      provider: 'ecs', projectId, environmentId: projectId, services: { web: { serviceId } }, awsNetwork,
+    }), { APP_MODE: 'updated' }, { deferDeployment: true })).resolves.toMatchObject({ receipt: { success: true } });
+    expect((expressService as any).activeConfigurations[0].networkConfiguration).toEqual({
+      subnets: ['subnet-a', 'subnet-b'],
+      securityGroups: ['sg-workloads'],
+    });
+    await expect(adapter.deleteEnvVars(environment({
+      provider: 'ecs', projectId, environmentId: projectId, services: { web: { serviceId } }, awsNetwork,
+    }), service(), ['APP_MODE'])).resolves.toMatchObject({ success: true });
+    expect((expressService as any).activeConfigurations[0].networkConfiguration).toEqual({
+      subnets: ['subnet-a', 'subnet-b'],
+      securityGroups: ['sg-workloads'],
+    });
     const mutationCount = calls.filter((name) => /^(Create|Update|Delete|Attach|Detach|Tag|Modify|Add|Remove)/.test(name)).length;
     await expect(adapter.observe(environment({
       provider: 'ecs',
       projectId,
       environmentId: projectId,
       services: { web: { serviceId } },
+      awsNetwork,
     }))).resolves.toMatchObject({
       projectExists: true,
       services: [{ name: 'web', externalId: serviceId, status: 'empty' }],
@@ -347,7 +631,9 @@ describe('EcsExpressAdapter lifecycle boundaries', () => {
     expect(clusterArn).toBeNull();
     expect(repository).toBeNull();
     expect(roles.size).toBe(0);
+    expect(workloadGroup).toBeNull();
     expect(calls.indexOf('DeleteClusterCommand')).toBeLessThan(calls.indexOf('DeleteRepositoryCommand'));
+    expect(calls.indexOf('DeleteClusterCommand')).toBeLessThan(calls.indexOf('DeleteSecurityGroupCommand'));
     expect(calls.indexOf('DeleteClusterCommand')).toBeLessThan(calls.indexOf('DeleteRoleCommand'));
   });
 });

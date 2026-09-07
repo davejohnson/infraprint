@@ -1,4 +1,4 @@
-import type { ToolEnvelope } from '../respond.js';
+import type { ToolEnvelope } from '../../application/results.js';
 import { expect } from 'vitest';
 
 export function parseToolEnvelope(result: unknown): ToolEnvelope {

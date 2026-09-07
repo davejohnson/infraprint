@@ -27,7 +27,7 @@ function makeService(name: string): Service {
 }
 
 describe('RailwayAdapter stale binding recovery', () => {
-  it('re-resolves stale service binding by name before variableCollectionUpsert', async () => {
+  it('refuses to re-resolve a stale environment binding by name before variableCollectionUpsert', async () => {
     const request = vi.fn()
       // listProjectEnvironments
       .mockResolvedValueOnce({
@@ -79,15 +79,11 @@ describe('RailwayAdapter stale binding recovery', () => {
 
     const receipt = await adapter.setEnvVars(env, makeService('web'), { DATABASE_URL: 'postgres://x' });
 
-    expect(receipt.success).toBe(true);
-    const upsertCall = request.mock.calls.find(([, vars]) => {
-      const payload = vars as Record<string, unknown> | undefined;
-      return Boolean(payload?.projectId && payload?.serviceId && payload?.environmentId && payload?.variables);
-    });
-    expect(upsertCall).toBeDefined();
-    const upsertVars = upsertCall?.[1] as Record<string, unknown>;
-    expect(upsertVars.serviceId).toBe('svc-new');
-    expect(upsertVars.environmentId).toBe('env-new');
+    expect(receipt.success).toBe(false);
+    expect(receipt.error).toContain('Bound Railway environment env-stale is absent');
+    expect(receipt.error).toContain('will not silently rebind');
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls.some(([query]) => String(query).includes('variableCollectionUpsert'))).toBe(false);
   });
 
   it('marks a bound project-level service as stale when it has no instance in the target environment', async () => {
@@ -115,6 +111,14 @@ describe('RailwayAdapter stale binding recovery', () => {
             edges: [{ node: { environmentId: 'env-production' } }],
           },
         },
+      })
+      // ensureServiceInstanceForEnvironment confirms it is still absent in staging.
+      .mockResolvedValueOnce({
+        service: {
+          serviceInstances: {
+            edges: [{ node: { environmentId: 'env-production' } }],
+          },
+        },
       });
 
     const adapter = new RailwayAdapter();
@@ -131,13 +135,14 @@ describe('RailwayAdapter stale binding recovery', () => {
     const receipt = await adapter.setEnvVars(env, makeService('web'), { DATABASE_URL: 'postgres://x' });
 
     expect(receipt.success).toBe(false);
-    expect(receipt.message).toContain('not found in Railway environment staging');
+    expect(receipt.message).toContain('missing an instance in environment staging');
     expect(receipt.data).toMatchObject({
-      staleBinding: true,
-      ignoredBoundServiceId: 'svc-prod-web',
+      phase: 'ensureServiceInstance',
+      serviceId: 'svc-prod-web',
       environmentId: 'env-staging',
     });
-    expect(request).toHaveBeenCalledTimes(3);
+    expect(request).toHaveBeenCalledTimes(4);
+    expect(request.mock.calls.some(([query]) => String(query).includes('variableCollectionUpsert'))).toBe(false);
   });
 
   it('stages variable updates without triggering a deployment when requested', async () => {

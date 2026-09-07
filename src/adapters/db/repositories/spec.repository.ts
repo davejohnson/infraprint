@@ -40,11 +40,14 @@ export class ProjectSpecRepository {
   }
 
   private mapRow(row: Record<string, unknown>): ProjectSpecRow {
-    let document: unknown = {};
+    let document: unknown;
     try {
-      document = JSON.parse(row.document as string);
+      document = JSON.parse(String(row.document));
     } catch {
-      console.warn(`[hypervibe] Corrupt JSON in project_specs.document (${row.id})`);
+      throw new Error(
+        `Cannot read project_specs.document at revision ${String(row.revision)}: persisted JSON is corrupt. `
+        + 'Hypervibe refuses to treat unreadable desired state as empty.'
+      );
     }
     return {
       id: row.id as string,

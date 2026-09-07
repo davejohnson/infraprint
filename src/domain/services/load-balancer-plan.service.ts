@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import { z } from 'zod';
+import { parse as parseDomain } from 'tldts';
 import { EnvironmentRepository } from '../../adapters/db/repositories/environment.repository.js';
 import type { Environment } from '../entities/environment.entity.js';
 import type { Project } from '../entities/project.entity.js';
@@ -138,6 +139,57 @@ function normalizedOrigins(origins: LoadBalancerOrigin[]): LoadBalancerOrigin[] 
   return [...origins].sort((left, right) => left.name.localeCompare(right.name));
 }
 
+function originsConfigHash(origins: LoadBalancerOrigin[]): string {
+  return createHash('sha256')
+    .update(JSON.stringify(normalizedOrigins(origins)))
+    .digest('hex');
+}
+
+function publicOriginHostname(value: string): string | undefined {
+  const hostname = value.trim().toLowerCase().replace(/\.+$/, '');
+  const domain = parseDomain(hostname, {
+    allowPrivateDomains: true,
+    detectSpecialUse: true,
+  });
+  return hostname
+    && value === hostname
+    && domain.hostname === hostname
+    && !domain.isIp
+    && !domain.isSpecialUse
+    && (domain.isIcann === true || domain.isPrivate === true)
+    ? hostname
+    : undefined;
+}
+
+function parseReviewedOrigins(value: unknown): LoadBalancerOrigin[] | null {
+  if (!Array.isArray(value) || value.length < 2) return null;
+  const origins: LoadBalancerOrigin[] = [];
+  for (const item of value) {
+    const record = asRecord(item);
+    if (
+      !record
+      || typeof record.name !== 'string'
+      || typeof record.address !== 'string'
+      || typeof record.hostHeader !== 'string'
+      || record.enabled !== true
+    ) return null;
+    const address = publicOriginHostname(record.address);
+    const hostHeader = publicOriginHostname(record.hostHeader);
+    if (!record.name || !address || hostHeader !== address) return null;
+    origins.push({
+      name: record.name,
+      address,
+      hostHeader,
+      enabled: true,
+    });
+  }
+  if (
+    new Set(origins.map((origin) => origin.name)).size !== origins.length
+    || new Set(origins.map((origin) => origin.address)).size !== origins.length
+  ) return null;
+  return normalizedOrigins(origins);
+}
+
 function poolMatches(actual: LoadBalancerPool, desired: Omit<LoadBalancerPool, 'id'>): boolean {
   return actual.name === desired.name
     && actual.monitorId === desired.monitorId
@@ -208,11 +260,21 @@ function originFromUrl(serviceName: string, url: string | undefined): LoadBalanc
   if (!url) return undefined;
   try {
     const parsed = new URL(url);
-    if (parsed.protocol !== 'https:' || !parsed.hostname) return undefined;
+    const hostname = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+    if (
+      parsed.protocol !== 'https:'
+      || !publicOriginHostname(hostname)
+      || parsed.username
+      || parsed.password
+      || (parsed.port && parsed.port !== '443')
+      || (parsed.pathname && parsed.pathname !== '/')
+      || parsed.search
+      || parsed.hash
+    ) return undefined;
     return {
       name: serviceName,
-      address: parsed.hostname.toLowerCase(),
-      hostHeader: parsed.hostname.toLowerCase(),
+      address: hostname,
+      hostHeader: hostname,
       enabled: true,
     };
   } catch {
@@ -224,7 +286,7 @@ function desiredOrigins(
   environmentSpec: EnvironmentSpec,
   environment: Environment | null,
   observed: ObservedState | null
-): { origins: LoadBalancerOrigin[]; missing: string[] } {
+): { origins: LoadBalancerOrigin[]; missing: string[]; duplicates: string[] } {
   const bindings = parseHostingBindings(environment);
   const origins: LoadBalancerOrigin[] = [];
   const missing: string[] = [];
@@ -234,7 +296,17 @@ function desiredOrigins(
     if (origin) origins.push(origin);
     else missing.push(serviceName);
   }
-  return { origins, missing };
+  const servicesByAddress = new Map<string, string[]>();
+  for (const origin of origins) {
+    const services = servicesByAddress.get(origin.address) ?? [];
+    services.push(origin.name);
+    servicesByAddress.set(origin.address, services);
+  }
+  const duplicates = [...servicesByAddress.values()]
+    .filter((services) => services.length > 1)
+    .flat()
+    .sort();
+  return { origins, missing, duplicates };
 }
 
 async function observeByIdentity<T>(params: {
@@ -328,6 +400,40 @@ export async function planLoadBalancer(params: {
     return planLoadBalancerDestroy({ adapter, binding, hostname });
   }
   if (!desired) return { actions, warnings, unmanaged };
+
+  // A monitor is harmless in isolation, but it is still a provider mutation
+  // authorized by this load-balancer declaration. Validate the entire origin
+  // boundary before planning any part of the topology so an invalid/private
+  // or not-yet-observed origin cannot create a monitor and leave partial,
+  // potentially billable infrastructure behind.
+  const originResolution = desiredOrigins(environmentSpec, environment, observed);
+  const serviceActionByName = new Map(params.serviceActions.map((serviceAction) => [serviceAction.resource.name, serviceAction]));
+  const unstableOrigins = desired.services.filter((serviceName) => {
+    const serviceAction = serviceActionByName.get(serviceName);
+    return serviceAction?.type === 'create' || serviceAction?.type === 'replace';
+  });
+  const unavailableOrigins = Array.from(new Set([
+    ...originResolution.missing,
+    ...originResolution.duplicates,
+    ...unstableOrigins,
+  ])).sort();
+  if (unavailableOrigins.length > 0) {
+    const duplicateOrigins = originResolution.duplicates.length > 0;
+    return {
+      actions: [blockedAction({
+        hostname,
+        provider,
+        reason: duplicateOrigins
+          ? `Load-balancer services must resolve to distinct public HTTPS origins: ${originResolution.duplicates.join(', ')}`
+          : `Cannot resolve stable public HTTPS origin URLs for services: ${unavailableOrigins.join(', ')}`,
+        blockedReason: duplicateOrigins
+          ? 'load_balancer_origin_url_duplicate'
+          : 'load_balancer_origin_url_missing_or_invalid',
+      })],
+      warnings,
+      unmanaged,
+    };
+  }
 
   const configHash = loadBalancerConfigHash(environmentSpec)!;
   const monitorName = externalResourceName(environmentName, hostname, 'monitor');
@@ -427,16 +533,6 @@ export async function planLoadBalancer(params: {
     },
   }));
 
-  const originResolution = desiredOrigins(environmentSpec, environment, observed);
-  const serviceActionByName = new Map(params.serviceActions.map((serviceAction) => [serviceAction.resource.name, serviceAction]));
-  const originIdentityMayChange = desired.services.some((serviceName) => {
-    const serviceAction = serviceActionByName.get(serviceName);
-    return serviceAction?.type === 'create' || serviceAction?.type === 'replace';
-  });
-  const unavailableOrigins = originResolution.missing.filter((serviceName) => {
-    const serviceAction = serviceActionByName.get(serviceName);
-    return !serviceAction || serviceAction.type === 'noop';
-  });
   const actualPool = poolObservation.resource;
   const desiredMonitorId = actualMonitor?.id ?? binding?.monitor?.id ?? '';
   const wantedPool: Omit<LoadBalancerPool, 'id'> = {
@@ -447,10 +543,7 @@ export async function planLoadBalancer(params: {
     steering: 'random',
   };
   const poolType: PlanAction['type'] = actualPool
-    ? unavailableOrigins.length === 0
-      && originResolution.missing.length === 0
-      && !originIdentityMayChange
-      && monitorType !== 'create'
+    ? monitorType !== 'create'
       && poolMatches(actualPool, wantedPool)
       ? 'noop'
       : 'update'
@@ -458,26 +551,25 @@ export async function planLoadBalancer(params: {
   const poolId = 'load-balancer:pool';
   actions.push(action({
     id: poolId,
-    type: unavailableOrigins.length > 0 ? 'update' : poolType,
+    type: poolType,
     hostname,
     provider,
     operation: LOAD_BALANCER_OPERATIONS.poolEnsure,
     verified: true,
-    reason: unavailableOrigins.length > 0
-      ? `Cannot resolve HTTPS origin URLs for services: ${unavailableOrigins.join(', ')}`
-      : poolType === 'noop'
+    reason: poolType === 'noop'
         ? 'Load-balancer origin pool is in sync'
         : poolType === 'create'
           ? 'Create the load-balancer origin pool'
           : 'Update the load-balancer origin pool',
     dependsOn: [monitorId, ...desired.services.map((serviceName) => `service:${serviceName}`)],
-    billable: unavailableOrigins.length === 0 && poolType !== 'noop',
+    billable: poolType !== 'noop',
     metadata: {
       ...metadata,
       externalName: poolName,
       services: desired.services,
+      origins: normalizedOrigins(originResolution.origins),
+      originsHash: originsConfigHash(originResolution.origins),
       ...(binding?.pool?.id ? { externalId: binding.pool.id } : {}),
-      ...(unavailableOrigins.length > 0 ? { blockedReason: 'load_balancer_origin_url_missing' } : {}),
     },
   }));
 
@@ -624,7 +716,9 @@ function persistBinding(environment: Environment, binding: LoadBalancerBinding |
 
 function currentOrigins(environmentSpec: EnvironmentSpec, environment: Environment): LoadBalancerOrigin[] | null {
   const resolved = desiredOrigins(environmentSpec, environment, null);
-  return resolved.missing.length === 0 ? resolved.origins : null;
+  return resolved.missing.length === 0 && resolved.duplicates.length === 0
+    ? resolved.origins
+    : null;
 }
 
 export async function applyLoadBalancerAction(params: {
@@ -643,6 +737,12 @@ export async function applyLoadBalancerAction(params: {
   const desired = params.environmentSpec.loadBalancer;
   const desiredHostname = params.environmentSpec.domain?.trim().replace(/\.$/, '').toLowerCase();
   const configHash = loadBalancerConfigHash(params.environmentSpec);
+  const accountId = typeof params.action.metadata?.accountId === 'string'
+    ? params.action.metadata.accountId
+    : '';
+  const zoneId = typeof params.action.metadata?.zoneId === 'string'
+    ? params.action.metadata.zoneId
+    : '';
   const ensureOperation = new Set<string>([
     LOAD_BALANCER_OPERATIONS.monitorEnsure,
     LOAD_BALANCER_OPERATIONS.poolEnsure,
@@ -672,6 +772,19 @@ export async function applyLoadBalancerAction(params: {
       : undefined;
   const ensureExternalNameMatches = expectedExternalName === undefined
     || params.action.metadata?.externalName === expectedExternalName;
+  const reviewedOrigins = operation === LOAD_BALANCER_OPERATIONS.poolEnsure
+    ? parseReviewedOrigins(params.action.metadata?.origins)
+    : null;
+  const liveOrigins = operation === LOAD_BALANCER_OPERATIONS.poolEnsure
+    ? currentOrigins(params.environmentSpec, environment)
+    : null;
+  const poolOriginsMatch = operation !== LOAD_BALANCER_OPERATIONS.poolEnsure
+    || Boolean(
+      reviewedOrigins
+      && liveOrigins
+      && params.action.metadata?.originsHash === originsConfigHash(reviewedOrigins)
+      && JSON.stringify(reviewedOrigins) === JSON.stringify(normalizedOrigins(liveOrigins))
+    );
   const identityMatches = params.action.resource.kind === 'load-balancer'
     && params.action.resource.name === hostname
     && (ensureOperation
@@ -679,10 +792,13 @@ export async function applyLoadBalancerAction(params: {
         && desired.provider === params.action.resource.provider
         && configHash === params.action.metadata?.configHash
         && ensureExternalIdMatches
-        && ensureExternalNameMatches)
+        && ensureExternalNameMatches
+        && poolOriginsMatch)
       : Boolean(!desired && binding
         && binding.hostname === hostname
         && binding.provider === params.action.resource.provider
+        && binding.accountId === accountId
+        && binding.zoneId === zoneId
         && binding.configHash === params.action.metadata?.configHash
         && params.action.metadata?.externalId));
   if (!identityMatches) {
@@ -711,8 +827,6 @@ export async function applyLoadBalancerAction(params: {
       error: `Plan targets ${params.action.resource.provider}, but the resolved adapter is ${adapter.name}.`,
     };
   }
-  const accountId = String(params.action.metadata?.accountId ?? '');
-  const zoneId = String(params.action.metadata?.zoneId ?? '');
   if (!accountId || !zoneId) {
     return { success: false, status: 'blocked', message: 'Load-balancer scope is missing', error: 'Re-run hv_plan.' };
   }
@@ -744,16 +858,25 @@ export async function applyLoadBalancerAction(params: {
         existingId
       );
       const next: LoadBalancerBinding = {
+        ...binding,
         provider: desired!.provider,
         hostname,
         accountId,
         zoneId,
         configHash: configHash!,
-        ...binding,
         monitor: { id: result.resource.id, name: externalName },
         updatedAt: new Date().toISOString(),
       };
       persistBinding(environment, next);
+      if (!result.verified) {
+        return {
+          success: false,
+          status: 'pending',
+          message: 'Cloud provider acknowledged the load-balancer monitor write, but exact convergence is not yet verified',
+          error: result.verificationError,
+          data: { externalId: result.resource.id, recoverableBindingRetained: true },
+        };
+      }
       return { success: true, message: `${result.created ? 'Created' : 'Updated'} load-balancer health monitor`, data: { externalId: result.resource.id } };
     }
 
@@ -761,8 +884,8 @@ export async function applyLoadBalancerAction(params: {
       if (!binding?.monitor?.id) {
         return { success: false, status: 'blocked', message: 'Load-balancer monitor binding is missing', error: 'Re-run hv_plan.' };
       }
-      const origins = currentOrigins(params.environmentSpec, environment);
-      if (!origins) {
+      const origins = liveOrigins;
+      if (!origins || !reviewedOrigins) {
         return { success: false, status: 'blocked', message: 'One or more load-balancer origins lack an HTTPS service URL', error: 'Deploy every declared public web service, then re-run hv_plan.' };
       }
       const externalName = String(params.action.metadata?.externalName ?? '');
@@ -780,7 +903,7 @@ export async function applyLoadBalancerAction(params: {
       const result = await adapter.ensurePool(accountId, {
         name: externalName,
         monitorId: binding.monitor.id,
-        origins,
+        origins: reviewedOrigins,
         enabled: true,
         steering: 'random',
       }, existingId);
@@ -790,7 +913,16 @@ export async function applyLoadBalancerAction(params: {
         pool: { id: result.resource.id, name: externalName },
         updatedAt: new Date().toISOString(),
       });
-      return { success: true, message: `${result.created ? 'Created' : 'Updated'} load-balancer origin pool`, data: { externalId: result.resource.id, origins: origins.map((origin) => origin.name) } };
+      if (!result.verified) {
+        return {
+          success: false,
+          status: 'pending',
+          message: 'Cloud provider acknowledged the load-balancer pool write, but exact convergence is not yet verified',
+          error: result.verificationError,
+          data: { externalId: result.resource.id, recoverableBindingRetained: true },
+        };
+      }
+      return { success: true, message: `${result.created ? 'Created' : 'Updated'} load-balancer origin pool`, data: { externalId: result.resource.id, origins: reviewedOrigins.map((origin) => origin.name) } };
     }
 
     if (operation === LOAD_BALANCER_OPERATIONS.ensure) {
@@ -822,6 +954,15 @@ export async function applyLoadBalancerAction(params: {
         loadBalancer: { id: result.resource.id },
         updatedAt: new Date().toISOString(),
       });
+      if (!result.verified) {
+        return {
+          success: false,
+          status: 'pending',
+          message: 'Cloud provider acknowledged the public load-balancer write, but exact convergence is not yet verified',
+          error: result.verificationError,
+          data: { externalId: result.resource.id, recoverableBindingRetained: true },
+        };
+      }
       return { success: true, message: `${result.created ? 'Created' : 'Updated'} public load balancer ${hostname}`, data: { externalId: result.resource.id, hostname } };
     }
 

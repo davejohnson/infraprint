@@ -123,7 +123,15 @@ export const AwsSecretsCredentialsSchema = z.object({
   secretAccessKey: z.string().optional(),
   /** Required for temporary STS credentials (adds X-Amz-Security-Token). */
   sessionToken: z.string().optional(),
-  // If not provided, uses default credential chain
+  // When explicit keys are omitted, the adapter resolves the AWS SDK default provider chain.
+}).superRefine((credentials, ctx) => {
+  if (Boolean(credentials.accessKeyId) !== Boolean(credentials.secretAccessKey)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'accessKeyId and secretAccessKey must be provided together',
+      path: credentials.accessKeyId ? ['secretAccessKey'] : ['accessKeyId'],
+    });
+  }
 });
 
 export const OnePasswordCredentialsSchema = z.object({

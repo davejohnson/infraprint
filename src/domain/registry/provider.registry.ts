@@ -3,10 +3,33 @@ import type { ProviderCiDeployMetadata } from '../ports/ci-deploy.port.js';
 import type { ProviderDatabaseRestoreDrillMetadata } from '../ports/database-restore-drill.port.js';
 import type { Project } from '../entities/project.entity.js';
 import type { Environment } from '../entities/environment.entity.js';
+import type { WorkloadKind } from '../entities/service.entity.js';
 import type { Receipt } from '../ports/provider.port.js';
 
 export type ProviderCategory = 'deployment' | 'dns' | 'email' | 'messaging' | 'payment' | 'database' | 'cache' | 'storage' | 'appstore' | 'ai';
-export type ProviderLifecycleCapability = 'hosting' | 'database' | 'cache' | 'storage';
+export type ProviderLifecycleCapability =
+  | 'hosting'
+  | 'database'
+  | 'cache'
+  | 'storage'
+  | 'queue'
+  | 'load-balancer';
+export type ProviderImplementationStatus = 'supported' | 'ready-for-live' | 'planned';
+
+export interface ProviderLiveEvidence {
+  /** ISO-8601 time at which the live lifecycle contract last passed. */
+  verifiedAt: string;
+  /** Non-secret repository path or HTTPS URL containing the live evidence. */
+  reference: string;
+}
+
+export interface ProviderCapabilityMaturity {
+  status: ProviderImplementationStatus;
+  /** Required for supported capabilities and omitted until live evidence exists. */
+  liveEvidence?: ProviderLiveEvidence;
+  /** Optional promotion blocker or other actionable maturity context. */
+  reason?: string;
+}
 
 export interface ProviderInspectionRequest {
   /** Provider connection/account/repository/domain scope. */
@@ -25,7 +48,7 @@ export interface ProviderInspectionRequest {
   project?: Pick<Project, 'id' | 'name'>;
   /** Logical Hypervibe environment context; never carries another provider's bindings. */
   environment?: Pick<Environment, 'id' | 'projectId' | 'name'>;
-  /** Sanitized binding belonging to the selected provider, when one was retained. */
+  /** Sanitized selected-provider or explicitly compatible hosting binding. */
   binding?: Record<string, unknown>;
   /** Logical services used only to recognize deterministic legacy resource names. */
   serviceNames?: string[];
@@ -100,10 +123,16 @@ export interface ProviderMetadata {
   };
   /** Existing provider connections whose authentication shape this adapter can reuse. */
   connectionAliases?: string[];
+  maturity?: {
+    /** Evidence status for each lifecycle slice implemented by this registration. */
+    lifecycle?: Partial<Record<ProviderLifecycleCapability, ProviderCapabilityMaturity>>;
+  };
   orchestration?: ProviderOrchestrationMetadata;
   lifecycle?: {
     /** Hosting lifecycle exists only when the provider is valid in environments.*.hosting. */
     hosting?: {
+      /** Workload kinds this adapter can reconcile through the complete hosting lifecycle. */
+      workloadKinds: readonly WorkloadKind[];
       /** Environment custom domains are either fully managed or explicitly unsupported. */
       customDomains: 'managed' | 'unsupported';
       /** Whether traffic DNS may be proxied or must remain directly resolvable. */
@@ -115,8 +144,35 @@ export interface ProviderMetadata {
     };
     /** Engines this provider can reconcile through its database adapter. */
     databaseEngines?: string[];
+    /**
+     * Hosting providers whose workloads can reach this database through the
+     * implemented networking contract. Omit only when connectivity is
+     * intentionally provider-independent.
+     */
+    databaseConnectivity?: {
+      compatibleHostingProviders: string[];
+    };
     /** Engines this provider can reconcile through its cache adapter. */
     cacheEngines?: string[];
+    /**
+     * Hosting providers whose workloads can reach this cache through the
+     * implemented networking contract. Omit only when connectivity is
+     * intentionally provider-independent.
+     */
+    cacheConnectivity?: {
+      compatibleHostingProviders: string[];
+    };
+    /** Queue backend reconciled through this provider's desired-state loop. */
+    queue?: {
+      backend: 'pubsub' | 'postgres';
+      /** Whether the provider owns external queue resources or only wiring. */
+      resources: 'managed' | 'application-managed';
+    };
+    /** Provider-managed edge load-balancer topology exposed by its adapter. */
+    loadBalancer?: {
+      topology: 'monitor-pool-balancer';
+      minimumOrigins: number;
+    };
     /** Declarative database resilience features implemented by the adapter. */
     databaseResilience?: {
       availabilityModes?: Array<'zonal' | 'regional'>;
@@ -185,7 +241,7 @@ export interface ProviderOrchestrationMetadata {
 
 export interface RegisteredProvider {
   metadata: ProviderMetadata;
-  factory: (credentials: unknown) => unknown;
+  factory: (credentials: unknown) => unknown | Promise<unknown>;
   /** Optional hook to install CLI tools or other dependencies when a connection is created. */
   ensureDependencies?: () => Promise<{ installed: string[]; errors: string[] }>;
   /** Optional provider-owned raw forensic reads used by hv_inspect. */
@@ -218,8 +274,125 @@ export class ProviderRegistry {
     if (this.providers.has(provider.metadata.name)) {
       throw new Error(`Provider "${provider.metadata.name}" is already registered`);
     }
+    this.assertCapabilityMaturity(provider);
     this.assertInspectionContract(provider);
     this.providers.set(provider.metadata.name, provider);
+  }
+
+  private declaredLifecycleCapabilities(provider: RegisteredProvider): ProviderLifecycleCapability[] {
+    const capabilities: ProviderLifecycleCapability[] = [];
+    if (
+      provider.metadata.category === 'deployment'
+      && provider.metadata.lifecycle?.hosting !== undefined
+    ) {
+      capabilities.push('hosting');
+    }
+    if (
+      (provider.metadata.lifecycle?.databaseEngines?.length ?? 0) > 0
+      && (
+        provider.metadata.category === 'database'
+        || typeof provider.derivedAdapters?.database === 'function'
+      )
+    ) {
+      capabilities.push('database');
+    }
+    if (
+      (provider.metadata.lifecycle?.cacheEngines?.length ?? 0) > 0
+      && (
+        provider.metadata.category === 'cache'
+        || typeof provider.derivedAdapters?.cache === 'function'
+      )
+    ) {
+      capabilities.push('cache');
+    }
+    if (
+      provider.metadata.category === 'storage'
+      || typeof provider.derivedAdapters?.storage === 'function'
+    ) {
+      capabilities.push('storage');
+    }
+    if (provider.metadata.lifecycle?.queue) {
+      capabilities.push('queue');
+    }
+    if (provider.metadata.lifecycle?.loadBalancer) {
+      capabilities.push('load-balancer');
+    }
+    return capabilities;
+  }
+
+  private assertCapabilityMaturity(provider: RegisteredProvider): void {
+    const declared = new Set(this.declaredLifecycleCapabilities(provider));
+    const maturity = provider.metadata.maturity?.lifecycle ?? {};
+    const hostingLifecycle = provider.metadata.lifecycle?.hosting;
+    if (hostingLifecycle) {
+      const workloadKinds = hostingLifecycle.workloadKinds;
+      const validKinds = new Set<WorkloadKind>(['web', 'worker', 'cron']);
+      if (
+        !Array.isArray(workloadKinds)
+        || workloadKinds.length === 0
+        || new Set(workloadKinds).size !== workloadKinds.length
+        || workloadKinds.some((kind) => !validKinds.has(kind))
+      ) {
+        throw new Error(
+          `Provider "${provider.metadata.name}" hosting workloadKinds must contain one or more unique supported workload kinds.`
+        );
+      }
+    }
+    const connectivity = [
+      ['database', provider.metadata.lifecycle?.databaseConnectivity],
+      ['cache', provider.metadata.lifecycle?.cacheConnectivity],
+    ] as const;
+    for (const [capability, contract] of connectivity) {
+      if (!contract) continue;
+      if (!declared.has(capability)) {
+        throw new Error(
+          `Provider "${provider.metadata.name}" declares ${capability} connectivity without a ${capability} lifecycle.`
+        );
+      }
+      const hosts = contract.compatibleHostingProviders;
+      if (
+        hosts.length === 0
+        || new Set(hosts).size !== hosts.length
+        || hosts.some((host) => !host.trim() || host !== host.trim())
+      ) {
+        throw new Error(
+          `Provider "${provider.metadata.name}" ${capability} connectivity must name one or more unique hosting providers.`
+        );
+      }
+    }
+    for (const capability of declared) {
+      const entry = maturity[capability];
+      if (!entry) {
+        throw new Error(
+          `Provider "${provider.metadata.name}" declares ${capability} lifecycle support without production maturity metadata.`
+        );
+      }
+      if (entry.reason !== undefined && !entry.reason.trim()) {
+        throw new Error(
+          `Provider "${provider.metadata.name}" has an empty maturity reason for ${capability}.`
+        );
+      }
+      if (entry.status === 'supported') {
+        const verifiedAt = entry.liveEvidence?.verifiedAt;
+        const reference = entry.liveEvidence?.reference;
+        if (
+          !verifiedAt
+          || !Number.isFinite(Date.parse(verifiedAt))
+          || !reference?.trim()
+        ) {
+          throw new Error(
+            `Provider "${provider.metadata.name}" cannot mark ${capability} supported without dated, non-secret liveEvidence.`
+          );
+        }
+      }
+    }
+    for (const capability of Object.keys(maturity) as ProviderLifecycleCapability[]) {
+      if (!declared.has(capability)) {
+        throw new Error(
+          `Provider "${provider.metadata.name}" declares ${capability} maturity without an implemented lifecycle capability.`
+        );
+      }
+    }
   }
 
   private assertInspectionContract(provider: RegisteredProvider): void {
@@ -255,6 +428,19 @@ export class ProviderRegistry {
         }
         if (new Set(contract.scopeKeys ?? []).size !== (contract.scopeKeys?.length ?? 0)) {
           throw new Error(`Provider "${provider.metadata.name}" inspection resource "${resource}" has duplicate provider scope keys.`);
+        }
+        if (contract.collectionKey !== undefined && (!contract.list || !contract.collectionKey.trim())) {
+          throw new Error(`Provider "${provider.metadata.name}" inspection resource "${resource}" has a collection key without a valid list contract.`);
+        }
+        const idAndNameExclusive = contract.mutuallyExclusive?.some((group) => (
+          group.includes('id') && group.includes('name')
+        ));
+        const canonicalCollection = ['database', 'cache', 'storage'].includes(resource);
+        if (contract.mode === 'provider-resource' && contract.list && idAndNameExclusive
+          && !canonicalCollection && !contract.collectionKey?.trim()) {
+          throw new Error(
+            `Provider "${provider.metadata.name}" inspection resource "${resource}" must declare a collection key so exact selector results can be validated.`
+          );
         }
       }
     }
@@ -428,12 +614,36 @@ export class ProviderRegistry {
       return exposesAdapter
         && (provider.metadata.lifecycle?.cacheEngines?.length ?? 0) > 0;
     }
-    return provider.metadata.category === 'storage'
-      || typeof provider.derivedAdapters?.storage === 'function';
+    if (capability === 'storage') {
+      return provider.metadata.category === 'storage'
+        || typeof provider.derivedAdapters?.storage === 'function';
+    }
+    if (capability === 'queue') {
+      return provider.metadata.lifecycle?.queue !== undefined;
+    }
+    return provider.metadata.lifecycle?.loadBalancer !== undefined;
   }
 
   namesFor(capability: ProviderLifecycleCapability): string[] {
     return this.names().filter((name) => this.supports(name, capability));
+  }
+
+  lifecycleMaturity(
+    name: string,
+    capability: ProviderLifecycleCapability
+  ): ProviderCapabilityMaturity | undefined {
+    if (!this.supports(name, capability)) return undefined;
+    return this.providers.get(name)?.metadata.maturity?.lifecycle?.[capability];
+  }
+
+  /** Planned capabilities remain discoverable/readable but cannot authorize mutation. */
+  supportsMutation(name: string, capability: ProviderLifecycleCapability): boolean {
+    const maturity = this.lifecycleMaturity(name, capability);
+    return maturity?.status === 'ready-for-live' || maturity?.status === 'supported';
+  }
+
+  namesForMutation(capability: ProviderLifecycleCapability): string[] {
+    return this.names().filter((name) => this.supportsMutation(name, capability));
   }
 
   supportsEngine(name: string, capability: 'database' | 'cache', engine: string): boolean {
@@ -443,6 +653,12 @@ export class ProviderRegistry {
       ? provider.metadata.lifecycle?.databaseEngines
       : provider.metadata.lifecycle?.cacheEngines;
     return Array.isArray(engines) && engines.includes(engine);
+  }
+
+  supportsWorkloadKind(name: string, workloadKind: WorkloadKind): boolean {
+    if (!this.supports(name, 'hosting')) return false;
+    return this.providers.get(name)?.metadata.lifecycle?.hosting?.workloadKinds
+      .includes(workloadKind) === true;
   }
 
   /**
@@ -466,12 +682,12 @@ export class ProviderRegistry {
   /**
    * Create an adapter instance for a provider
    */
-  createAdapter<T = unknown>(name: string, creds: unknown): T {
+  async createAdapter<T = unknown>(name: string, creds: unknown): Promise<T> {
     const provider = this.providers.get(name);
     if (!provider) {
       throw new Error(`Unknown provider: ${name}`);
     }
-    return provider.factory(creds) as T;
+    return await provider.factory(creds) as T;
   }
 
   /**

@@ -24,5 +24,5 @@ export interface CreateComponentInput {
   environmentId: string;
   type: ComponentType;
   bindings?: ComponentBindings;
-  externalId?: string;
+  externalId?: string | null;
 }

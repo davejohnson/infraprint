@@ -21,10 +21,12 @@ import { MemorystoreAdapter } from '../../adapters/providers/gcp/memorystore.ada
 import { CloudflareAdapter } from '../../adapters/providers/cloudflare/cloudflare.adapter.js';
 import { GitHubAdapter } from '../../adapters/providers/github/github.adapter.js';
 import { NeonAdapter } from '../../adapters/providers/neon/neon.adapter.js';
+import { AzurePostgresAdapter } from '../../adapters/providers/azure/azure-postgres.adapter.js';
 import type { ObservedService, ObservedState } from '../../domain/ports/observe.port.js';
 import { providerRegistry } from '../../domain/registry/provider.registry.js';
+import { adapterFactory } from '../../domain/services/adapter.factory.js';
 import { registerLifecycleTools } from '../lifecycle.tools.js';
-import { createToolContext } from '../context.js';
+import { createToolContext } from '../../application/context.js';
 import '../../application/providers.js';
 
 let tempDir: string;
@@ -229,7 +231,7 @@ describe('hv_inspect / hv_import', () => {
         },
       }],
     },
-    plugins: { edges: [{ node: { id: 'plug-1', name: 'Postgres' } }] },
+    plugins: { edges: [] },
   };
 
   function createRailwayConnection(verified = false) {
@@ -246,7 +248,6 @@ describe('hv_inspect / hv_import', () => {
     vi.spyOn(RailwayAdapter.prototype, 'disconnect').mockResolvedValue();
     vi.spyOn(RailwayAdapter.prototype, 'listProjects').mockResolvedValue([{ id: projectDetails.id, name: projectDetails.name }]);
     vi.spyOn(RailwayAdapter.prototype, 'getProjectDetails').mockResolvedValue(projectDetails);
-    vi.spyOn(RailwayAdapter.prototype, 'findProjectByName').mockResolvedValue({ id: projectDetails.id, name: projectDetails.name });
     vi.spyOn(RailwayAdapter.prototype, 'findProjectsByName').mockResolvedValue([{ id: projectDetails.id, name: projectDetails.name }]);
     vi.spyOn(RailwayAdapter.prototype, 'getServiceVariables').mockResolvedValue({ DATABASE_URL: 'postgres://x' });
   }
@@ -365,6 +366,36 @@ describe('hv_inspect / hv_import', () => {
         ]),
       }),
     ]));
+    expect(result.data.providers.find((entry: { provider: string }) => entry.provider === 'railway'))
+      .toMatchObject({
+        maturity: {
+          lifecycle: {
+            hosting: { status: 'ready-for-live' },
+            database: { status: 'ready-for-live' },
+            cache: { status: 'ready-for-live' },
+            storage: { status: 'ready-for-live' },
+            queue: {
+              status: 'ready-for-live',
+              reason: expect.any(String),
+            },
+          },
+        },
+        lifecycle: expect.objectContaining({
+          queue: { backend: 'postgres', resources: 'application-managed' },
+        }),
+      });
+    expect(result.data.providers.find((entry: { provider: string }) => entry.provider === 'memorystore'))
+      .toMatchObject({
+        maturity: {
+          lifecycle: {
+            cache: { status: 'ready-for-live', reason: expect.any(String) },
+          },
+        },
+      });
+    const vercel = result.data.providers.find((entry: { provider: string }) => entry.provider === 'vercel');
+    expect(vercel.inspectionModes
+      .filter((mode: { resource: string }) => mode.resource === 'environment')
+      .every((mode: { optional: string[] }) => !mode.optional.includes('region'))).toBe(true);
     expect(providerRegistry.namesFor('storage').sort()).toEqual(['azureblob', 'gcs', 'railway', 's3']);
     for (const provider of providerRegistry.namesFor('hosting')) {
       expect(providerRegistry.get(provider)?.inspection?.resources, provider)
@@ -571,12 +602,98 @@ describe('hv_inspect / hv_import', () => {
     await t.close();
   });
 
+  it('hv_inspect selects the resource-specific component in mixed database/cache environments regardless of insertion order', async () => {
+    const project = new ProjectRepository().create({ name: 'mixed-datastore-inspection' });
+    const first = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'database-first',
+      platformBindings: { provider: 'digitalocean', projectId: 'app-1' },
+    });
+    const second = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'cache-first',
+      platformBindings: { provider: 'digitalocean', projectId: 'app-2' },
+    });
+    const components = new ComponentRepository();
+    const firstDatabase = components.create({
+      environmentId: first.id,
+      type: 'postgres',
+      externalId: 'db-first',
+      bindings: { provider: 'digitalocean' },
+    });
+    const firstCache = components.create({
+      environmentId: first.id,
+      type: 'redis',
+      externalId: 'cache-second',
+      bindings: { provider: 'digitalocean' },
+    });
+    const secondCache = components.create({
+      environmentId: second.id,
+      type: 'redis',
+      externalId: 'cache-first',
+      bindings: { provider: 'digitalocean' },
+    });
+    const secondDatabase = components.create({
+      environmentId: second.id,
+      type: 'postgres',
+      externalId: 'db-second',
+      bindings: { provider: 'digitalocean' },
+    });
+    const observeDatabase = vi.fn(async (_environment, component) => ({
+      provider: 'digitalocean', engine: 'postgres', externalId: component.externalId,
+      providerScope: { accountUuid: 'account-1' }, status: 'running',
+    }));
+    const observeCache = vi.fn(async (_environment, component) => ({
+      provider: 'digitalocean', engine: 'redis', externalId: component.externalId,
+      providerScope: { accountUuid: 'account-1' }, status: 'running',
+    }));
+    vi.spyOn(adapterFactory, 'getProviderAdapter').mockResolvedValue({
+      success: true,
+      adapter: {
+        name: 'digitalocean',
+        observeDatabase,
+        observeCache,
+        disconnect: async () => {},
+      },
+    } as never);
+    const t = await makeClient();
+
+    await t.call('hv_inspect', {
+      provider: 'digitalocean', project: project.name, env: first.name, resource: 'cache',
+    });
+    await t.call('hv_inspect', {
+      provider: 'digitalocean', project: project.name, env: second.name, resource: 'database',
+    });
+
+    expect(observeCache).toHaveBeenCalledWith(first, expect.objectContaining({ id: firstCache.id }), expect.anything());
+    expect(observeDatabase).toHaveBeenCalledWith(second, expect.objectContaining({ id: secondDatabase.id }), expect.anything());
+    expect(observeCache).not.toHaveBeenCalledWith(first, expect.objectContaining({ id: firstDatabase.id }), expect.anything());
+    expect(observeDatabase).not.toHaveBeenCalledWith(second, expect.objectContaining({ id: secondCache.id }), expect.anything());
+    await t.close();
+  });
+
   it('hv_import confirmation-gates one exact scoped retained database cleanup identity', async () => {
     const project = new ProjectRepository().create({ name: 'retained-database-app' });
     const environment = new EnvironmentRepository().create({
       projectId: project.id,
       name: 'production',
       platformBindings: { provider: 'railway' },
+    });
+    const unresolved = new ComponentRepository().create({
+      environmentId: environment.id,
+      type: 'postgres',
+      externalId: null,
+      bindings: {
+        provider: 'cloudsql',
+        providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+        provisioningIncomplete: true,
+        unresolvedMutation: {
+          resourceKind: 'database',
+          operation: 'create',
+          resourceName: 'legacy-production-db',
+          providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+        },
+      },
     });
     const connections = new ConnectionRepository();
     const connection = connections.create({
@@ -622,6 +739,207 @@ describe('hv_inspect / hv_import', () => {
       name: 'legacy-production-db',
       providerScope: { projectId: 'gcp-project', region: 'us-west1' },
     });
+    expect(new ComponentRepository().findById(unresolved.id)).toMatchObject({
+      externalId: null,
+      bindings: { provisioningIncomplete: true },
+    });
+    await t.close();
+  });
+
+  it('hv_import refuses to retarget an unresolved database marker to a different inspected scope', async () => {
+    const project = new ProjectRepository().create({ name: 'unresolved-database-scope-app' });
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'production',
+      platformBindings: { provider: 'railway' },
+    });
+    new ComponentRepository().create({
+      environmentId: environment.id,
+      type: 'postgres',
+      externalId: null,
+      bindings: {
+        provider: 'cloudsql',
+        providerScope: { projectId: 'gcp-project', region: 'us-central1' },
+        provisioningIncomplete: true,
+        unresolvedMutation: {
+          resourceKind: 'database',
+          operation: 'create',
+          resourceName: 'production-postgres',
+          providerScope: { projectId: 'gcp-project', region: 'us-central1' },
+        },
+      },
+    });
+    const connections = new ConnectionRepository();
+    const connection = connections.create({
+      provider: 'cloudsql',
+      credentialsEncrypted: getSecretStore().encryptObject({ projectId: 'gcp-project', credentials: '{}' }),
+    });
+    connections.updateStatus(connection.id, 'verified');
+    vi.spyOn(CloudSqlAdapter.prototype, 'connect').mockResolvedValue();
+    vi.spyOn(CloudSqlAdapter.prototype, 'disconnect').mockResolvedValue();
+    vi.spyOn(CloudSqlAdapter.prototype, 'inspectDatabaseResources').mockResolvedValue({
+      observation: 'present',
+      resource: 'database',
+      project: { id: 'gcp-project' },
+      databases: [{
+        id: 'candidate-db',
+        name: 'production-postgres',
+        engine: 'postgres',
+        providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+      }],
+      truncated: false,
+      partial: false,
+    });
+    const t = await makeClient();
+
+    const result = await t.call('hv_import', {
+      provider: 'cloudsql',
+      mode: 'retained-database-cleanup',
+      project: project.name,
+      env: environment.name,
+      id: 'candidate-db',
+      confirm: true,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('VALIDATION');
+    expect(result.error.message).toContain('does not exactly match the unresolved');
+    expect(new EnvironmentRepository().findById(environment.id)!.platformBindings.previousDatabase)
+      .toBeUndefined();
+    await t.close();
+  });
+
+  it('hv_import confirmation-gates one exact scoped retained cache cleanup identity', async () => {
+    const project = new ProjectRepository().create({ name: 'retained-cache-app' });
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'production',
+      platformBindings: { provider: 'cloudrun' },
+    });
+    const unresolved = new ComponentRepository().create({
+      environmentId: environment.id,
+      type: 'redis',
+      externalId: null,
+      bindings: {
+        provider: 'memorystore',
+        providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+        provisioningIncomplete: true,
+        unresolvedMutation: {
+          resourceKind: 'cache',
+          operation: 'create',
+          resourceName: 'legacy-production-cache',
+          providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+        },
+      },
+    });
+    const connections = new ConnectionRepository();
+    const connection = connections.create({
+      provider: 'memorystore',
+      credentialsEncrypted: getSecretStore().encryptObject({ projectId: 'gcp-project', credentials: '{}' }),
+    });
+    connections.updateStatus(connection.id, 'verified');
+    vi.spyOn(MemorystoreAdapter.prototype, 'connect').mockResolvedValue();
+    vi.spyOn(MemorystoreAdapter.prototype, 'disconnect').mockResolvedValue();
+    vi.spyOn(MemorystoreAdapter.prototype, 'inspectCacheResources').mockResolvedValue({
+      observation: 'present',
+      resource: 'cache',
+      caches: [{
+        id: 'legacy-production-cache-id',
+        name: 'legacy-production-cache',
+        engine: 'redis',
+        providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+      }],
+      truncated: false,
+      partial: false,
+    });
+    const t = await makeClient();
+    const input = {
+      provider: 'memorystore',
+      mode: 'retained-cache-cleanup',
+      project: project.name,
+      env: environment.name,
+      id: 'legacy-production-cache-id',
+    };
+
+    const preview = await t.call('hv_import', input);
+    expect(preview.ok).toBe(false);
+    expect(preview.error.code).toBe('CONFIRM_REQUIRED');
+    expect(new EnvironmentRepository().findById(environment.id)!.platformBindings.previousCache).toBeUndefined();
+
+    const retained = await t.call('hv_import', { ...input, confirm: true });
+    expect(retained.ok).toBe(true);
+    expect(new EnvironmentRepository().findById(environment.id)!.platformBindings.previousCache).toEqual({
+      provider: 'memorystore',
+      externalId: 'legacy-production-cache-id',
+      engine: 'redis',
+      providerEngine: 'redis',
+      name: 'legacy-production-cache',
+      providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+    });
+    expect(new ComponentRepository().findById(unresolved.id)).toMatchObject({
+      externalId: null,
+      bindings: { provisioningIncomplete: true },
+    });
+    await t.close();
+  });
+
+  it('hv_import refuses to retarget an unresolved cache marker to a different inspected scope', async () => {
+    const project = new ProjectRepository().create({ name: 'unresolved-cache-scope-app' });
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'production',
+      platformBindings: { provider: 'cloudrun' },
+    });
+    new ComponentRepository().create({
+      environmentId: environment.id,
+      type: 'redis',
+      externalId: null,
+      bindings: {
+        provider: 'memorystore',
+        providerScope: { projectId: 'gcp-project', region: 'us-central1' },
+        provisioningIncomplete: true,
+        unresolvedMutation: {
+          resourceKind: 'cache',
+          operation: 'create',
+          resourceName: 'production-cache',
+          providerScope: { projectId: 'gcp-project', region: 'us-central1' },
+        },
+      },
+    });
+    const connections = new ConnectionRepository();
+    const connection = connections.create({
+      provider: 'memorystore',
+      credentialsEncrypted: getSecretStore().encryptObject({ projectId: 'gcp-project', credentials: '{}' }),
+    });
+    connections.updateStatus(connection.id, 'verified');
+    vi.spyOn(MemorystoreAdapter.prototype, 'connect').mockResolvedValue();
+    vi.spyOn(MemorystoreAdapter.prototype, 'disconnect').mockResolvedValue();
+    vi.spyOn(MemorystoreAdapter.prototype, 'inspectCacheResources').mockResolvedValue({
+      observation: 'present',
+      resource: 'cache',
+      caches: [{
+        id: 'candidate-cache',
+        name: 'production-cache',
+        engine: 'redis',
+        providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+      }],
+      truncated: false,
+      partial: false,
+    });
+    const t = await makeClient();
+
+    const result = await t.call('hv_import', {
+      provider: 'memorystore',
+      mode: 'retained-cache-cleanup',
+      project: project.name,
+      env: environment.name,
+      id: 'candidate-cache',
+      confirm: true,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(['NOT_FOUND', 'VALIDATION']).toContain(result.error.code);
+    expect(new EnvironmentRepository().findById(environment.id)!.platformBindings.previousCache).toBeUndefined();
     await t.close();
   });
 
@@ -727,6 +1045,146 @@ describe('hv_inspect / hv_import', () => {
     await t.close();
   });
 
+  it('hv_inspect passes only a sanitized compatible hosting scope to Azure database inventory', async () => {
+    const subscriptionId = '22222222-2222-4222-8222-222222222222';
+    const resourceGroupId = `/subscriptions/${subscriptionId}/resourceGroups/hv-inspect-production`;
+    const environmentId = `${resourceGroupId}/providers/Microsoft.App/managedEnvironments/hv-inspect`;
+    const project = new ProjectRepository().create({ name: 'azure-database-inventory-app' });
+    new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'production',
+      platformBindings: {
+        provider: 'azure-container-apps',
+        projectId: resourceGroupId,
+        environmentId,
+        services: {
+          web: {
+            serviceId: 'azure-web-id',
+            injectedSecret: 'must-never-cross-the-provider-boundary',
+          },
+        },
+        componentSecret: 'must-never-cross-the-provider-boundary',
+      },
+    });
+    const connections = new ConnectionRepository();
+    const connection = connections.create({
+      provider: 'azure-container-apps',
+      credentialsEncrypted: getSecretStore().encryptObject({
+        tenantId: '11111111-1111-4111-8111-111111111111',
+        subscriptionId,
+        clientId: '33333333-3333-4333-8333-333333333333',
+        clientSecret: 'azure-secret-never-output',
+      }),
+    });
+    connections.updateStatus(connection.id, 'verified');
+    vi.spyOn(AzurePostgresAdapter.prototype, 'connect').mockResolvedValue();
+    vi.spyOn(AzurePostgresAdapter.prototype, 'disconnect').mockResolvedValue();
+    const inspect = vi.spyOn(
+      AzurePostgresAdapter.prototype,
+      'inspectDatabaseResources'
+    ).mockResolvedValue({
+      observation: 'present',
+      resource: 'database',
+      databases: [{
+        id: `${resourceGroupId}/providers/Microsoft.DBforPostgreSQL/flexibleServers/selected-db`,
+        name: 'selected-db',
+        engine: 'postgres',
+        providerScope: { subscriptionId, resourceGroup: 'hv-inspect-production' },
+      }],
+      truncated: false,
+      partial: false,
+    });
+    const t = await makeClient();
+
+    const result = await t.call('hv_inspect', {
+      provider: 'azure-postgres',
+      project: project.name,
+      env: 'production',
+      resource: 'database',
+      name: 'selected-db',
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({
+      provider: 'azure-postgres',
+      mode: 'database',
+      binding: 'missing',
+      inventory: { databases: [{ name: 'selected-db' }] },
+    });
+    expect(inspect).toHaveBeenCalledWith(expect.objectContaining({
+      resource: 'database',
+      name: 'selected-db',
+      binding: {
+        provider: 'azure-container-apps',
+        projectId: resourceGroupId,
+        environmentId,
+      },
+    }));
+    const forwardedRequest = inspect.mock.calls[0]![0];
+    expect(JSON.stringify(forwardedRequest)).not.toContain('must-never-cross-the-provider-boundary');
+    expect(forwardedRequest.binding).not.toHaveProperty('services');
+
+    const defaultResult = await t.call('hv_inspect', {
+      provider: 'azure-postgres',
+      project: project.name,
+      env: 'production',
+    });
+    expect(defaultResult.ok).toBe(true);
+    expect(inspect).toHaveBeenLastCalledWith(expect.objectContaining({
+      resource: 'database',
+      binding: {
+        provider: 'azure-container-apps',
+        projectId: resourceGroupId,
+        environmentId,
+      },
+    }));
+    await t.close();
+  });
+
+  it('hv_inspect does not pass an incompatible hosting binding to a datastore provider', async () => {
+    const project = new ProjectRepository().create({ name: 'incompatible-database-inventory-app' });
+    new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'production',
+      platformBindings: {
+        provider: 'azure-container-apps',
+        projectId: '/subscriptions/sub/resourceGroups/unrelated',
+        environmentId: '/subscriptions/sub/resourceGroups/unrelated/providers/Microsoft.App/managedEnvironments/app',
+        services: { web: { serviceId: 'azure-web-id' } },
+      },
+    });
+    const connections = new ConnectionRepository();
+    const connection = connections.create({
+      provider: 'neon',
+      credentialsEncrypted: getSecretStore().encryptObject({ apiKey: 'neon-token' }),
+    });
+    connections.updateStatus(connection.id, 'verified');
+    vi.spyOn(NeonAdapter.prototype, 'connect').mockResolvedValue();
+    vi.spyOn(NeonAdapter.prototype, 'disconnect').mockResolvedValue();
+    const inspect = vi.spyOn(NeonAdapter.prototype, 'inspectDatabaseResources').mockResolvedValue({
+      observation: 'absent',
+      resource: 'database',
+      databases: [],
+      truncated: false,
+      partial: false,
+    });
+    const t = await makeClient();
+
+    const result = await t.call('hv_inspect', {
+      provider: 'neon',
+      project: project.name,
+      env: 'production',
+      resource: 'database',
+      name: 'selected-db',
+    });
+
+    expect(result.ok).toBe(true);
+    expect(inspect).toHaveBeenCalledWith(expect.not.objectContaining({
+      binding: expect.anything(),
+    }));
+    await t.close();
+  });
+
   it('hv_inspect uses provider-scoped forensics instead of passing a current-provider binding to an abandoned provider', async () => {
     const project = new ProjectRepository().create({ name: 'migrated-inspect-app' });
     new EnvironmentRepository().create({
@@ -793,6 +1251,49 @@ describe('hv_inspect / hv_import', () => {
     }));
     expect(observe).not.toHaveBeenCalled();
     expect(configureTarget).toHaveBeenCalledWith({ region: 'europe-west1' });
+    await t.close();
+  });
+
+  it('hv_inspect rejects an over-limit environment-forensics collection', async () => {
+    const project = new ProjectRepository().create({ name: 'bounded-forensics-app' });
+    new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'production',
+      platformBindings: { provider: 'railway' },
+    });
+    const connection = new ConnectionRepository().create({
+      provider: 'cloudrun',
+      credentialsEncrypted: getSecretStore().encryptObject({
+        projectId: 'gcp-project',
+        credentials: '{}',
+      }),
+    });
+    new ConnectionRepository().updateStatus(connection.id, 'verified');
+    vi.spyOn(CloudRunAdapter.prototype, 'connect').mockResolvedValue();
+    vi.spyOn(CloudRunAdapter.prototype, 'disconnect').mockResolvedValue();
+    vi.spyOn(CloudRunAdapter.prototype as any, 'inspectEnvironmentResources').mockResolvedValue({
+      observation: 'present',
+      resource: 'environment',
+      services: [
+        { id: 'service-1', name: 'one' },
+        { id: 'service-2', name: 'two' },
+      ],
+    });
+    const t = await makeClient();
+
+    const result = await t.call('hv_inspect', {
+      provider: 'cloudrun',
+      project: project.name,
+      env: 'production',
+      limit: 1,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatchObject({
+      code: 'PROVIDER_ERROR',
+      details: { resource: 'environment', collectionKey: 'services' },
+    });
+    expect(result.error.message).toContain('above limit 1');
     await t.close();
   });
 
@@ -957,6 +1458,28 @@ describe('hv_inspect / hv_import', () => {
     expect(untypedSelector.error.code).toBe('VALIDATION');
     expect(untypedSelector.error.details.invalid).toEqual(['id']);
     expect(untypedSelector.hint).toContain('provider, project, and env');
+
+    const ignoredDatabaseRegion = await t.call('hv_inspect', {
+      provider: 'railway',
+      project: project.name,
+      env: 'staging',
+      resource: 'database',
+      region: 'us-west1',
+    });
+    expect(ignoredDatabaseRegion.ok).toBe(false);
+    expect(ignoredDatabaseRegion.error.code).toBe('VALIDATION');
+    expect(ignoredDatabaseRegion.error.details).toMatchObject({
+      invalid: ['region'],
+      suggestedCall: {
+        command: 'hv_inspect',
+        input: {
+          provider: 'railway',
+          project: project.name,
+          env: 'staging',
+          resource: 'database',
+        },
+      },
+    });
 
     const mixedModes = await t.call('hv_inspect', {
       provider: 'railway',
@@ -1142,7 +1665,7 @@ describe('hv_inspect / hv_import', () => {
     const result = await t.call('hv_inspect', { provider: 'railway' });
     expect(result.ok).toBe(true);
     expect(result.data.projects).toEqual([
-      { name: 'demo-app', railwayId: 'rp-1', environmentCount: 1, serviceCount: 1 },
+      { id: 'rp-1', name: 'demo-app', railwayId: 'rp-1', environmentCount: 1, serviceCount: 1 },
     ]);
     await t.close();
   });
@@ -1159,7 +1682,7 @@ describe('hv_inspect / hv_import', () => {
     expect(result.data.autoDetected).toEqual({ production: 'production' });
     expect(result.data.needsMapping).toEqual([]);
     expect(result.data.envVarNames).toEqual(['DATABASE_URL']);
-    expect(result.data.components).toEqual([{ type: 'postgres', id: 'plug-1', name: 'Postgres' }]);
+    expect(result.data.components).toEqual([]);
     expect(new ProjectRepository().findByName('demo-app')).toBeNull();
     await t.close();
   });
@@ -1191,6 +1714,37 @@ describe('hv_inspect / hv_import', () => {
     expect(result.ok).toBe(false);
     expect(result.error.code).toBe('CONFIRM_REQUIRED');
     expect(result.error.details.project).toEqual({ name: 'demo-app', id: 'rp-1' });
+    expect(new ProjectRepository().findByName('demo-app')).toBeNull();
+    await t.close();
+  });
+
+  it('refuses to adopt legacy Railway plugins without a verified teardown contract', async () => {
+    createRailwayConnection();
+    mockAdapter({
+      ...details,
+      plugins: {
+        edges: [
+          { node: { id: 'plugin-postgres', name: 'Postgres' } },
+          { node: { id: 'plugin-redis', name: 'Redis' } },
+        ],
+      },
+    });
+    const t = await makeClient();
+
+    const result = await t.call('hv_import', {
+      provider: 'railway',
+      name: 'demo-app',
+      environmentMappings: { production: 'production' },
+      confirm: true,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('UNSUPPORTED');
+    expect(result.error.details.components).toEqual([
+      { id: 'plugin-postgres', name: 'Postgres', type: 'postgres' },
+      { id: 'plugin-redis', name: 'Redis', type: 'redis' },
+    ]);
+    expect(result.hint).toContain('service-backed');
     expect(new ProjectRepository().findByName('demo-app')).toBeNull();
     await t.close();
   });
@@ -1227,14 +1781,7 @@ describe('hv_inspect / hv_import', () => {
     });
 
     expect(new ServiceRepository().findByProjectAndName(project!.id, 'web')).not.toBeNull();
-    const component = new ComponentRepository().findByEnvironmentAndType(env!.id, 'postgres');
-    expect(component?.bindings).toMatchObject({
-      provider: 'railway',
-      projectId: 'rp-1',
-      environmentId: 'env-prod',
-      resourceKind: 'plugin',
-      pluginName: 'Postgres',
-    });
+    expect(new ComponentRepository().findByEnvironmentAndType(env!.id, 'postgres')).toBeNull();
     await t.close();
   });
 
@@ -1363,6 +1910,7 @@ describe('hv_inspect / hv_import', () => {
         provider: 'railway',
         projectId: 'rp-1',
         environmentId: 'env-prod',
+        providerScope: { projectId: 'rp-1' },
         resourceKind: 'service',
         serviceId: 'svc-postgres',
         pluginName: 'Postgres',
@@ -1503,6 +2051,7 @@ describe('hv_inspect / hv_import', () => {
           provider: 'railway',
           engine: 'postgres',
           externalId: 'plugin-postgres',
+          providerScope: { projectId: 'rp-legacy' },
           name: 'Postgres',
           status: 'unknown',
         }],
@@ -1510,6 +2059,7 @@ describe('hv_inspect / hv_import', () => {
           provider: 'railway',
           engine: 'redis',
           externalId: 'plugin-redis',
+          providerScope: { projectId: 'rp-legacy' },
           name: 'Redis',
           status: 'unknown',
         }],
@@ -1527,6 +2077,7 @@ describe('hv_inspect / hv_import', () => {
       } satisfies ObservedState,
       expectedServices: ['cron', 'web', 'worker'],
       expectedStorage: [],
+      expectedUnsupported: true,
     },
     {
       label: 'service-backed datastores and explicitly mapped object storage',
@@ -1583,20 +2134,23 @@ describe('hv_inspect / hv_import', () => {
           provider: 'railway',
           engine: 'postgres',
           externalId: 'svc-postgres',
+          providerScope: { projectId: 'rp-service-backed' },
           name: 'Postgres',
-          status: 'unknown',
+          status: 'running',
         }],
         caches: [{
           provider: 'railway',
           engine: 'redis',
           externalId: 'svc-redis',
+          providerScope: { projectId: 'rp-service-backed', environmentId: 'env-prod' },
           name: 'redis-cache',
-          status: 'unknown',
+          status: 'running',
         }],
         storage: [{
           provider: 'railway',
           kind: 'object',
           externalId: 'bucket-uploads',
+          instanceScope: { projectId: 'rp-service-backed', environmentId: 'env-prod' },
           name: 'provider-upload-bucket',
           region: 'sjc',
           status: 'ready',
@@ -1614,6 +2168,7 @@ describe('hv_inspect / hv_import', () => {
       } satisfies ObservedState,
       expectedServices: ['web'],
       expectedStorage: ['uploads'],
+      expectedUnsupported: false,
     },
   ])('inspect → import → status is mutation-safe for $label', async ({
     projectDetails,
@@ -1621,6 +2176,7 @@ describe('hv_inspect / hv_import', () => {
     observed,
     expectedServices,
     expectedStorage,
+    expectedUnsupported,
   }) => {
     createRailwayConnection(true);
     mockAdapter(projectDetails);
@@ -1641,6 +2197,14 @@ describe('hv_inspect / hv_import', () => {
       ...importArgs,
       confirm: true,
     });
+    if (expectedUnsupported) {
+      expect(imported.ok).toBe(false);
+      expect(imported.error.code).toBe('UNSUPPORTED');
+      expect(new ProjectRepository().findByName(projectDetails.name)).toBeNull();
+      expect(observe).not.toHaveBeenCalled();
+      await t.close();
+      return;
+    }
     expect(imported.ok).toBe(true);
     expect(imported.data.specRevision).toBe(1);
     expect(Object.keys(imported.data.spec.environments.production.services).sort()).toEqual(expectedServices);
@@ -1665,8 +2229,9 @@ describe('hv_inspect / hv_import', () => {
     expect(missingCacheStatus.data.drift).toEqual(expect.arrayContaining([
       expect.objectContaining({
         id: 'cache:railway',
-        type: 'create',
+        type: 'update',
         resource: expect.objectContaining({ kind: 'cache', provider: 'railway' }),
+        metadata: expect.objectContaining({ blockedReason: 'cache_binding_identity_mismatch' }),
       }),
     ]));
 

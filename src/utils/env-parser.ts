@@ -84,14 +84,3 @@ export function extractKeysFromEnvFile(
 
   return result;
 }
-
-/**
- * Mask a secret key value for display.
- * Shows first few chars and last few chars, masks the middle.
- */
-export function maskSecretValue(value: string, showStart = 7, showEnd = 4): string {
-  if (value.length <= showStart + showEnd + 3) {
-    return '*'.repeat(value.length);
-  }
-  return value.substring(0, showStart) + '...' + value.substring(value.length - showEnd);
-}

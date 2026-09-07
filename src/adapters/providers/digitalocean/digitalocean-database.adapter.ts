@@ -6,6 +6,11 @@ import type {
   ProvisionableType,
   ProvisionResult,
 } from '../../../domain/ports/database.port.js';
+import {
+  createUnresolvedDatabaseMutation,
+  databaseCreateMayHaveCommitted,
+  parseUnresolvedDatabaseMutation,
+} from '../../../domain/ports/database.port.js';
 import type { ObservedDatabase } from '../../../domain/ports/observe.port.js';
 import type { Receipt, VerifyResult } from '../../../domain/ports/provider.port.js';
 import {
@@ -28,8 +33,8 @@ export class DigitalOceanDatabaseAdapter implements IDatabaseAdapter {
   readonly capabilities: DatabaseCapabilities = {
     supportedDatabases: ['postgres'],
     supportsPooling: false,
-    supportsReadReplicas: true,
-    supportsPointInTimeRecovery: true,
+    supportsReadReplicas: false,
+    supportsPointInTimeRecovery: false,
     serverlessOptimized: false,
   };
 
@@ -93,7 +98,11 @@ export class DigitalOceanDatabaseAdapter implements IDatabaseAdapter {
 
     const resourceName = options?.resourceName ?? `${environment.name}-postgres`;
     const databaseName = options?.databaseName?.trim() || 'app';
+    const requestedRegion = options?.region ?? this.credentials.region;
     let created: DigitalOceanDatabaseCluster | undefined;
+    let accountUuid: string | undefined;
+    let createMutationAttempted = false;
+    let unresolvedCreateOutcome = false;
 
     try {
       let matches: DigitalOceanDatabaseCluster[];
@@ -114,13 +123,33 @@ export class DigitalOceanDatabaseAdapter implements IDatabaseAdapter {
         ].join(' '));
       }
 
-      created = await this.client.createDatabaseCluster({
-        name: resourceName,
-        engine: 'pg',
-        version: this.credentials.postgresVersion,
-        region: options?.region ?? this.credentials.region,
-        size: options?.size ?? this.credentials.databaseSize,
-      });
+      // Resolve the durable account scope before the billable create so an
+      // acknowledged resource can always be retained safely if readiness or
+      // database initialization later fails.
+      accountUuid = await this.client.getAccountUuid();
+
+      createMutationAttempted = true;
+      try {
+        created = await this.client.createDatabaseCluster({
+          name: resourceName,
+          engine: 'pg',
+          version: this.credentials.postgresVersion,
+          region: requestedRegion,
+          size: options?.size ?? this.credentials.databaseSize,
+        });
+      } catch (error) {
+        unresolvedCreateOutcome = databaseCreateMayHaveCommitted(error);
+        throw error;
+      }
+      if (
+        created.name !== resourceName
+        || created.engine !== 'pg'
+        || (created.region && created.region !== requestedRegion)
+      ) {
+        throw new Error(
+          `DigitalOcean acknowledged database creation without the exact expected ${resourceName}/pg/${requestedRegion} identity.`
+        );
+      }
       const online = await this.client.waitForDatabaseOnline(created.id);
       await this.client.ensurePostgresDatabase(online.id, databaseName);
       const connectionUrl = this.connectionUrl(
@@ -129,7 +158,6 @@ export class DigitalOceanDatabaseAdapter implements IDatabaseAdapter {
         databaseName
       );
       const parsed = this.parseConnectionUrl(connectionUrl);
-      const accountUuid = await this.client.getAccountUuid();
       const component = this.component(
         environment,
         online,
@@ -166,22 +194,47 @@ export class DigitalOceanDatabaseAdapter implements IDatabaseAdapter {
         },
       };
     } catch (error) {
+      let recoveryError: string | undefined;
+      if (!created && unresolvedCreateOutcome) {
+        try {
+          created = await this.recoverCreatedCluster(resourceName) ?? undefined;
+        } catch (recoveryFailure) {
+          recoveryError = this.formatError(recoveryFailure);
+        }
+      }
+      const unresolvedComponent = !created && unresolvedCreateOutcome && accountUuid
+        ? this.unresolvedCreateComponent(
+            environment,
+            resourceName,
+            accountUuid,
+            requestedRegion,
+            databaseName
+          )
+        : undefined;
       return {
         component: created
-          ? this.partialComponent(environment, created, databaseName)
-          : this.emptyComponent(environment, type),
+          ? this.partialComponent(environment, created, databaseName, accountUuid!, requestedRegion)
+          : unresolvedComponent ?? this.emptyComponent(environment, type),
         receipt: {
           success: false,
           message: created
             ? 'DigitalOcean created the PostgreSQL cluster, but provisioning did not complete'
             : 'Failed to provision DigitalOcean PostgreSQL cluster',
-          error: this.formatError(error),
+          error: `${this.formatError(error)}${recoveryError
+            ? ` Exact-name recovery also failed: ${recoveryError}`
+            : ''}`,
           ...(created ? {
             data: {
               clusterId: created.id,
               engine: created.engine,
               region: created.region,
               status: created.status,
+            },
+          } : unresolvedComponent ? {
+            data: {
+              mutationAttempted: createMutationAttempted,
+              resourceCreated: 'unknown',
+              unresolvedCreateRetained: true,
             },
           } : {}),
         },
@@ -190,12 +243,13 @@ export class DigitalOceanDatabaseAdapter implements IDatabaseAdapter {
   }
 
   async getConnectionUrl(component: Component): Promise<string | null> {
+    if (!this.client || !component.externalId) {
+      return null;
+    }
+    await this.assertComponentScope(component);
     const stored = component.bindings.connectionString;
     if (typeof stored === 'string') {
       return stored;
-    }
-    if (!this.client || !component.externalId) {
-      return null;
     }
     const cluster = await this.client.getDatabaseCluster(component.externalId);
     if (!cluster) {
@@ -215,6 +269,7 @@ export class DigitalOceanDatabaseAdapter implements IDatabaseAdapter {
       return { success: false, message: 'No external ID for component' };
     }
     try {
+      await this.assertComponentScope(component);
       const result = await this.client.destroyDatabaseCluster(component.externalId);
       return {
         success: true,
@@ -239,6 +294,7 @@ export class DigitalOceanDatabaseAdapter implements IDatabaseAdapter {
       return { status: 'unknown' };
     }
     try {
+      await this.assertComponentScope(component);
       const cluster = await this.client.getDatabaseCluster(component.externalId);
       if (!cluster) {
         return {
@@ -263,13 +319,20 @@ export class DigitalOceanDatabaseAdapter implements IDatabaseAdapter {
     if (!this.client) {
       throw new Error('Not connected. Call connect() first.');
     }
+    if (component) await this.assertComponentScope(component);
+    const unresolved = parseUnresolvedDatabaseMutation(component?.bindings);
 
     let cluster: DigitalOceanDatabaseCluster | null;
     if (component?.externalId) {
       cluster = await this.client.getDatabaseCluster(component.externalId);
     } else {
-      const resourceName = options?.resourceName ?? `${environment.name}-postgres`;
-      const matches = await this.client.findDatabaseClustersByName(resourceName);
+      const resourceName = unresolved?.resourceName
+        ?? options?.resourceName
+        ?? `${environment.name}-postgres`;
+      const matches = (await this.client.findDatabaseClustersByName(resourceName))
+        .filter((candidate) => (
+          !unresolved || candidate.region === unresolved.providerScope.region
+        ));
       if (matches.length > 1) {
         throw new Error(
           `Multiple DigitalOcean database clusters match "${resourceName}": ${matches
@@ -318,7 +381,9 @@ export class DigitalOceanDatabaseAdapter implements IDatabaseAdapter {
   private partialComponent(
     environment: Environment,
     cluster: DigitalOceanDatabaseCluster,
-    database: string
+    database: string,
+    accountUuid: string,
+    requestedRegion: string
   ): Component {
     return {
       id: '',
@@ -327,6 +392,12 @@ export class DigitalOceanDatabaseAdapter implements IDatabaseAdapter {
       bindings: {
         provider: 'digitalocean',
         instanceId: cluster.id,
+        providerScope: {
+          accountUuid,
+          region: typeof cluster.region === 'string' && cluster.region.trim()
+            ? cluster.region.trim()
+            : requestedRegion,
+        },
         engine: cluster.engine,
         database,
       },
@@ -334,6 +405,57 @@ export class DigitalOceanDatabaseAdapter implements IDatabaseAdapter {
       createdAt: new Date(),
       updatedAt: new Date(),
     };
+  }
+
+  private unresolvedCreateComponent(
+    environment: Environment,
+    resourceName: string,
+    accountUuid: string,
+    region: string,
+    database: string
+  ): Component {
+    const providerScope = { accountUuid, region };
+    return {
+      id: '',
+      environmentId: environment.id,
+      type: 'postgres',
+      bindings: {
+        provider: this.name,
+        providerScope,
+        unresolvedMutation: createUnresolvedDatabaseMutation(resourceName, providerScope),
+        database,
+      },
+      externalId: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+  }
+
+  private async recoverCreatedCluster(
+    resourceName: string
+  ): Promise<DigitalOceanDatabaseCluster | null> {
+    if (!this.client) throw new Error('DigitalOcean adapter is not connected.');
+    const attempts = Math.max(
+      1,
+      Number(process.env.HYPERVIBE_DIGITALOCEAN_DATABASE_CREATE_RECOVERY_ATTEMPTS ?? 3) || 3
+    );
+    const delayMs = Math.max(
+      0,
+      Number(process.env.HYPERVIBE_DIGITALOCEAN_DATABASE_CREATE_RECOVERY_DELAY_MS ?? 1000) || 0
+    );
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const matches = await this.client.findDatabaseClustersByName(resourceName);
+      if (matches.length > 1) {
+        throw new Error(
+          `DigitalOcean returned multiple database clusters named ${resourceName} after an uncertain create; no identity was selected.`
+        );
+      }
+      if (matches.length === 1) return matches[0]!;
+      if (attempt < attempts && delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+    return null;
   }
 
   private component(
@@ -427,6 +549,30 @@ export class DigitalOceanDatabaseAdapter implements IDatabaseAdapter {
     if (['error', 'failed'].includes(normalized ?? '')) return 'error';
     if (normalized) return 'provisioning';
     return 'unknown';
+  }
+
+  private async assertComponentScope(component: Component): Promise<void> {
+    if (!this.client) {
+      throw new Error('DigitalOcean adapter is not connected.');
+    }
+    const rawScope = component.bindings.providerScope;
+    const scope = rawScope && typeof rawScope === 'object' && !Array.isArray(rawScope)
+      ? rawScope as Record<string, unknown>
+      : null;
+    const accountUuid = typeof scope?.accountUuid === 'string'
+      ? scope.accountUuid
+      : undefined;
+    if (!accountUuid) {
+      throw new Error(
+        `DigitalOcean database binding ${component.externalId ?? component.id} is missing its durable accountUuid provider scope; re-import or re-plan the database before using it.`
+      );
+    }
+    const connectedAccountUuid = await this.client.getAccountUuid();
+    if (accountUuid !== connectedAccountUuid) {
+      throw new Error(
+        `DigitalOcean database binding scope account ${accountUuid} does not match connected account ${connectedAccountUuid}.`
+      );
+    }
   }
 
   private formatError(error: unknown): string {

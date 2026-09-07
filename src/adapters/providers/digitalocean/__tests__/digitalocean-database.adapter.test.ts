@@ -26,6 +26,7 @@ function makeComponent(externalId = 'do-postgres-1'): Component {
     bindings: {
       provider: 'digitalocean',
       instanceId: externalId,
+      providerScope: { accountUuid: 'do-account-uuid' },
       database: 'app',
     },
     createdAt: new Date(),
@@ -37,6 +38,13 @@ function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function mutationCalls(fetchMock: ReturnType<typeof vi.fn>): unknown[][] {
+  return fetchMock.mock.calls.filter((call) => {
+    const init = call[1] as RequestInit | undefined;
+    return !['GET', 'HEAD'].includes(init?.method ?? 'GET');
   });
 }
 
@@ -52,11 +60,20 @@ async function connectedAdapter(): Promise<DigitalOceanDatabaseAdapter> {
   return adapter;
 }
 
+async function connectedContractAdapter(): Promise<DigitalOceanDatabaseAdapter> {
+  const adapter = await connectedAdapter();
+  const client = (adapter as unknown as {
+    client: { getAccountUuid(): Promise<string> };
+  }).client;
+  vi.spyOn(client, 'getAccountUuid').mockResolvedValue('do-account-uuid');
+  return adapter;
+}
+
 runMockDatabaseLifecycleContract({
   displayName: 'DigitalOcean',
   externalIds: ['do-postgres-1', 'do-postgres-2'],
   resourceName: 'invoice-perfect-production-postgres',
-  createAdapter: connectedAdapter,
+  createAdapter: connectedContractAdapter,
   makeEnvironment,
   makeComponent,
   isListRequest: (url, init) =>
@@ -220,6 +237,9 @@ describe('DigitalOceanDatabaseAdapter', () => {
     ) => {
       const url = new URL(String(input));
       const method = init?.method ?? 'GET';
+      if (url.pathname === '/v2/account' && method === 'GET') {
+        return jsonResponse({ account: { uuid: 'do-account-uuid' } });
+      }
       if (url.pathname === '/v2/databases' && method === 'GET') {
         return jsonResponse({ databases: [], links: {} });
       }
@@ -257,6 +277,10 @@ describe('DigitalOceanDatabaseAdapter', () => {
     expect(result.component.bindings).toMatchObject({
       provider: 'digitalocean',
       instanceId: 'do-pending',
+      providerScope: {
+        accountUuid: 'do-account-uuid',
+        region: 'sfo3',
+      },
       engine: 'pg',
     });
     expect(result.receipt.data).toMatchObject({
@@ -264,6 +288,199 @@ describe('DigitalOceanDatabaseAdapter', () => {
       status: 'creating',
     });
     expect(result.connectionUrl).toBeUndefined();
+  });
+
+  it('recovers a unique cluster when the create transport loses its response', async () => {
+    vi.stubEnv('HYPERVIBE_DIGITALOCEAN_DATABASE_CREATE_RECOVERY_ATTEMPTS', '2');
+    vi.stubEnv('HYPERVIBE_DIGITALOCEAN_DATABASE_CREATE_RECOVERY_DELAY_MS', '0');
+    let listReads = 0;
+    const recovered = {
+      id: 'do-recovered',
+      name: 'production-postgres',
+      engine: 'pg',
+      status: 'creating',
+      region: 'sfo3',
+      tags: ['hypervibe'],
+    };
+    const fetchMock = vi.fn(async (
+      input: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname === '/v2/account' && method === 'GET') {
+        return jsonResponse({ account: { uuid: 'do-account-uuid' } });
+      }
+      if (url.pathname === '/v2/databases' && method === 'GET') {
+        listReads += 1;
+        return jsonResponse({
+          databases: listReads < 3 ? [] : [recovered],
+          links: {},
+        });
+      }
+      if (url.pathname === '/v2/databases' && method === 'POST') {
+        throw new Error('connection closed after request transmission');
+      }
+      throw new Error(`unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connectedAdapter();
+
+    const result = await adapter.provision('postgres', makeEnvironment());
+
+    expect(result.receipt).toMatchObject({
+      success: false,
+      data: { clusterId: 'do-recovered', region: 'sfo3' },
+    });
+    expect(result.component).toMatchObject({
+      externalId: 'do-recovered',
+      bindings: {
+        provider: 'digitalocean',
+        providerScope: { accountUuid: 'do-account-uuid', region: 'sfo3' },
+      },
+    });
+    expect(fetchMock.mock.calls.filter(([, request]) => request?.method === 'POST'))
+      .toHaveLength(1);
+  });
+
+  it.each([
+    ['transport failure', () => { throw new Error('connection closed after request transmission'); }],
+    ['HTTP 408', () => jsonResponse({ message: 'request timed out' }, 408)],
+  ])('retains an unresolved create marker when %s remains invisible', async (_label, createResponse) => {
+    vi.stubEnv('HYPERVIBE_DIGITALOCEAN_DATABASE_CREATE_RECOVERY_ATTEMPTS', '1');
+    vi.stubEnv('HYPERVIBE_DIGITALOCEAN_DATABASE_CREATE_RECOVERY_DELAY_MS', '0');
+    let listReads = 0;
+    const fetchMock = vi.fn(async (
+      input: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname === '/v2/account' && method === 'GET') {
+        return jsonResponse({ account: { uuid: 'do-account-uuid' } });
+      }
+      if (url.pathname === '/v2/databases' && method === 'GET') {
+        listReads += 1;
+        return jsonResponse({ databases: [], links: {} });
+      }
+      if (url.pathname === '/v2/databases' && method === 'POST') {
+        return createResponse();
+      }
+      throw new Error(`unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connectedAdapter();
+
+    const result = await adapter.provision('postgres', makeEnvironment(), {
+      resourceName: 'production-postgres',
+    });
+
+    expect(result.receipt).toMatchObject({
+      success: false,
+      data: {
+        mutationAttempted: true,
+        resourceCreated: 'unknown',
+        unresolvedCreateRetained: true,
+      },
+    });
+    expect(result.component).toMatchObject({
+      externalId: null,
+      bindings: {
+        provider: 'digitalocean',
+        providerScope: { accountUuid: 'do-account-uuid', region: 'sfo3' },
+        unresolvedMutation: {
+          resourceKind: 'database',
+          operation: 'create',
+          resourceName: 'production-postgres',
+          providerScope: { accountUuid: 'do-account-uuid', region: 'sfo3' },
+        },
+      },
+    });
+    expect(listReads).toBe(2);
+    expect(fetchMock.mock.calls.filter(([, request]) => request?.method === 'POST'))
+      .toHaveLength(1);
+  });
+
+  it('does not retain an unresolved marker or retry observation after a definitive create rejection', async () => {
+    let listReads = 0;
+    const fetchMock = vi.fn(async (
+      input: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname === '/v2/account' && method === 'GET') {
+        return jsonResponse({ account: { uuid: 'do-account-uuid' } });
+      }
+      if (url.pathname === '/v2/databases' && method === 'GET') {
+        listReads += 1;
+        return jsonResponse({ databases: [], links: {} });
+      }
+      if (url.pathname === '/v2/databases' && method === 'POST') {
+        return jsonResponse({ message: 'invalid request' }, 422);
+      }
+      throw new Error(`unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connectedAdapter();
+
+    const result = await adapter.provision('postgres', makeEnvironment(), {
+      resourceName: 'production-postgres',
+    });
+
+    expect(result.receipt.success).toBe(false);
+    expect(result.component.externalId).toBeNull();
+    expect(result.component.bindings).not.toHaveProperty('unresolvedMutation');
+    expect(listReads).toBe(1);
+    expect(fetchMock.mock.calls.filter(([, request]) => request?.method === 'POST'))
+      .toHaveLength(1);
+  });
+
+  it('retains a provider-acknowledged cluster ID when create metadata is mismatched', async () => {
+    const fetchMock = vi.fn(async (
+      input: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname === '/v2/account' && method === 'GET') {
+        return jsonResponse({ account: { uuid: 'do-account-uuid' } });
+      }
+      if (url.pathname === '/v2/databases' && method === 'GET') {
+        return jsonResponse({ databases: [], links: {} });
+      }
+      if (url.pathname === '/v2/databases' && method === 'POST') {
+        return jsonResponse({
+          database: {
+            id: 'do-acknowledged',
+            name: 'wrong-name',
+            engine: 'pg',
+            region: 'sfo3',
+            status: 'creating',
+          },
+        }, 201);
+      }
+      throw new Error(`unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connectedAdapter();
+
+    const result = await adapter.provision('postgres', makeEnvironment(), {
+      resourceName: 'production-postgres',
+    });
+
+    expect(result.receipt.success).toBe(false);
+    expect(result.receipt.error).toContain('without the exact expected');
+    expect(result.component).toMatchObject({
+      externalId: 'do-acknowledged',
+      bindings: {
+        provider: 'digitalocean',
+        instanceId: 'do-acknowledged',
+        providerScope: { accountUuid: 'do-account-uuid', region: 'sfo3' },
+      },
+    });
+    expect(fetchMock.mock.calls.filter(([, request]) => request?.method === 'POST'))
+      .toHaveLength(1);
   });
 
   it('observes a bound cluster by durable ID and propagates non-404 failures', async () => {
@@ -352,14 +569,20 @@ describe('DigitalOceanDatabaseAdapter', () => {
   });
 
   it('rejects a durable ID that resolves to a different engine', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({
-      database: {
-        id: 'do-postgres-1',
-        name: 'production-redis',
-        engine: 'valkey',
-        status: 'online',
-      },
-    })));
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/v2/account') {
+        return jsonResponse({ account: { uuid: 'do-account-uuid' } });
+      }
+      return jsonResponse({
+        database: {
+          id: 'do-postgres-1',
+          name: 'production-redis',
+          engine: 'valkey',
+          status: 'online',
+        },
+      });
+    }));
     const adapter = await connectedAdapter();
 
     await expect(
@@ -377,6 +600,9 @@ describe('DigitalOceanDatabaseAdapter', () => {
     ) => {
       const url = new URL(String(input));
       const method = init?.method ?? 'GET';
+      if (url.pathname === '/v2/account' && method === 'GET') {
+        return jsonResponse({ account: { uuid: 'do-account-uuid' } });
+      }
       if (url.pathname === '/v2/databases/do-postgres-1' && method === 'GET') {
         clusterRead += 1;
         return clusterRead < 3
@@ -406,5 +632,31 @@ describe('DigitalOceanDatabaseAdapter', () => {
     expect(receipt.success).toBe(true);
     expect(receipt.message).toContain('Deleted DigitalOcean PostgreSQL');
     expect(clusterRead).toBe(3);
+  });
+
+  it('blocks observation and deletion when the binding belongs to another account', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/v2/account') {
+        return jsonResponse({ account: { uuid: 'another-do-account' } });
+      }
+      throw new Error(`resource request must not run: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connectedAdapter();
+
+    await expect(
+      adapter.observeDatabase(makeEnvironment(), makeComponent())
+    ).rejects.toThrow(
+      /scope account do-account-uuid does not match connected account another-do-account/
+    );
+    await expect(adapter.destroy(makeComponent())).resolves.toMatchObject({
+      success: false,
+      error: expect.stringContaining(
+        'scope account do-account-uuid does not match connected account another-do-account'
+      ),
+    });
+    expect(fetchMock.mock.calls).toHaveLength(1);
+    expect(mutationCalls(fetchMock)).toEqual([]);
   });
 });

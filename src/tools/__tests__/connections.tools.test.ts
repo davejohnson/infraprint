@@ -21,7 +21,7 @@ import '../../adapters/providers/gcp/cloudrun.adapter.js';
 import '../../adapters/providers/secretmanagers/onepassword.adapter.js';
 import { StripeProjectsAdapter } from '../../adapters/providers/secretmanagers/stripe-projects.adapter.js';
 import { registerConnectionsTools } from '../connections.tools.js';
-import { createToolContext } from '../context.js';
+import { createToolContext } from '../../application/context.js';
 
 let tempDir: string;
 const githubTokenEnvironmentNames = [
@@ -714,6 +714,21 @@ describe('hv_connections', () => {
         tokenType: expect.stringContaining('Railway Account API token'),
         setupHelpUrl: 'https://railway.com/account/tokens',
         defaultScalarKey: 'apiToken',
+        maturity: {
+          lifecycle: {
+            hosting: { status: 'ready-for-live' },
+            database: { status: 'ready-for-live' },
+            cache: { status: 'ready-for-live' },
+            storage: { status: 'ready-for-live' },
+            queue: {
+              status: 'ready-for-live',
+              reason: expect.any(String),
+            },
+          },
+        },
+        lifecycle: expect.objectContaining({
+          queue: { backend: 'postgres', resources: 'application-managed' },
+        }),
         credentialFields: [
           {
             name: 'apiToken',

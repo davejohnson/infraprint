@@ -867,20 +867,6 @@ export class GitLabAdapter implements CodeHostPort, CodeRepositoryLifecyclePort,
     return { commits: value.commits ?? [], paths: [...paths].sort() };
   }
 
-  async lintConfiguration(projectId: string, content: string): Promise<{
-    valid: boolean;
-    errors: string[];
-    warnings: string[];
-  }> {
-    const value = await this.request<{ valid: boolean; errors?: string[]; warnings?: string[] }>(
-      'POST',
-      `${this.projectRoute(projectId)}/ci/lint`,
-      { content },
-      new URLSearchParams({ include_merged_yaml: 'false' })
-    );
-    return { valid: value.valid, errors: value.errors ?? [], warnings: value.warnings ?? [] };
-  }
-
   async observeActiveConfiguration(projectId: string, commitSha: string, _branch: string): Promise<Observation<{
     valid: boolean;
     jobs: Array<{ name: string; stage?: string; when?: string; environment?: string | null }>;
@@ -1192,6 +1178,7 @@ export class GitLabAdapter implements CodeHostPort, CodeRepositoryLifecyclePort,
   }
 
   async listArtifacts(repository: CodeRepositoryIdentity, runId?: string, limit = 100): Promise<CiArtifactSummary[]> {
+    const boundedLimit = Math.min(Math.max(limit, 1), 100);
     let resolvedRunId = runId;
     if (!resolvedRunId) {
       const runs = await this.listRuns(repository, 'pipeline', 1);
@@ -1203,7 +1190,7 @@ export class GitLabAdapter implements CodeHostPort, CodeRepositoryLifecyclePort,
       'GET',
       `${this.projectRoute(repository.nativeId)}/pipelines/${resolvedRunId}/jobs`,
       undefined,
-      new URLSearchParams({ per_page: String(Math.min(Math.max(limit, 1), 100)), include_retried: 'true' })
+      new URLSearchParams({ per_page: String(boundedLimit), include_retried: 'true' })
     );
     return jobs.flatMap((job) => (job.artifacts ?? []).map((artifact, index) => ({
       id: `${job.id}:${artifact.file_type ?? index}`,
@@ -1212,7 +1199,7 @@ export class GitLabAdapter implements CodeHostPort, CodeRepositoryLifecyclePort,
       jobId: String(job.id),
       ...(job.created_at ? { createdAt: job.created_at } : {}),
       ...(job.artifacts_expire_at ? { expiresAt: job.artifacts_expire_at } : {}),
-    })));
+    }))).slice(0, boundedLimit);
   }
 
   async dispatch(repository: CodeRepositoryIdentity, request: CiDispatchRequest): Promise<CiRunSummary> {

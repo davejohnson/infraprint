@@ -83,7 +83,10 @@ export class OnePasswordAdapter implements ISecretManagerAdapter {
     }
   }
 
-  async getSecret(path: string, key?: string, _version?: string): Promise<ResolvedSecret> {
+  async getSecret(path: string, key?: string, version?: string): Promise<ResolvedSecret> {
+    if (version !== undefined) {
+      throw new Error('1Password secret reads do not support selecting a historical version.');
+    }
     const client = await this.getClient();
     const value = await client.secrets.resolve(this.toOpReference(path, key));
     return { value };

@@ -36,6 +36,16 @@ describe('OnePasswordAdapter', () => {
     expect(resolve).toHaveBeenCalledWith('op://Production/db/password');
   });
 
+  it('rejects historical versions instead of silently reading the latest value', async () => {
+    const adapter = new OnePasswordAdapter();
+    await adapter.connect({ serviceAccountToken: 'ops_token' });
+
+    await expect(adapter.getSecret('Production/db', undefined, '2')).rejects.toThrow(
+      'historical version'
+    );
+    expect(createClient).not.toHaveBeenCalled();
+  });
+
   it('verify reports failure when the client cannot authenticate', async () => {
     createClient.mockRejectedValue(new Error('invalid service account token'));
 

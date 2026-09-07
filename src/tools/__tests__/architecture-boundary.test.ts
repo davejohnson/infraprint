@@ -8,21 +8,17 @@ const genericOrchestrationFiles: Array<[string, URL]> = [
   ['src/tools/hv-ci.tools.ts', new URL('../hv-ci.tools.ts', import.meta.url)],
 ];
 
-const registeredCommandModules = [
-  'connections',
-  'core',
-  'hv-appstore',
-  'hv-ci',
-  'hv-db',
-  'hv-deploy',
-  'hv-devx',
-  'hv-observability',
-  'hv-secrets',
-  'lifecycle',
-].map((name) => [
-  `src/tools/${name}.tools.ts`,
-  new URL(`../${name}.tools.ts`, import.meta.url),
-] as const);
+const commandRegistrySource = readFileSync(
+  new URL('../../application/commands.ts', import.meta.url),
+  'utf8'
+);
+const registeredCommandModules = Array.from(
+  commandRegistrySource.matchAll(/from ['"]\.\.\/tools\/([^'"]+\.tools)\.js['"]/g),
+  (match) => [
+    `src/tools/${match[1]}.ts`,
+    new URL(`../${match[1]}.ts`, import.meta.url),
+  ] as const
+);
 
 const interfaceModules: Array<[string, URL]> = [
   ['src/interfaces/cli/parser.ts', new URL('../../interfaces/cli/parser.ts', import.meta.url)],
@@ -60,10 +56,19 @@ describe('provider boundary architecture', () => {
   });
 
   it('keeps command declarations transport-neutral', () => {
+    expect(registeredCommandModules.length).toBeGreaterThan(0);
     for (const [label, url] of registeredCommandModules) {
       const source = readFileSync(url, 'utf8');
       expect(source, `${label} must not import MCP`).not.toContain('@modelcontextprotocol');
       expect(source, `${label} must register commands, not MCP-shaped tools`).not.toContain('server.tool(');
+    }
+  });
+
+  it('keeps provider implementations behind the registered command boundary', () => {
+    for (const [label, url] of registeredCommandModules) {
+      const source = readFileSync(url, 'utf8');
+      expect(source, `${label} must route provider behavior through ports, registries, or services`)
+        .not.toContain('/adapters/providers/');
     }
   });
 

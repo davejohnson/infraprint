@@ -1,6 +1,5 @@
 import { z } from 'zod';
 import { providerRegistry } from '../../../domain/registry/provider.registry.js';
-import type { EmailDomainAuth } from '../../../domain/ports/email.port.js';
 
 const SENDGRID_API_URL = 'https://api.sendgrid.com/v3';
 
@@ -38,13 +37,6 @@ export interface SendGridValidationResult {
     dkim1?: { valid: boolean; reason?: string };
     dkim2?: { valid: boolean; reason?: string };
   };
-}
-
-export interface SendGridEventWebhook {
-  enabled: boolean;
-  url: string;
-  oauth_client_id?: string;
-  oauth_token_url?: string;
 }
 
 export interface SendGridEventWebhookSettings {
@@ -115,21 +107,6 @@ export interface CreateSendGridVerifiedSenderInput {
   country?: string;
 }
 
-// Common event types for SendGrid webhooks
-export const SENDGRID_COMMON_WEBHOOK_EVENTS = [
-  'bounce',
-  'click',
-  'deferred',
-  'delivered',
-  'dropped',
-  'open',
-  'processed',
-  'spam_report',
-  'unsubscribe',
-  'group_unsubscribe',
-  'group_resubscribe',
-];
-
 // Credentials schema for self-registration
 export const SendGridCredentialsSchema = z.object({
   apiKey: z.string().min(1, 'API key is required').refine(
@@ -139,6 +116,16 @@ export const SendGridCredentialsSchema = z.object({
 });
 
 export type SendGridCredentials = z.infer<typeof SendGridCredentialsSchema>;
+
+export class SendGridApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number
+  ) {
+    super(message);
+    this.name = 'SendGridApiError';
+  }
+}
 
 function hasSendGridScope(scopeSet: Set<string>, requiredScope: string): boolean {
   if (scopeSet.has(requiredScope) || scopeSet.has('*')) return true;
@@ -242,13 +229,27 @@ export class SendGridAdapter {
       return {} as T;
     }
 
-    const data = await response.json();
+    let data: unknown;
+    try {
+      data = await response.json();
+    } catch {
+      if (!response.ok) {
+        throw new SendGridApiError(
+          `SendGrid API error: HTTP ${response.status}`,
+          response.status
+        );
+      }
+      throw new Error(`SendGrid API returned invalid JSON for ${method} ${endpoint}.`);
+    }
 
     if (!response.ok) {
       const errorMsg = (data as { errors?: Array<{ message: string }> }).errors
         ?.map((e) => e.message)
         .join(', ') || `HTTP ${response.status}`;
-      throw new Error(`SendGrid API error: ${errorMsg}`);
+      throw new SendGridApiError(
+        `SendGrid API error: ${errorMsg}`,
+        response.status
+      );
     }
 
     return data as T;
@@ -303,6 +304,9 @@ export class SendGridAdapter {
       'GET',
       '/whitelabel/domains'
     );
+    if (!Array.isArray(result)) {
+      throw new Error('SendGrid domain-authentication observation returned an invalid list.');
+    }
     return result;
   }
 
@@ -313,14 +317,12 @@ export class SendGridAdapter {
         `/whitelabel/domains/${domainId}`
       );
       return result;
-    } catch {
-      return null;
+    } catch (error) {
+      if (error instanceof SendGridApiError && error.status === 404) {
+        return null;
+      }
+      throw error;
     }
-  }
-
-  async getDomainDnsRecords(domainId: number): Promise<SendGridDnsRecords | null> {
-    const domain = await this.getDomainAuthentication(domainId);
-    return domain?.dns ?? null;
   }
 
   async validateDomainAuthentication(domainId: number): Promise<SendGridValidationResult> {
@@ -357,7 +359,10 @@ export class SendGridAdapter {
       'GET',
       '/verified_senders'
     );
-    return result.results ?? [];
+    if (!Array.isArray(result.results)) {
+      throw new Error('SendGrid verified-sender observation returned an invalid list.');
+    }
+    return result.results;
   }
 
   async createVerifiedSender(input: CreateSendGridVerifiedSenderInput): Promise<SendGridVerifiedSender> {
@@ -379,96 +384,6 @@ export class SendGridAdapter {
     return this.request<SendGridVerifiedSender>('POST', '/verified_senders', body);
   }
 
-  // IEmailProvider interface methods
-
-  private convertToEmailDomainAuth(domain: SendGridDomainAuthentication): EmailDomainAuth {
-    const dnsRecords: EmailDomainAuth['dnsRecords'] = [];
-
-    if (domain.dns.mail_cname) {
-      dnsRecords.push({
-        name: domain.dns.mail_cname.host,
-        type: domain.dns.mail_cname.type,
-        value: domain.dns.mail_cname.data,
-        valid: domain.dns.mail_cname.valid,
-        purpose: 'mail_cname',
-      });
-    }
-    if (domain.dns.dkim1) {
-      dnsRecords.push({
-        name: domain.dns.dkim1.host,
-        type: domain.dns.dkim1.type,
-        value: domain.dns.dkim1.data,
-        valid: domain.dns.dkim1.valid,
-        purpose: 'dkim1',
-      });
-    }
-    if (domain.dns.dkim2) {
-      dnsRecords.push({
-        name: domain.dns.dkim2.host,
-        type: domain.dns.dkim2.type,
-        value: domain.dns.dkim2.data,
-        valid: domain.dns.dkim2.valid,
-        purpose: 'dkim2',
-      });
-    }
-    if (domain.dns.mail_server) {
-      dnsRecords.push({
-        name: domain.dns.mail_server.host,
-        type: domain.dns.mail_server.type,
-        value: domain.dns.mail_server.data,
-        valid: domain.dns.mail_server.valid,
-        purpose: 'mail_server',
-      });
-    }
-    if (domain.dns.subdomain_spf) {
-      dnsRecords.push({
-        name: domain.dns.subdomain_spf.host,
-        type: domain.dns.subdomain_spf.type,
-        value: domain.dns.subdomain_spf.data,
-        valid: domain.dns.subdomain_spf.valid,
-        purpose: 'subdomain_spf',
-      });
-    }
-
-    return {
-      id: domain.id,
-      domain: domain.domain,
-      valid: domain.valid,
-      dnsRecords,
-    };
-  }
-
-  async listDomainAuthenticationsAsPort(): Promise<EmailDomainAuth[]> {
-    const domains = await this.listDomainAuthentications();
-    return domains.map((d) => this.convertToEmailDomainAuth(d));
-  }
-
-  async getDomainAuthenticationAsPort(id: string | number): Promise<EmailDomainAuth | null> {
-    const domainId = typeof id === 'string' ? parseInt(id, 10) : id;
-    const domain = await this.getDomainAuthentication(domainId);
-    return domain ? this.convertToEmailDomainAuth(domain) : null;
-  }
-
-  async validateDomainAuthenticationAsPort(
-    id: string | number
-  ): Promise<{ valid: boolean; results: Record<string, { valid: boolean; reason?: string }> }> {
-    const domainId = typeof id === 'string' ? parseInt(id, 10) : id;
-    const result = await this.validateDomainAuthentication(domainId);
-
-    const results: Record<string, { valid: boolean; reason?: string }> = {};
-    if (result.validation_results.mail_cname) {
-      results.mail_cname = result.validation_results.mail_cname;
-    }
-    if (result.validation_results.dkim1) {
-      results.dkim1 = result.validation_results.dkim1;
-    }
-    if (result.validation_results.dkim2) {
-      results.dkim2 = result.validation_results.dkim2;
-    }
-
-    return { valid: result.valid, results };
-  }
-
   // Event Webhook Management
 
   async getEventWebhookSettings(): Promise<SendGridEventWebhookSettings> {
@@ -485,57 +400,6 @@ export class SendGridAdapter {
     );
   }
 
-  async enableEventWebhook(
-    url: string,
-    events?: {
-      bounce?: boolean;
-      click?: boolean;
-      deferred?: boolean;
-      delivered?: boolean;
-      dropped?: boolean;
-      open?: boolean;
-      processed?: boolean;
-      spam_report?: boolean;
-      unsubscribe?: boolean;
-      group_unsubscribe?: boolean;
-      group_resubscribe?: boolean;
-    }
-  ): Promise<SendGridEventWebhookSettings> {
-    // Default to all common events if not specified
-    const eventSettings = events ?? {
-      bounce: true,
-      click: true,
-      deferred: true,
-      delivered: true,
-      dropped: true,
-      open: true,
-      processed: true,
-      spam_report: true,
-      unsubscribe: true,
-      group_unsubscribe: true,
-      group_resubscribe: true,
-    };
-
-    return this.updateEventWebhookSettings({
-      enabled: true,
-      url,
-      ...eventSettings,
-    });
-  }
-
-  async disableEventWebhook(): Promise<SendGridEventWebhookSettings> {
-    return this.updateEventWebhookSettings({ enabled: false });
-  }
-
-  async testEventWebhook(url: string): Promise<{ success: boolean; error?: string }> {
-    try {
-      await this.request('POST', '/user/webhooks/event/test', { url });
-      return { success: true };
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  }
-
   // Inbound Parse Webhook (for receiving emails)
 
   async listInboundParseWebhooks(): Promise<Array<{ hostname: string; url: string; spam_check: boolean; send_raw: boolean }>> {
@@ -543,7 +407,10 @@ export class SendGridAdapter {
       'GET',
       '/user/webhooks/parse/settings'
     );
-    return result.result ?? [];
+    if (!Array.isArray(result.result)) {
+      throw new Error('SendGrid Inbound Parse observation returned an invalid list.');
+    }
+    return result.result;
   }
 
   async createInboundParseWebhook(

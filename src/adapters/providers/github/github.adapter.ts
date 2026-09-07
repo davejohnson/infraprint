@@ -135,10 +135,6 @@ export interface GitHubPullRequestSummary {
   };
 }
 
-interface GitHubResponse<T> {
-  data: T;
-}
-
 export class GitHubApiError extends Error {
   constructor(
     message: string,
@@ -148,6 +144,10 @@ export class GitHubApiError extends Error {
     super(message);
     this.name = 'GitHubApiError';
   }
+}
+
+function isGitHubNotFound(error: unknown): error is GitHubApiError {
+  return error instanceof GitHubApiError && error.status === 404;
 }
 
 export class GitHubAdapter {
@@ -285,7 +285,7 @@ export class GitHubAdapter {
       return await this.request<GitHubPagesConfig>('GET', `/repos/${owner}/${repo}/pages`);
     } catch (error) {
       // 404 means Pages is not enabled (GitHub returns "Not Found" message)
-      if (error instanceof Error && (error.message.includes('404') || error.message.includes('Not Found'))) {
+      if (isGitHubNotFound(error)) {
         return null;
       }
       throw error;
@@ -345,7 +345,7 @@ export class GitHubAdapter {
       );
       return decodeFileContent(existing.content);
     } catch (error) {
-      if (error instanceof Error && (error.message.includes('404') || error.message.includes('Not Found'))) {
+      if (isGitHubNotFound(error)) {
         return null;
       }
       throw error;
@@ -377,7 +377,7 @@ export class GitHubAdapter {
         `/repos/${owner}/${repo}/git/ref/${encodeURIComponent(ref)}`
       );
     } catch (error) {
-      if (error instanceof Error && (error.message.includes('404') || error.message.includes('Not Found'))) return null;
+      if (isGitHubNotFound(error)) return null;
       throw error;
     }
   }
@@ -413,7 +413,7 @@ export class GitHubAdapter {
       );
       return { sha: existing.sha, content: decodeFileContent(existing.content) };
     } catch (error) {
-      if (error instanceof Error && (error.message.includes('404') || error.message.includes('Not Found'))) return null;
+      if (isGitHubNotFound(error)) return null;
       throw error;
     }
   }
@@ -448,7 +448,7 @@ export class GitHubAdapter {
 
       return { created: false, updated: true };
     } catch (error) {
-      if (error instanceof Error && (error.message.includes('404') || error.message.includes('Not Found'))) {
+      if (isGitHubNotFound(error)) {
         // Create new file
         await this.request<unknown>('PUT', `/repos/${owner}/${repo}/contents/${path}`, {
           message: commitMessage,
@@ -523,7 +523,7 @@ export class GitHubAdapter {
       await this.request('GET', `/repos/${owner}/${repo}/vulnerability-alerts`);
       return true;
     } catch (error) {
-      if (error instanceof Error && (error.message.includes('404') || error.message.includes('Not Found'))) return false;
+      if (isGitHubNotFound(error)) return false;
       throw error;
     }
   }
@@ -550,7 +550,7 @@ export class GitHubAdapter {
     try {
       return await this.request('GET', `/repos/${owner}/${repo}/code-scanning/default-setup`);
     } catch (error) {
-      if (error instanceof Error && (error.message.includes('404') || error.message.includes('Not Found'))) return null;
+      if (isGitHubNotFound(error)) return null;
       throw error;
     }
   }
@@ -623,7 +623,7 @@ export class GitHubAdapter {
       );
       return response.secrets.map((secret) => secret.name);
     } catch (error) {
-      if (error instanceof Error && /404|not found/i.test(error.message)) return [];
+      if (isGitHubNotFound(error)) return [];
       throw error;
     }
   }
@@ -642,7 +642,7 @@ export class GitHubAdapter {
     try {
       await this.request<unknown>('GET', `/repos/${owner}/${repo}/environments/${environment}`);
     } catch (error) {
-      if (!(error instanceof Error) || !/404|not found/i.test(error.message)) throw error;
+      if (!isGitHubNotFound(error)) throw error;
       await this.request<unknown>('PUT', `/repos/${owner}/${repo}/environments/${environment}`, {});
     }
     const publicKeyResponse = await this.request<{ key_id: string; key: string }>(
@@ -720,7 +720,7 @@ export class GitHubAdapter {
         `/repos/${owner}/${repo}/environments/${environment}/variables/${variable}`
       );
     } catch (error) {
-      if (error instanceof Error && /404|not found/i.test(error.message)) {
+      if (isGitHubNotFound(error)) {
         return null;
       }
       throw error;
@@ -743,7 +743,7 @@ export class GitHubAdapter {
     try {
       await this.request<unknown>('GET', `/repos/${owner}/${repo}/environments/${environment}`);
     } catch (error) {
-      if (!(error instanceof Error) || !/404|not found/i.test(error.message)) {
+      if (!isGitHubNotFound(error)) {
         throw error;
       }
       await this.request<unknown>('PUT', `/repos/${owner}/${repo}/environments/${environment}`, {});
@@ -784,7 +784,7 @@ export class GitHubAdapter {
       });
       return { created: false, updated: true };
     } catch (error) {
-      if (error instanceof Error && (error.message.includes('404') || error.message.includes('Not Found'))) {
+      if (isGitHubNotFound(error)) {
         await this.request<GitHubLabel>('POST', `/repos/${owner}/${repo}/labels`, {
           name: label.name,
           color,
@@ -1047,7 +1047,7 @@ export class GitHubAdapter {
       }>('GET', `/repos/${owner}/${repo}/branches/${branch}/protection`);
     } catch (error) {
       // 404 means no protection rules
-      if (error instanceof Error && (error.message.includes('404') || error.message.includes('Not Found') || error.message.includes('Branch not protected'))) {
+      if (isGitHubNotFound(error)) {
         return null;
       }
       throw error;
@@ -1172,26 +1172,35 @@ async function inspectGitHubResources(
     };
   }
   if (resource === 'pull-request') {
-    const pullRequests = await adapter.listPullRequests(owner, repo, {
+    const listed = await adapter.listPullRequests(owner, repo, {
       state: 'all',
       ...(request.name ? { head: `${owner}:${request.name}` } : {}),
     });
+    const pullRequests = listed.map((pullRequest) => ({
+      id: String(pullRequest.number),
+      name: pullRequest.head.ref,
+      ...pullRequest,
+    }));
     return {
-      observation: 'present',
+      observation: pullRequests.length > 0 ? 'present' : 'absent',
       resource,
       repository: `${owner}/${repo}`,
       pullRequests: pullRequests.slice(0, request.limit),
+      ...(pullRequests.length === 0 && request.name ? { name: request.name } : {}),
+      truncated: pullRequests.length > request.limit,
+      partial: pullRequests.length >= 100,
     };
   }
   if (resource === 'branch-protection') {
     const branch = request.id ?? request.name;
     if (!branch) throw new Error('GitHub branch-protection inspection requires id or name.');
+    const protection = await adapter.getBranchProtection(owner, repo, branch);
     return {
-      observation: 'present',
+      observation: protection ? 'present' : 'absent',
       resource,
       repository: `${owner}/${repo}`,
       branch,
-      protection: await adapter.getBranchProtection(owner, repo, branch),
+      protection,
     };
   }
   throw new Error(`Unsupported GitHub inspection resource "${resource}".`);
@@ -1227,7 +1236,7 @@ providerRegistry.register({
       ref: { mode: 'provider-resource', oneOf: [['scope', 'project'], ['id', 'name']], optional: ['scope', 'project', 'id', 'name'], mutuallyExclusive: [['id', 'name']] },
       branch: { mode: 'provider-resource', oneOf: [['scope', 'project'], ['id', 'name']], optional: ['scope', 'project', 'id', 'name'], mutuallyExclusive: [['id', 'name']] },
       pages: { mode: 'provider-resource', oneOf: [['scope', 'project']], optional: ['scope', 'project'] },
-      'pull-request': { mode: 'provider-resource', oneOf: [['scope', 'project']], optional: ['scope', 'project', 'name', 'limit'], list: true },
+      'pull-request': { mode: 'provider-resource', oneOf: [['scope', 'project']], optional: ['scope', 'project', 'name', 'limit'], list: true, collectionKey: 'pullRequests' },
       'branch-protection': { mode: 'provider-resource', oneOf: [['scope', 'project'], ['id', 'name']], optional: ['scope', 'project', 'id', 'name'], mutuallyExclusive: [['id', 'name']] },
     },
     inspect: (adapter, request) => inspectGitHubResources(adapter as GitHubAdapter, request),

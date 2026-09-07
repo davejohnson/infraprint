@@ -2155,6 +2155,13 @@ providerRegistry.register({
         ['DIGITALOCEAN_TOKEN', 'HYPERVIBE_DIGITALOCEAN_TOKEN'],
       ],
     },
+    maturity: {
+      lifecycle: {
+        hosting: { status: 'ready-for-live' },
+        database: { status: 'ready-for-live' },
+        cache: { status: 'ready-for-live' },
+      },
+    },
     orchestration: {
       project: { shareAcrossEnvironments: false },
       diff: {
@@ -2175,14 +2182,14 @@ providerRegistry.register({
       },
     },
     lifecycle: {
-      hosting: { customDomains: 'managed', maintenance: 'managed', teardownBoundary: 'project' },
+      hosting: { workloadKinds: ['web', 'worker', 'cron'], customDomains: 'managed', maintenance: 'managed', teardownBoundary: 'project' },
       databaseEngines: ['postgres'],
       cacheEngines: ['redis'],
     },
   },
-  factory: (credentials) => {
+  factory: async (credentials) => {
     const adapter = new DigitalOceanAdapter();
-    void adapter.connect(credentials);
+    await adapter.connect(credentials);
     return adapter;
   },
   inspection: {

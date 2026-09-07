@@ -91,8 +91,15 @@ import {
   buildDatabaseEnvVarsFromComponent,
 } from '../domain/services/database-env.js';
 import { buildCacheEnvVarsFromComponent } from '../domain/services/cache-env.js';
-import type { CacheEngine } from '../domain/ports/cache.port.js';
-import type { DatabaseType } from '../domain/ports/database.port.js';
+import {
+  parseUnresolvedCacheNetworkMutation,
+  type CacheEngine,
+} from '../domain/ports/cache.port.js';
+import {
+  parseUnresolvedDatabaseMutation,
+  parseUnresolvedDatastoreMutation,
+  type DatabaseType,
+} from '../domain/ports/database.port.js';
 import { applyEmailAction } from '../domain/services/email-apply.service.js';
 import {
   emailIntegrationFingerprint,
@@ -113,6 +120,8 @@ import { resolvePlanActionAuthority } from '../domain/plan/action-authority.js';
 import { applyDatabaseResilienceAction } from './apply-database-resilience.js';
 import { applyDataMigrationAction } from './apply-data-migration.js';
 import { applyMaintenanceAction } from './apply-maintenance.js';
+import { bindingIdentityFingerprint } from '../domain/services/binding-identity.js';
+import { firstProviderSpecValidationFailure } from '../domain/services/provider-spec-validation.js';
 
 /**
  * The shared plan-apply pipeline: connection gating, TOCTOU re-observe,
@@ -135,6 +144,137 @@ function stringArrayField(record: Record<string, unknown> | null, key: string): 
   return Array.isArray(value)
     ? value.filter((entry): entry is string => typeof entry === 'string')
     : [];
+}
+
+/**
+ * Preserve the exact identity returned after an uncertain provider mutation.
+ * A failed provision normally needs both a concrete provider id and complete
+ * durable scope. The sole exception is a strictly shaped unresolved-create
+ * marker: it is retained without an external id only to block another create,
+ * and can never authorize deletion.
+ */
+function retainFailedProvisionIdentity(params: {
+  ctx: CommandContext;
+  environment: Environment;
+  provider: string;
+  capability: 'database' | 'cache';
+  component: Component;
+  existing: Component | null;
+}): boolean {
+  const { ctx, environment, provider, capability, component, existing } = params;
+  const externalId = typeof component.externalId === 'string'
+    && component.externalId.trim().length > 0
+    ? component.externalId
+    : undefined;
+  const newBindings = asRecord(component.bindings);
+  const providerScope = asRecord(newBindings?.providerScope);
+  const unresolvedCreate = !externalId
+    ? parseUnresolvedDatastoreMutation(newBindings, capability)
+    : null;
+  const unresolvedNetworkCreate = capability === 'cache' && !externalId
+    ? parseUnresolvedCacheNetworkMutation(newBindings)
+    : null;
+  if (unresolvedCreate && unresolvedNetworkCreate) {
+    return false;
+  }
+  const unresolvedMutation = unresolvedCreate ?? unresolvedNetworkCreate;
+  const requiredScopeKeys = providerRegistry.get(provider)
+    ?.inspection?.selectors[capability]?.scopeKeys ?? [];
+  const completeProviderScope = requiredScopeKeys.length > 0
+    && providerScope
+    && Object.entries(providerScope).every(([key, value]) => (
+      key.trim().length > 0
+      && typeof value === 'string'
+      && value.trim().length > 0
+    ))
+    && requiredScopeKeys.every((key) => Boolean(stringField(providerScope, key)));
+  const unresolvedScopeMatches = unresolvedMutation !== null
+    && providerScope !== null
+    && sortedRecordJson(providerScope) === sortedRecordJson(unresolvedMutation.providerScope);
+  if (
+    (!externalId && !unresolvedScopeMatches)
+    || component.environmentId !== environment.id
+    || stringField(newBindings, 'provider') !== provider
+    || (externalId ? !completeProviderScope : !unresolvedScopeMatches)
+  ) {
+    return false;
+  }
+
+  const existingBindings = asRecord(existing?.bindings);
+  const existingProvider = stringField(existingBindings, 'provider');
+  const existingExternalId = existing?.externalId
+    ?? stringField(existingBindings, 'instanceId')
+    ?? stringField(existingBindings, 'serviceId');
+  const existingProviderScope = asRecord(existingBindings?.providerScope);
+  const isUncertainInPlaceCacheReconcile = capability === 'cache'
+    && existingProvider === provider
+    && Boolean(externalId)
+    && existingExternalId === externalId
+    && existingProviderScope !== null
+    && providerScope !== null
+    && sortedRecordJson(existingProviderScope) === sortedRecordJson(providerScope);
+  const existingUnresolvedMutation = capability === 'cache' && !existingExternalId
+    ? parseUnresolvedDatastoreMutation(existingBindings, 'cache')
+      ?? parseUnresolvedCacheNetworkMutation(existingBindings)
+    : null;
+  const isUnresolvedInPlaceCacheRecovery = capability === 'cache'
+    && existingProvider === provider
+    && !existingExternalId
+    && !externalId
+    && existingUnresolvedMutation !== null
+    && unresolvedMutation !== null
+    && JSON.stringify(existingUnresolvedMutation) === JSON.stringify(unresolvedMutation)
+    && existingProviderScope !== null
+    && providerScope !== null
+    && sortedRecordJson(existingProviderScope) === sortedRecordJson(providerScope);
+  // A cache update is authorized only for the exact durable identity already
+  // bound when the plan was created. Never let an adapter's failed response
+  // retarget local state (and a future deletion) to another same-provider
+  // cache or scope.
+  if (capability === 'cache'
+    && existingProvider === provider
+    && !isUncertainInPlaceCacheReconcile
+    && !isUnresolvedInPlaceCacheRecovery) {
+    return false;
+  }
+  if (unresolvedMutation && existingProvider === provider && Boolean(existingExternalId)) {
+    return false;
+  }
+  const bindingsToStore: Record<string, unknown> = existing && existingProvider && existingProvider !== provider
+    ? {
+        ...newBindings,
+        providerScope: { ...providerScope },
+        previousProvider: existingProvider,
+        previousExternalId: existing.externalId ?? undefined,
+        previousBindings: existing.bindings,
+      }
+    : {
+        ...(existing?.bindings ?? {}),
+        ...newBindings,
+        providerScope: { ...providerScope },
+      };
+  delete bindingsToStore.provisioningIncomplete;
+  delete bindingsToStore.reconciliationIncomplete;
+  bindingsToStore[
+    isUncertainInPlaceCacheReconcile
+      ? 'reconciliationIncomplete'
+      : 'provisioningIncomplete'
+  ] = true;
+
+  if (existing) {
+    ctx.repos.components.update(existing.id, {
+      bindings: bindingsToStore,
+      externalId: externalId ?? null,
+    });
+  } else {
+    ctx.repos.components.create({
+      environmentId: environment.id,
+      type: component.type,
+      bindings: bindingsToStore,
+      externalId: externalId ?? null,
+    });
+  }
+  return true;
 }
 
 function blockedActionIdentity(
@@ -353,6 +493,12 @@ export function bootstrapActionResultFromSummary(
 
 
 export type PlanApplyOutcome =
+  | {
+    kind: 'invalid_spec';
+    message: string;
+    hint: string;
+    details: Record<string, unknown>;
+  }
   | { kind: 'plan_not_found'; error: string }
   | { kind: 'env_missing'; envName: string }
   | { kind: 'input_required'; envName: string; requirements: DelegatedSecretInputRequirement[] }
@@ -520,6 +666,15 @@ export async function executePlanApply(ctx: CommandContext, params: {
   alwaysRunBootstrap?: boolean;
 }): Promise<PlanApplyOutcome> {
   const { project, spec, planId } = params;
+  const providerValidation = firstProviderSpecValidationFailure(spec);
+  if (providerValidation) {
+    return {
+      kind: 'invalid_spec',
+      message: providerValidation.message,
+      hint: providerValidation.hint,
+      details: providerValidation.details,
+    };
+  }
   const planService = new PlanService();
 
   const executor = new ConvergeExecutor();
@@ -588,6 +743,7 @@ export async function executePlanApply(ctx: CommandContext, params: {
         || action.metadata?.operation === 'dataMigrationStoragePreviousDestroy'
         || action.metadata?.operation === 'previousHostingDestroy'
         || action.metadata?.operation === 'retainedDatabaseDestroy'
+        || action.metadata?.operation === 'retainedCacheDestroy'
         || action.metadata?.operation === 'retainedResourceDestroy'
       )
     )
@@ -1260,16 +1416,19 @@ export async function executePlanApply(ctx: CommandContext, params: {
       });
     }
     if (capability === 'cache.provision') {
-      return createCache(ctx, applyProject, envName, action);
+      return createCache(ctx, applyProject, envName, envSpec, action);
     }
     if (capability === 'cache.env.remove') {
-      return unwireCache(ctx, applyProject, envName, action);
+      return unwireCache(ctx, applyProject, envName, envSpec, action);
     }
     if (capability === 'cache.destroy') {
       return destroyCache(ctx, applyProject, envName, action);
     }
+    if (capability === 'cache.retained.destroy') {
+      return destroyRetainedCache(ctx, applyProject, envName, action);
+    }
     if (capability === 'database.provision') {
-      return createDatabase(ctx, applyProject, envName, action);
+      return createDatabase(ctx, applyProject, envName, envSpec, action);
     }
     if (
       capability === 'database.migrate'
@@ -1379,6 +1538,20 @@ export async function executePlanApply(ctx: CommandContext, params: {
           status: 'blocked',
           message: `Service action ${action.id} does not match the current environment spec`,
           error: `Reviewed target is ${action.resource.provider}/${action.resource.name}; expected provider ${envSpec.hosting.provider} and a declared service name.`,
+        };
+      }
+      const latestEnvironment = ctx.repos.environments.findByProjectAndName(project.id, envName);
+      const rawRecoveryMap = asRecord(latestEnvironment?.platformBindings)?.serviceCreateRecovery;
+      const recoveryMap = asRecord(rawRecoveryMap);
+      if (rawRecoveryMap !== undefined && (
+        !recoveryMap
+        || Object.prototype.hasOwnProperty.call(recoveryMap, action.resource.name)
+      )) {
+        return {
+          success: false,
+          status: 'blocked',
+          message: `Service ${action.resource.name} has retained create-recovery state`,
+          error: 'Resolve or explicitly clean up the retained provider service identity before applying another service create. No hosting mutation was attempted.',
         };
       }
       const result = await ensureServiceBootstrap(action.resource.name);
@@ -1566,6 +1739,24 @@ async function ensureHostingProject(
   );
   const projectId = stringField(asRecord(receipt.data), 'projectId') ?? refreshedBindings.projectId;
   const environmentId = stringField(asRecord(receipt.data), 'environmentId') ?? refreshedBindings.environmentId;
+  const providerBindings = asRecord(asRecord(receipt.data)?.providerBindings) ?? {};
+  const reservedProviderBindingKeys = [
+    'provider',
+    'projectId',
+    'environmentId',
+    'services',
+    'previousHosting',
+  ];
+  const reservedProviderBinding = reservedProviderBindingKeys.find((key) => key in providerBindings);
+  if (reservedProviderBinding) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: `${provider} returned an invalid provider binding`,
+      error: `Provider-owned project binding data cannot replace reserved hosting key ${reservedProviderBinding}.`,
+      data: receipt.data,
+    };
+  }
   if (!projectId) {
     return {
       success: false,
@@ -1575,6 +1766,7 @@ async function ensureHostingProject(
     };
   }
   ctx.repos.environments.updatePlatformBindings(environment.id, {
+    ...providerBindings,
     provider,
     projectId,
     ...(environmentId ? { environmentId } : {}),
@@ -1588,6 +1780,7 @@ async function ensureHostingProject(
       projectId,
       ...(environmentId ? { environmentId } : {}),
       created: receipt.data?.created === true,
+      ...(Object.keys(providerBindings).length > 0 ? { providerBindings } : {}),
     },
   };
 }
@@ -2242,6 +2435,15 @@ async function destroyService(
       error: `No local serviceId binding for "${action.resource.name}" in ${envName}.`,
     };
   }
+  const plannedServiceId = stringField(action.metadata ?? null, 'externalId');
+  if (!plannedServiceId || plannedServiceId !== serviceId) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Service destroy target changed after planning',
+      error: `The reviewed destroy targets ${plannedServiceId ?? '(missing id)'}, but the current local binding is ${serviceId}. Re-run hv_plan before deleting provider infrastructure.`,
+    };
+  }
 
   const adapterResult = await adapterFactory.getHostingAdapter(project);
   if (!adapterResult.success || !adapterResult.adapter) {
@@ -2301,7 +2503,12 @@ async function destroyDatabase(
   }
   const component = ctx.repos.components.findByEnvironmentAndType(environment.id, action.resource.name);
   if (!component) {
-    return { success: true, message: `No local ${action.resource.name} component to destroy — nothing to do` };
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Database destroy target disappeared after planning',
+      error: `The reviewed ${action.resource.name} binding is no longer present locally, so provider absence cannot be proven. Re-run hv_plan.`,
+    };
   }
 
   const bindings = asRecord(component.bindings) ?? {};
@@ -2324,7 +2531,41 @@ async function destroyDatabase(
     componentToDestroy = {
       ...component,
       bindings: previousBindings,
-      externalId: stringField(bindings, 'previousExternalId') ?? stringField(previousBindings, 'instanceId') ?? null,
+      externalId: stringField(bindings, 'previousExternalId')
+        ?? stringField(previousBindings, 'instanceId')
+        ?? stringField(previousBindings, 'serviceId')
+        ?? null,
+    };
+  }
+
+  const targetBindings = asRecord(componentToDestroy.bindings) ?? {};
+  const targetExternalId = componentToDestroy.externalId
+    ?? stringField(targetBindings, 'instanceId')
+    ?? stringField(targetBindings, 'serviceId');
+  const targetProviderScope = asRecord(targetBindings.providerScope);
+  const actionMetadata = asRecord(action.metadata);
+  const plannedExternalId = stringField(actionMetadata, 'externalId');
+  const plannedBindingsFingerprint = stringField(actionMetadata, 'bindingsFingerprint');
+  const plannedProviderScope = asRecord(actionMetadata?.providerScope);
+  const plannedScopeEntries = Object.entries(plannedProviderScope ?? {});
+  const targetScopeEntries = Object.entries(targetProviderScope ?? {});
+  const providerScopeMatches = plannedScopeEntries.length > 0
+    && targetScopeEntries.length > 0
+    && plannedScopeEntries.every(([, value]) => typeof value === 'string' && value.length > 0)
+    && targetScopeEntries.every(([, value]) => typeof value === 'string' && value.length > 0)
+    && sortedRecordJson(plannedProviderScope!) === sortedRecordJson(targetProviderScope!);
+  if (
+    !plannedExternalId
+    || targetExternalId !== plannedExternalId
+    || !providerScopeMatches
+    || !plannedBindingsFingerprint
+    || bindingIdentityFingerprint(targetBindings) !== plannedBindingsFingerprint
+  ) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Database destroy target changed after planning',
+      error: 'The current database provider id or provider-native scope differs from the reviewed destroy action. Re-run hv_plan before deleting data.',
     };
   }
 
@@ -2347,6 +2588,32 @@ async function destroyDatabase(
       externalId: component.externalId ?? undefined,
     });
     return { success: true, message: `Destroyed previous ${action.resource.provider} ${action.resource.name}` };
+  }
+  if (
+    bindings.provisioningIncomplete === true
+    && previousProvider
+    && previousBindings
+  ) {
+    const restoredExternalId = stringField(bindings, 'previousExternalId')
+      ?? stringField(previousBindings, 'instanceId')
+      ?? stringField(previousBindings, 'serviceId');
+    const restoredScope = asRecord(previousBindings.providerScope);
+    if (!restoredExternalId || !restoredScope || Object.keys(restoredScope).length === 0) {
+      return {
+        success: false,
+        status: 'blocked',
+        message: `Destroyed incomplete ${action.resource.provider} ${action.resource.name}, but the previous database binding is incomplete`,
+        error: 'The exact previous provider id and scope must be repaired before Hypervibe can restore that binding safely.',
+      };
+    }
+    ctx.repos.components.update(component.id, {
+      bindings: previousBindings,
+      externalId: restoredExternalId,
+    });
+    return {
+      success: true,
+      message: `Destroyed incomplete ${action.resource.provider} ${action.resource.name} and restored the previous ${previousProvider} database binding`,
+    };
   }
   ctx.repos.components.delete(component.id);
   return { success: true, message: `Destroyed ${action.resource.provider} ${action.resource.name} and removed local component` };
@@ -2371,6 +2638,7 @@ async function destroyRetainedDatabase(
   const provider = stringField(retained, 'provider');
   const externalId = stringField(retained, 'externalId');
   const engine = stringField(retained, 'engine');
+  const retainedName = stringField(retained, 'name');
   const providerScope = asRecord(retained?.providerScope);
   const plannedScope = asRecord(metadata?.providerScope);
   if (
@@ -2381,8 +2649,8 @@ async function destroyRetainedDatabase(
     || !plannedScope
     || Object.keys(providerScope).length === 0
     || Object.keys(plannedScope).length === 0
-    || Object.values(providerScope).some((value) => typeof value !== 'string' || !value)
-    || Object.values(plannedScope).some((value) => typeof value !== 'string' || !value)
+    || Object.entries(providerScope).some(([key, value]) => !key.trim() || typeof value !== 'string' || !value.trim())
+    || Object.entries(plannedScope).some(([key, value]) => !key.trim() || typeof value !== 'string' || !value.trim())
     || sortedRecordJson(providerScope) !== sortedRecordJson(plannedScope)
   ) {
     return {
@@ -2391,6 +2659,57 @@ async function destroyRetainedDatabase(
       message: 'Retained database cleanup identity changed after planning',
       error: 'Re-run hv_plan before deleting any data-bearing provider resource.',
     };
+  }
+
+  const matchingUnresolvedComponents = ctx.repos.components
+    .findByEnvironmentId(environment.id)
+    .filter((candidate) => {
+      const bindings = asRecord(candidate.bindings);
+      const marker = parseUnresolvedDatabaseMutation(bindings);
+      return candidate.type === 'postgres'
+        && candidate.externalId === null
+        && bindings?.provisioningIncomplete === true
+        && stringField(bindings, 'provider') === provider
+        && marker !== null
+        && marker.resourceName === retainedName
+        && sortedRecordJson(marker.providerScope) === sortedRecordJson(providerScope);
+    });
+  if (matchingUnresolvedComponents.length > 1) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Multiple unresolved database markers match the retained cleanup target',
+      error: 'Hypervibe cannot choose which local database state to clear after deletion. Repair the duplicate local components before retrying.',
+    };
+  }
+  const unresolvedComponent = matchingUnresolvedComponents[0];
+  let restorePrevious: { bindings: Record<string, unknown>; externalId: string } | undefined;
+  if (unresolvedComponent) {
+    const unresolvedBindings = asRecord(unresolvedComponent.bindings)!;
+    const previousProvider = stringField(unresolvedBindings, 'previousProvider');
+    if (previousProvider) {
+      const previousBindings = asRecord(unresolvedBindings.previousBindings);
+      const previousExternalId = stringField(unresolvedBindings, 'previousExternalId')
+        ?? stringField(previousBindings, 'instanceId')
+        ?? stringField(previousBindings, 'serviceId');
+      const previousScope = asRecord(previousBindings?.providerScope);
+      if (
+        !previousBindings
+        || stringField(previousBindings, 'provider') !== previousProvider
+        || !previousExternalId
+        || !previousScope
+        || Object.keys(previousScope).length === 0
+        || Object.entries(previousScope).some(([key, value]) => !key.trim() || typeof value !== 'string' || !value.trim())
+      ) {
+        return {
+          success: false,
+          status: 'blocked',
+          message: 'The unresolved database marker has no complete previous binding to restore',
+          error: 'Repair the exact previous provider id and provider scope before deleting the unresolved provider-switch target.',
+        };
+      }
+      restorePrevious = { bindings: previousBindings, externalId: previousExternalId };
+    }
   }
 
   const adapterResult = await adapterFactory.getDatabaseAdapter(provider, project);
@@ -2413,9 +2732,24 @@ async function destroyRetainedDatabase(
     updatedAt: environment.updatedAt,
   };
   const clearBinding = (): void => {
+    if (unresolvedComponent) {
+      if (restorePrevious) {
+        const restored = ctx.repos.components.update(unresolvedComponent.id, {
+          bindings: restorePrevious.bindings,
+          externalId: restorePrevious.externalId,
+        });
+        if (!restored) {
+          throw new Error(`Could not restore previous database binding after deleting ${externalId}.`);
+        }
+      } else if (!ctx.repos.components.delete(unresolvedComponent.id)) {
+        throw new Error(`Could not clear unresolved database marker after deleting ${externalId}.`);
+      }
+    }
     const nextBindings = { ...environment.platformBindings };
     delete nextBindings.previousDatabase;
-    ctx.repos.environments.update(environment.id, { platformBindings: nextBindings });
+    if (!ctx.repos.environments.update(environment.id, { platformBindings: nextBindings })) {
+      throw new Error(`Could not clear retained database cleanup binding after deleting ${externalId}.`);
+    }
   };
 
   try {
@@ -2463,14 +2797,240 @@ async function destroyRetainedDatabase(
     return {
       success: true,
       message: before
-        ? `Deleted retained ${provider} database ${externalId} and cleared its cleanup binding`
-        : `Retained ${provider} database ${externalId} was already absent; cleared its cleanup binding`,
+        ? `Deleted retained ${provider} database ${externalId} and cleared its cleanup binding${restorePrevious ? ' while restoring the previous database binding' : unresolvedComponent ? ' and unresolved create marker' : ''}`
+        : `Retained ${provider} database ${externalId} was already absent; cleared its cleanup binding${restorePrevious ? ' and restored the previous database binding' : unresolvedComponent ? ' and unresolved create marker' : ''}`,
     };
   } catch (error) {
     return {
       success: false,
       status: 'blocked',
       message: 'Retained database cleanup could not prove terminal absence',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    await adapterResult.adapter.disconnect?.();
+  }
+}
+
+async function destroyRetainedCache(
+  ctx: CommandContext,
+  project: Project,
+  envName: string,
+  action: PlanAction
+): Promise<ActionResult> {
+  const environment = ctx.repos.environments.findByProjectAndName(project.id, envName);
+  if (!environment) {
+    return { success: false, status: 'blocked', message: 'Retained cache environment is missing', error: `No local environment "${envName}".` };
+  }
+  const retained = asRecord(environment.platformBindings.previousCache);
+  const metadata = asRecord(action.metadata);
+  const provider = stringField(retained, 'provider');
+  const externalId = stringField(retained, 'externalId');
+  const engine = stringField(retained, 'engine');
+  const providerEngine = stringField(retained, 'providerEngine');
+  const retainedName = stringField(retained, 'name');
+  const resourceKind = stringField(retained, 'resourceKind');
+  const providerScope = asRecord(retained?.providerScope);
+  const plannedScope = asRecord(metadata?.providerScope);
+  if (
+    provider !== action.resource.provider
+    || action.resource.kind !== 'cache'
+    || action.resource.name !== 'redis'
+    || externalId !== stringField(metadata, 'externalId')
+    || engine !== 'redis'
+    || stringField(metadata, 'engine') !== engine
+    || !retainedName
+    || stringField(metadata, 'name') !== retainedName
+    || stringField(metadata, 'providerEngine') !== providerEngine
+    || stringField(metadata, 'resourceKind') !== resourceKind
+    || !providerScope
+    || !plannedScope
+    || Object.keys(providerScope).length === 0
+    || Object.keys(plannedScope).length === 0
+    || Object.entries(providerScope).some(([key, value]) => !key.trim() || typeof value !== 'string' || !value.trim())
+    || Object.entries(plannedScope).some(([key, value]) => !key.trim() || typeof value !== 'string' || !value.trim())
+    || sortedRecordJson(providerScope) !== sortedRecordJson(plannedScope)
+  ) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Retained cache cleanup identity changed after planning',
+      error: 'Re-run hv_plan before deleting any data-bearing provider resource.',
+    };
+  }
+
+  const localComponents = ctx.repos.components.findByEnvironmentId(environment.id);
+  const activeMatches = localComponents.filter((candidate) => {
+    const bindings = asRecord(candidate.bindings);
+    return candidate.type === 'redis'
+      && (
+        candidate.externalId
+        ?? stringField(bindings, 'instanceId')
+        ?? stringField(bindings, 'serviceId')
+      ) === externalId
+      && stringField(bindings, 'provider') === provider;
+  });
+  if (activeMatches.length > 0) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Retained cache target became an active local binding after import',
+      error: 'Use the ordinary desired-state cache destroy lifecycle; retained cleanup cannot delete an active component.',
+    };
+  }
+  const matchingUnresolvedComponents = localComponents.filter((candidate) => {
+    const bindings = asRecord(candidate.bindings);
+    const marker = parseUnresolvedDatastoreMutation(bindings, 'cache');
+    return candidate.type === 'redis'
+      && candidate.externalId === null
+      && bindings?.provisioningIncomplete === true
+      && stringField(bindings, 'provider') === provider
+      && marker !== null
+      && marker.resourceName === retainedName
+      && sortedRecordJson(marker.providerScope) === sortedRecordJson(providerScope);
+  });
+  if (matchingUnresolvedComponents.length > 1) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Multiple unresolved cache markers match the retained cleanup target',
+      error: 'Hypervibe cannot choose which local cache state to clear after deletion. Repair the duplicate local components before retrying.',
+    };
+  }
+  const unresolvedComponent = matchingUnresolvedComponents[0];
+  let restorePrevious: { bindings: Record<string, unknown>; externalId: string } | undefined;
+  if (unresolvedComponent) {
+    const unresolvedBindings = asRecord(unresolvedComponent.bindings)!;
+    const previousProvider = stringField(unresolvedBindings, 'previousProvider');
+    if (previousProvider) {
+      const previousBindings = asRecord(unresolvedBindings.previousBindings);
+      const previousExternalId = stringField(unresolvedBindings, 'previousExternalId')
+        ?? stringField(previousBindings, 'instanceId')
+        ?? stringField(previousBindings, 'serviceId');
+      const previousScope = asRecord(previousBindings?.providerScope);
+      const nestedExternalId = stringField(previousBindings, 'instanceId')
+        ?? stringField(previousBindings, 'serviceId');
+      if (
+        !previousBindings
+        || stringField(previousBindings, 'provider') !== previousProvider
+        || !previousExternalId
+        || (nestedExternalId && nestedExternalId !== previousExternalId)
+        || !previousScope
+        || Object.keys(previousScope).length === 0
+        || Object.entries(previousScope).some(([key, value]) => !key.trim() || typeof value !== 'string' || !value.trim())
+      ) {
+        return {
+          success: false,
+          status: 'blocked',
+          message: 'The unresolved cache marker has no complete previous binding to restore',
+          error: 'Repair the exact previous provider id and provider scope before deleting the unresolved provider-switch target.',
+        };
+      }
+      restorePrevious = { bindings: previousBindings, externalId: previousExternalId };
+    }
+  }
+
+  const adapterResult = await adapterFactory.getCacheAdapter(provider, project);
+  if (!adapterResult.success || !adapterResult.adapter) {
+    return { success: false, status: 'blocked', message: 'Retained cache adapter unavailable', error: adapterResult.error };
+  }
+  const component: Component = {
+    id: `retained:${externalId}`,
+    environmentId: environment.id,
+    type: 'redis',
+    externalId: externalId!,
+    bindings: {
+      provider,
+      instanceId: externalId,
+      providerScope,
+      retainedCleanup: true,
+      ...(resourceKind ? { resourceKind } : {}),
+    },
+    createdAt: environment.createdAt,
+    updatedAt: environment.updatedAt,
+  };
+  const clearBinding = (): void => {
+    if (unresolvedComponent) {
+      if (restorePrevious) {
+        const restored = ctx.repos.components.update(unresolvedComponent.id, {
+          bindings: restorePrevious.bindings,
+          externalId: restorePrevious.externalId,
+        });
+        if (!restored) {
+          throw new Error(`Could not restore previous cache binding after deleting ${externalId}.`);
+        }
+      } else if (!ctx.repos.components.delete(unresolvedComponent.id)) {
+        throw new Error(`Could not clear unresolved cache marker after deleting ${externalId}.`);
+      }
+    }
+    const nextBindings = { ...environment.platformBindings };
+    delete nextBindings.previousCache;
+    if (!ctx.repos.environments.update(environment.id, { platformBindings: nextBindings })) {
+      throw new Error(`Could not clear retained cache cleanup binding after deleting ${externalId}.`);
+    }
+  };
+
+  try {
+    const before = await adapterResult.adapter.observeCache(environment, component);
+    if (before) {
+      if (
+        before.provider !== provider
+        || before.engine !== engine
+        || before.externalId !== externalId
+        || before.name !== retainedName
+      ) {
+        return {
+          success: false,
+          status: 'blocked',
+          message: 'Retained cache observation returned a different identity',
+          error: `Expected ${provider}/${engine}/${retainedName}/${externalId}. No deletion was attempted.`,
+        };
+      }
+      if (!before.providerScope) {
+        return {
+          success: false,
+          status: 'blocked',
+          message: 'Retained cache observation omitted its provider scope',
+          error: 'Hypervibe cannot authorize deletion by an unscoped provider id. No deletion was attempted.',
+        };
+      }
+      if (sortedRecordJson(before.providerScope) !== sortedRecordJson(providerScope)) {
+        return {
+          success: false,
+          status: 'blocked',
+          message: 'Retained cache provider scope changed',
+          error: 'The live provider scope no longer matches the reviewed binding. No deletion was attempted.',
+        };
+      }
+    }
+    // Always invoke the idempotent cache teardown, even when the primary cache
+    // is already absent. Provider-owned dependent resources (for example a
+    // Railway persistent volume) may remain after a prior partial teardown.
+    const destroyed = await adapterResult.adapter.destroy(component);
+    if (!destroyed.success) {
+      return { success: false, message: destroyed.message, error: destroyed.error };
+    }
+    const after = await adapterResult.adapter.observeCache(environment, component);
+    if (after) {
+      return {
+        success: false,
+        status: 'blocked',
+        message: 'Provider acknowledged deletion but the retained cache is still present',
+        error: `Cache ${externalId} remains observable; its cleanup binding was preserved.`,
+      };
+    }
+    clearBinding();
+    return {
+      success: true,
+      message: before
+        ? `Deleted retained ${provider} cache ${externalId} and cleared its cleanup binding${restorePrevious ? ' while restoring the previous cache binding' : unresolvedComponent ? ' and unresolved create marker' : ''}`
+        : `Retained ${provider} cache ${externalId} was already absent; cleared its cleanup binding${restorePrevious ? ' and restored the previous cache binding' : unresolvedComponent ? ' and unresolved create marker' : ''}`,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Retained cache cleanup could not prove terminal absence',
       error: error instanceof Error ? error.message : String(error),
     };
   } finally {
@@ -2627,11 +3187,41 @@ async function createDatabase(
   ctx: CommandContext,
   project: Project,
   envName: string,
+  environmentSpec: EnvironmentSpec,
   action: PlanAction
 ): Promise<ActionResult> {
+  if (typeof action.metadata?.blockedReason === 'string') {
+    return {
+      success: false,
+      status: 'blocked',
+      message: action.reason,
+      error: 'The database action is blocked by unresolved observation or durable identity. Re-run hv_plan after resolving the reported state.',
+    };
+  }
+  const desired = environmentSpec.database;
+  if (
+    !desired
+    || desired.provider !== action.resource.provider
+    || desired.engine !== action.resource.name
+  ) {
+    return blockedActionIdentity(
+      action,
+      'The reviewed database provider or engine no longer matches desired state.'
+    );
+  }
   const environment = ctx.repos.environments.findByProjectAndName(project.id, envName);
   if (!environment) {
     return { success: false, message: 'Environment not found locally', error: `No local environment "${envName}"` };
+  }
+  const existing = ctx.repos.components.findByEnvironmentAndType(environment.id, action.resource.name);
+  const unresolvedCreate = parseUnresolvedDatabaseMutation(existing?.bindings);
+  if (unresolvedCreate) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'The previous database create outcome is still unresolved',
+      error: `Hypervibe will not issue another create for ${unresolvedCreate.resourceName} in ${JSON.stringify(unresolvedCreate.providerScope)}. Re-observe that exact name/scope and explicitly import or clean up the resulting provider identity first.`,
+    };
   }
 
   const adapterResult = await adapterFactory.getDatabaseAdapter(action.resource.provider, project);
@@ -2639,22 +3229,48 @@ async function createDatabase(
     return { success: false, message: 'Database adapter unavailable', error: adapterResult.error };
   }
 
-  const engine = action.resource.name as DatabaseType;
+  try {
+    await adapterResult.adapter.configureTarget?.({
+      projectName: project.name,
+      region: environmentSpec.hosting.region,
+    });
+  } catch (error) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Database placement is invalid or unavailable',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  const engine = desired.engine as DatabaseType;
   const provisioned = await adapterResult.adapter.provision(engine, environment, {
     databaseName: 'app',
     resourceName: `${project.name}-${envName}-${engine}`,
   });
   if (!provisioned.receipt.success) {
+    const recoverableComponentRetained = retainFailedProvisionIdentity({
+      ctx,
+      environment,
+      provider: action.resource.provider,
+      capability: 'database',
+      component: provisioned.component,
+      existing,
+    });
     return {
       success: false,
       message: provisioned.receipt.message,
       error: provisioned.receipt.error,
-      data: provisioned.receipt.data,
+      data: {
+        ...(provisioned.receipt.data ?? {}),
+        ...(recoverableComponentRetained ? { recoverableComponentRetained: true } : {}),
+      },
     };
   }
 
-  const existing = ctx.repos.components.findByEnvironmentAndType(environment.id, action.resource.name);
-  const newBindings = asRecord(provisioned.component.bindings) ?? {};
+  const newBindings = { ...(asRecord(provisioned.component.bindings) ?? {}) };
+  delete newBindings.provisioningIncomplete;
+  delete newBindings.reconciliationIncomplete;
   const existingBindings = asRecord(existing?.bindings) ?? null;
   const existingProvider = stringField(existingBindings, 'provider');
   const bindingsToStore = existing && existingProvider && existingProvider !== action.resource.provider
@@ -2706,35 +3322,135 @@ async function createCache(
   ctx: CommandContext,
   project: Project,
   envName: string,
+  environmentSpec: EnvironmentSpec,
   action: PlanAction
 ): Promise<ActionResult> {
+  if (typeof action.metadata?.blockedReason === 'string') {
+    return {
+      success: false,
+      status: 'blocked',
+      message: action.reason,
+      error: 'The cache action is blocked by unresolved observation or durable identity. Re-run hv_plan after resolving the reported state.',
+    };
+  }
   const environment = ctx.repos.environments.findByProjectAndName(project.id, envName);
   if (!environment) {
     return { success: false, message: 'Environment not found locally', error: `No local environment "${envName}"` };
   }
 
+  const desired = environmentSpec.cache;
+  const metadata = asRecord(action.metadata) ?? {};
+  const configFields = ['region', 'network', 'subnetwork', 'tier', 'size'] as const;
+  const staleConfigField = configFields.find((field) => (
+    metadata[field] !== (desired?.[field] ?? null)
+  ));
+  if (
+    !desired
+    || desired.provider !== action.resource.provider
+    || desired.engine !== action.resource.name
+    || staleConfigField
+  ) {
+    return blockedActionIdentity(
+      action,
+      staleConfigField
+        ? `Cache ${staleConfigField} changed after planning; re-run hv_plan before provisioning.`
+        : 'The reviewed cache provider or engine no longer matches desired state.'
+    );
+  }
+
+  const engine = action.resource.name as CacheEngine;
+  const existing = ctx.repos.components.findByEnvironmentAndType(environment.id, engine);
+  const unresolvedCreate = parseUnresolvedDatastoreMutation(existing?.bindings, 'cache');
+  if (unresolvedCreate) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'The previous cache create outcome is still unresolved',
+      error: `Hypervibe will not issue another create for ${unresolvedCreate.resourceName} in ${JSON.stringify(unresolvedCreate.providerScope)}. Re-observe that exact name/scope and explicitly import or clean up the resulting provider identity first.`,
+    };
+  }
+  const unresolvedNetworkCreate = parseUnresolvedCacheNetworkMutation(existing?.bindings);
+  const actionDeclaresNetworkRecovery = Object.prototype.hasOwnProperty.call(
+    metadata,
+    'recoveryMarker'
+  );
+  const plannedNetworkRecovery = actionDeclaresNetworkRecovery
+    ? parseUnresolvedCacheNetworkMutation({
+        unresolvedNetworkMutation: metadata.recoveryMarker,
+      })
+    : null;
+  if (
+    Boolean(unresolvedNetworkCreate) !== Boolean(plannedNetworkRecovery)
+    || (actionDeclaresNetworkRecovery && !plannedNetworkRecovery)
+    || (
+      unresolvedNetworkCreate
+      && plannedNetworkRecovery
+      && JSON.stringify(unresolvedNetworkCreate) !== JSON.stringify(plannedNetworkRecovery)
+    )
+  ) {
+    return blockedActionIdentity(
+      action,
+      'The unresolved cache-network create marker changed after planning; its exact resource name, cache name, provider scope, network scope, and ownership tags must all remain unchanged.'
+    );
+  }
   const adapterResult = await adapterFactory.getCacheAdapter(action.resource.provider, project);
   if (!adapterResult.success || !adapterResult.adapter) {
     return { success: false, message: 'Cache adapter unavailable', error: adapterResult.error };
   }
-
-  const engine = action.resource.name as CacheEngine;
+  const existingBindings = asRecord(existing?.bindings);
+  const existingProvider = stringField(existingBindings, 'provider');
+  const target = {
+    projectName: project.name,
+    region: desired.region,
+    network: desired.network,
+    subnetwork: desired.subnetwork,
+    tier: desired.tier,
+    size: desired.size,
+  };
+  try {
+    await adapterResult.adapter.configureTarget?.(target);
+  } catch (error) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Cache placement is invalid or unavailable',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
   const provisioned = await adapterResult.adapter.provision(engine, environment, {
     resourceName: `${project.name}-${envName}-${engine}`,
+    ...target,
+    component: existingProvider === action.resource.provider ? existing : null,
   });
   if (!provisioned.receipt.success) {
+    const recoverableComponentRetained = retainFailedProvisionIdentity({
+      ctx,
+      environment,
+      provider: action.resource.provider,
+      capability: 'cache',
+      component: provisioned.component,
+      existing,
+    });
     return {
       success: false,
       message: provisioned.receipt.message,
       error: provisioned.receipt.error,
-      data: provisioned.receipt.data,
+      data: {
+        ...(provisioned.receipt.data ?? {}),
+        ...(recoverableComponentRetained ? { recoverableComponentRetained: true } : {}),
+      },
     };
   }
 
-  const existing = ctx.repos.components.findByEnvironmentAndType(environment.id, engine);
-  const newBindings = asRecord(provisioned.component.bindings) ?? {};
-  const existingBindings = asRecord(existing?.bindings);
-  const existingProvider = stringField(existingBindings, 'provider');
+  const newBindings = { ...(asRecord(provisioned.component.bindings) ?? {}) };
+  delete newBindings.provisioningIncomplete;
+  delete newBindings.reconciliationIncomplete;
+  const runtimeNetwork = asRecord(newBindings.runtimeNetwork);
+  const requiredNetworkFields = ['provider', 'projectId', 'region', 'network', 'subnetwork', 'egress'];
+  const validRuntimeNetwork = runtimeNetwork
+    && requiredNetworkFields.every((field) => (
+      typeof runtimeNetwork[field] === 'string' && String(runtimeNetwork[field]).length > 0
+    ));
   const bindingsToStore = existing && existingProvider && existingProvider !== action.resource.provider
     ? {
         ...newBindings,
@@ -2758,6 +3474,28 @@ async function createCache(
     });
   }
 
+  if (validRuntimeNetwork) {
+    ctx.repos.environments.updatePlatformBindings(environment.id, {
+      cacheNetwork: runtimeNetwork,
+    });
+  } else if (!adapterResult.adapter.capabilities.requiresRuntimeNetwork) {
+    // A cache provider without private runtime networking replaces any stale
+    // Memorystore attachment. The dependent service action owns its removal.
+    ctx.repos.environments.updatePlatformBindings(environment.id, { cacheNetwork: null });
+  }
+  if (adapterResult.adapter.capabilities.requiresRuntimeNetwork && !validRuntimeNetwork) {
+    return {
+      success: false,
+      message: 'Cache provider succeeded without a usable runtime network binding',
+      error: 'The exact cache component was retained locally for recovery, but service wiring is blocked because provider/project/region/network/subnetwork/egress were not all verified.',
+      data: {
+        provider: action.resource.provider,
+        componentId: provisioned.component.externalId ?? provisioned.component.id,
+        recoverableComponentRetained: true,
+      },
+    };
+  }
+
   return {
     success: true,
     message: `${provisioned.receipt.message}. Cache recorded locally; run hv_plan again to verify REDIS_URL wiring.`,
@@ -2776,6 +3514,7 @@ async function unwireCache(
   ctx: CommandContext,
   project: Project,
   envName: string,
+  environmentSpec: EnvironmentSpec,
   action: PlanAction
 ): Promise<ActionResult> {
   const environment = ctx.repos.environments.findByProjectAndName(project.id, envName);
@@ -2792,12 +3531,29 @@ async function unwireCache(
         : `Service "${serviceName ?? 'unknown'}" is not tracked locally`,
     };
   }
-  return removeHostingEnvVars({
+  if (environmentSpec.cache) {
+    return blockedActionIdentity(
+      action,
+      `Redis is still desired through ${environmentSpec.cache.provider}; re-run hv_plan before removing its runtime wiring.`
+    );
+  }
+  const environmentWithoutCacheNetwork: Environment = {
+    ...environment,
+    platformBindings: {
+      ...environment.platformBindings,
+      cacheNetwork: null,
+    },
+  };
+  const result = await removeHostingEnvVars({
     project,
-    environment,
+    environment: environmentWithoutCacheNetwork,
     service,
     keys: ['REDIS_URL'],
   });
+  if (result.success) {
+    ctx.repos.environments.updatePlatformBindings(environment.id, { cacheNetwork: null });
+  }
+  return result;
 }
 
 async function destroyCache(
@@ -2812,7 +3568,12 @@ async function destroyCache(
   }
   const component = ctx.repos.components.findByEnvironmentAndType(environment.id, 'redis');
   if (!component) {
-    return { success: true, message: 'No local Redis component to destroy — nothing to do' };
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Cache destroy target disappeared after planning',
+      error: 'The reviewed Redis binding is no longer present locally, so Hypervibe cannot prove which provider resource the action authorized. Re-run hv_plan.',
+    };
   }
 
   const bindings = asRecord(component.bindings) ?? {};
@@ -2841,6 +3602,37 @@ async function destroyCache(
     };
   }
 
+  const targetBindings = asRecord(componentToDestroy.bindings) ?? {};
+  const targetExternalId = componentToDestroy.externalId
+    ?? stringField(targetBindings, 'instanceId')
+    ?? stringField(targetBindings, 'serviceId');
+  const targetProviderScope = asRecord(targetBindings.providerScope);
+  const actionMetadata = asRecord(action.metadata);
+  const plannedExternalId = stringField(actionMetadata, 'externalId');
+  const plannedBindingsFingerprint = stringField(actionMetadata, 'bindingsFingerprint');
+  const plannedProviderScope = asRecord(actionMetadata?.providerScope);
+  const plannedScopeEntries = Object.entries(plannedProviderScope ?? {});
+  const targetScopeEntries = Object.entries(targetProviderScope ?? {});
+  const providerScopeMatches = plannedScopeEntries.length > 0
+    && targetScopeEntries.length > 0
+    && plannedScopeEntries.every(([, value]) => typeof value === 'string' && value.length > 0)
+    && targetScopeEntries.every(([, value]) => typeof value === 'string' && value.length > 0)
+    && sortedRecordJson(plannedProviderScope!) === sortedRecordJson(targetProviderScope!);
+  if (
+    !plannedExternalId
+    || targetExternalId !== plannedExternalId
+    || !providerScopeMatches
+    || !plannedBindingsFingerprint
+    || bindingIdentityFingerprint(targetBindings) !== plannedBindingsFingerprint
+  ) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Cache destroy target changed after planning',
+      error: 'The current Redis provider id or provider-native scope differs from the reviewed destroy action. Re-run hv_plan before deleting data.',
+    };
+  }
+
   const adapterResult = await adapterFactory.getCacheAdapter(action.resource.provider, project);
   if (!adapterResult.success || !adapterResult.adapter) {
     return { success: false, message: 'Cache adapter unavailable', error: adapterResult.error };
@@ -2860,7 +3652,34 @@ async function destroyCache(
     });
     return { success: true, message: `Destroyed previous ${action.resource.provider} Redis cache` };
   }
+  if (
+    bindings.provisioningIncomplete === true
+    && previousProvider
+    && previousBindings
+  ) {
+    const restoredExternalId = stringField(bindings, 'previousExternalId')
+      ?? stringField(previousBindings, 'instanceId')
+      ?? stringField(previousBindings, 'serviceId');
+    const restoredScope = asRecord(previousBindings.providerScope);
+    if (!restoredExternalId || !restoredScope || Object.keys(restoredScope).length === 0) {
+      return {
+        success: false,
+        status: 'blocked',
+        message: `Destroyed incomplete ${action.resource.provider} Redis cache, but the previous cache binding is incomplete`,
+        error: 'The exact previous provider id and scope must be repaired before Hypervibe can restore that binding safely.',
+      };
+    }
+    ctx.repos.components.update(component.id, {
+      bindings: previousBindings,
+      externalId: restoredExternalId,
+    });
+    return {
+      success: true,
+      message: `Destroyed incomplete ${action.resource.provider} Redis cache and restored the previous ${previousProvider} cache binding`,
+    };
+  }
   ctx.repos.components.delete(component.id);
+  ctx.repos.environments.updatePlatformBindings(environment.id, { cacheNetwork: null });
   return { success: true, message: `Destroyed ${action.resource.provider} Redis cache and removed local component` };
 }
 

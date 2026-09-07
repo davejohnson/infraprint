@@ -141,6 +141,22 @@ describe('CloudSqlAdapter', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('rejects an exact Cloud SQL lookup that returns a different instance identity', async () => {
+    const adapter = await connectedAdapter();
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      name: 'different-instance',
+      state: 'RUNNABLE',
+      databaseVersion: 'POSTGRES_15',
+      region: 'us-central1',
+    })));
+
+    await expect(adapter.inspectDatabaseResources({
+      resource: 'database',
+      id: 'expected-instance',
+      limit: 1,
+    })).rejects.toThrow('exact lookup for expected-instance returned different-instance');
+  });
+
   it('inventories project-level retained backups with exact scoped identities', async () => {
     const adapter = await connectedAdapter();
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL, init?: RequestInit) => {
@@ -263,6 +279,468 @@ describe('CloudSqlAdapter', () => {
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
   });
 
+  it('carries an explicit provision region into every durable Cloud SQL connection identity', async () => {
+    const adapter = await connectedAdapter();
+    let instanceReads = 0;
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.endsWith('/instances/production-postgres') && method === 'GET') {
+        instanceReads += 1;
+        return instanceReads === 1
+          ? new Response('missing', { status: 404 })
+          : Response.json({
+              name: 'production-postgres',
+              state: 'RUNNABLE',
+              databaseVersion: 'POSTGRES_15',
+              region: 'europe-west1',
+              connectionName: 'gcp-project:europe-west1:production-postgres',
+            });
+      }
+      if (url.endsWith('/instances') && method === 'POST') {
+        expect(JSON.parse(String(init?.body))).toMatchObject({
+          name: 'production-postgres',
+          region: 'europe-west1',
+        });
+        return Response.json({ name: 'instance-create-op' });
+      }
+      if (url.endsWith('/operations/instance-create-op') && method === 'GET') {
+        return Response.json({ name: 'instance-create-op', status: 'DONE' });
+      }
+      if (url.endsWith('/instances/production-postgres/databases/app') && method === 'GET') {
+        return new Response('missing', { status: 404 });
+      }
+      if (url.endsWith('/instances/production-postgres/databases') && method === 'POST') {
+        return Response.json({ name: 'database-create-op' });
+      }
+      if (url.endsWith('/operations/database-create-op') && method === 'GET') {
+        return Response.json({ name: 'database-create-op', status: 'DONE' });
+      }
+      throw new Error(`Unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const now = new Date();
+    const environment: Environment = {
+      id: 'env-1', projectId: 'project-1', name: 'production', platformBindings: {}, createdAt: now, updatedAt: now,
+    };
+
+    const result = await adapter.provision('postgres', environment, {
+      resourceName: 'production-postgres',
+      databaseName: 'app',
+      region: 'europe-west1',
+    });
+
+    expect(result.receipt.success).toBe(true);
+    expect(result.component.bindings).toMatchObject({
+      host: 'production-postgres.europe-west1.gcp-project',
+      connectionName: 'gcp-project:europe-west1:production-postgres',
+      providerScope: { projectId: 'gcp-project', region: 'europe-west1' },
+    });
+    expect(instanceReads).toBe(2);
+  });
+
+  it('retains cleanup identity when Cloud SQL acknowledges create but read-back is unknown', async () => {
+    const adapter = await connectedAdapter();
+    let instanceReads = 0;
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.endsWith('/instances/production-postgres') && method === 'GET') {
+        instanceReads += 1;
+        return instanceReads === 1
+          ? new Response('missing', { status: 404 })
+          : new Response('observation unavailable', { status: 503 });
+      }
+      if (url.endsWith('/instances') && method === 'POST') {
+        return Response.json({ name: 'instance-create-op' });
+      }
+      if (url.endsWith('/operations/instance-create-op') && method === 'GET') {
+        return Response.json({ name: 'instance-create-op', status: 'DONE' });
+      }
+      throw new Error(`Unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const now = new Date();
+    const environment: Environment = {
+      id: 'env-1', projectId: 'project-1', name: 'production', platformBindings: {}, createdAt: now, updatedAt: now,
+    };
+
+    const result = await adapter.provision('postgres', environment, {
+      resourceName: 'production-postgres',
+      region: 'europe-west1',
+    });
+
+    expect(result.receipt).toMatchObject({
+      success: false,
+      data: {
+        instanceName: 'production-postgres',
+        projectId: 'gcp-project',
+        region: 'europe-west1',
+        resourceCreated: 'unknown',
+        cleanupRequired: true,
+      },
+    });
+    expect(result.component).toMatchObject({
+      externalId: 'production-postgres',
+      bindings: {
+        provider: 'cloudsql',
+        instanceId: 'production-postgres',
+        providerScope: { projectId: 'gcp-project', region: 'europe-west1' },
+        cleanupRequired: true,
+      },
+    });
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
+  });
+
+  it('recovers the deterministic instance after the create transport loses its response', async () => {
+    vi.stubEnv('HYPERVIBE_CLOUDSQL_CREATE_RECOVERY_ATTEMPTS', '2');
+    vi.stubEnv('HYPERVIBE_CLOUDSQL_CREATE_RECOVERY_DELAY_MS', '0');
+    const adapter = await connectedAdapter();
+    let instanceReads = 0;
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.endsWith('/instances/production-postgres') && method === 'GET') {
+        instanceReads += 1;
+        if (instanceReads < 3) return new Response('missing', { status: 404 });
+        return Response.json({
+          name: 'production-postgres',
+          region: 'europe-west1',
+          databaseVersion: 'POSTGRES_15',
+          state: 'PENDING_CREATE',
+        });
+      }
+      if (url.endsWith('/instances') && method === 'POST') {
+        throw new Error('connection closed after request transmission');
+      }
+      throw new Error(`Unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const now = new Date();
+    const environment: Environment = {
+      id: 'env-1', projectId: 'project-1', name: 'production', platformBindings: {}, createdAt: now, updatedAt: now,
+    };
+
+    const result = await adapter.provision('postgres', environment, {
+      resourceName: 'production-postgres',
+      region: 'europe-west1',
+    });
+
+    expect(result.receipt).toMatchObject({
+      success: false,
+      data: {
+        instanceName: 'production-postgres',
+        projectId: 'gcp-project',
+        region: 'europe-west1',
+        resourceCreated: true,
+        cleanupRequired: true,
+        mutationAttempted: true,
+      },
+    });
+    expect(result.component).toMatchObject({
+      externalId: 'production-postgres',
+      bindings: {
+        provider: 'cloudsql',
+        providerScope: { projectId: 'gcp-project', region: 'europe-west1' },
+      },
+    });
+    expect(fetchMock.mock.calls.filter(([, request]) => request?.method === 'POST'))
+      .toHaveLength(1);
+  });
+
+  it('retains deterministic scope after an acknowledged create returns malformed JSON', async () => {
+    vi.stubEnv('HYPERVIBE_CLOUDSQL_CREATE_RECOVERY_ATTEMPTS', '1');
+    vi.stubEnv('HYPERVIBE_CLOUDSQL_CREATE_RECOVERY_DELAY_MS', '0');
+    const adapter = await connectedAdapter();
+    let instanceReads = 0;
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.endsWith('/instances/production-postgres') && method === 'GET') {
+        instanceReads += 1;
+        return new Response('missing', { status: 404 });
+      }
+      if (url.endsWith('/instances') && method === 'POST') {
+        return new Response('{not-json', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const now = new Date();
+    const environment: Environment = {
+      id: 'env-1', projectId: 'project-1', name: 'production', platformBindings: {}, createdAt: now, updatedAt: now,
+    };
+
+    const result = await adapter.provision('postgres', environment, {
+      resourceName: 'production-postgres',
+      region: 'europe-west1',
+    });
+
+    expect(instanceReads).toBe(2);
+    expect(result.receipt).toMatchObject({
+      success: false,
+      data: {
+        instanceName: 'production-postgres',
+        projectId: 'gcp-project',
+        region: 'europe-west1',
+        resourceCreated: 'unknown',
+        cleanupRequired: true,
+      },
+    });
+    expect(result.component).toMatchObject({
+      externalId: 'production-postgres',
+      bindings: {
+        providerScope: { projectId: 'gcp-project', region: 'europe-west1' },
+      },
+    });
+    expect(fetchMock.mock.calls.filter(([, request]) => request?.method === 'POST'))
+      .toHaveLength(1);
+  });
+
+  it('retains deterministic scope when a lost create response remains eventually absent', async () => {
+    vi.stubEnv('HYPERVIBE_CLOUDSQL_CREATE_RECOVERY_ATTEMPTS', '1');
+    vi.stubEnv('HYPERVIBE_CLOUDSQL_CREATE_RECOVERY_DELAY_MS', '0');
+    const adapter = await connectedAdapter();
+    let instanceReads = 0;
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.endsWith('/instances/production-postgres') && method === 'GET') {
+        instanceReads += 1;
+        return new Response('missing', { status: 404 });
+      }
+      if (url.endsWith('/instances') && method === 'POST') {
+        throw new Error('connection closed after request transmission');
+      }
+      throw new Error(`Unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const now = new Date();
+    const environment: Environment = {
+      id: 'env-1', projectId: 'project-1', name: 'production', platformBindings: {}, createdAt: now, updatedAt: now,
+    };
+
+    const result = await adapter.provision('postgres', environment, {
+      resourceName: 'production-postgres',
+      region: 'europe-west1',
+    });
+
+    expect(instanceReads).toBe(2);
+    expect(result.receipt).toMatchObject({
+      success: false,
+      data: {
+        instanceName: 'production-postgres',
+        projectId: 'gcp-project',
+        region: 'europe-west1',
+        resourceCreated: 'unknown',
+        cleanupRequired: true,
+        mutationAttempted: true,
+      },
+    });
+    expect(result.component).toMatchObject({
+      externalId: 'production-postgres',
+      bindings: {
+        provider: 'cloudsql',
+        providerScope: { projectId: 'gcp-project', region: 'europe-west1' },
+      },
+    });
+    expect(fetchMock.mock.calls.filter(([, request]) => request?.method === 'POST'))
+      .toHaveLength(1);
+  });
+
+  it.each([408, 503])(
+    'retains deterministic scope when the create request returns ambiguous HTTP %s',
+    async (createStatus) => {
+      vi.stubEnv('HYPERVIBE_CLOUDSQL_CREATE_RECOVERY_ATTEMPTS', '1');
+      vi.stubEnv('HYPERVIBE_CLOUDSQL_CREATE_RECOVERY_DELAY_MS', '0');
+      const adapter = await connectedAdapter();
+      let instanceReads = 0;
+      const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        if (url.endsWith('/instances/production-postgres') && method === 'GET') {
+          instanceReads += 1;
+          return new Response('missing', { status: 404 });
+        }
+        if (url.endsWith('/instances') && method === 'POST') {
+          return new Response('ambiguous create failure', { status: createStatus });
+        }
+        throw new Error(`Unexpected fetch: ${method} ${url}`);
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const now = new Date();
+      const environment: Environment = {
+        id: 'env-1', projectId: 'project-1', name: 'production', platformBindings: {}, createdAt: now, updatedAt: now,
+      };
+
+      const result = await adapter.provision('postgres', environment, {
+        resourceName: 'production-postgres',
+        region: 'europe-west1',
+      });
+
+      expect(result.receipt).toMatchObject({
+        success: false,
+        data: {
+          instanceName: 'production-postgres',
+          projectId: 'gcp-project',
+          region: 'europe-west1',
+          resourceCreated: 'unknown',
+          cleanupRequired: true,
+          mutationAttempted: true,
+        },
+      });
+      expect(result.component).toMatchObject({
+        externalId: 'production-postgres',
+        bindings: {
+          provider: 'cloudsql',
+          instanceId: 'production-postgres',
+          providerScope: { projectId: 'gcp-project', region: 'europe-west1' },
+        },
+      });
+      expect(instanceReads).toBe(2);
+      expect(fetchMock.mock.calls.filter(([, request]) => request?.method === 'POST'))
+        .toHaveLength(1);
+    }
+  );
+
+  it('does not retain deterministic identity or retry observation after a definitive create rejection', async () => {
+    const adapter = await connectedAdapter();
+    let instanceReads = 0;
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.endsWith('/instances/production-postgres') && method === 'GET') {
+        instanceReads += 1;
+        return new Response('missing', { status: 404 });
+      }
+      if (url.endsWith('/instances') && method === 'POST') {
+        return new Response('invalid request', { status: 422 });
+      }
+      throw new Error(`Unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const now = new Date();
+    const environment: Environment = {
+      id: 'env-1', projectId: 'project-1', name: 'production', platformBindings: {}, createdAt: now, updatedAt: now,
+    };
+
+    const result = await adapter.provision('postgres', environment, {
+      resourceName: 'production-postgres',
+      region: 'europe-west1',
+    });
+
+    expect(result.receipt.success).toBe(false);
+    expect(result.receipt.data).toBeUndefined();
+    expect(result.component.externalId).toBeNull();
+    expect(result.component.bindings).toEqual({});
+    expect(instanceReads).toBe(1);
+    expect(fetchMock.mock.calls.filter(([, request]) => request?.method === 'POST'))
+      .toHaveLength(1);
+  });
+
+  it('blocks ordinary database mutations when the component belongs to another GCP project', async () => {
+    const adapter = await connectedAdapter();
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const now = new Date();
+    const component: Component = {
+      id: 'component-1',
+      environmentId: 'env-1',
+      type: 'postgres',
+      externalId: 'production-postgres',
+      bindings: {
+        provider: 'cloudsql',
+        database: 'app',
+        providerScope: { projectId: 'different-project', region: 'us-central1' },
+      },
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const database = await adapter.ensureDatabase(component);
+    const availability = await adapter.configureAvailability(
+      { id: 'env-1', projectId: 'project-1', name: 'production', platformBindings: {}, createdAt: now, updatedAt: now },
+      component,
+      'zonal'
+    );
+    const destroyed = await adapter.destroy(component);
+
+    expect(database.success).toBe(false);
+    expect(database.error).toContain('different-project');
+    expect(availability.success).toBe(false);
+    expect(availability.error).toContain('different-project');
+    expect(destroyed.success).toBe(false);
+    expect(destroyed.error).toContain('different-project');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('blocks an external-ID-bound component whose durable GCP project scope is missing', async () => {
+    const adapter = await connectedAdapter();
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const now = new Date();
+    const component: Component = {
+      id: 'component-1',
+      environmentId: 'env-1',
+      type: 'postgres',
+      externalId: 'production-postgres',
+      bindings: { provider: 'cloudsql' },
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const result = await adapter.destroy(component);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('missing its durable GCP project scope');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('does not mutate or delete a logical database when the live instance moved outside its bound region', async () => {
+    const adapter = await connectedAdapter();
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.endsWith('/instances/production-postgres') && method === 'GET') {
+        return Response.json({
+          name: 'production-postgres',
+          state: 'RUNNABLE',
+          databaseVersion: 'POSTGRES_15',
+          region: 'us-east1',
+        });
+      }
+      throw new Error(`Unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const now = new Date();
+    const component: Component = {
+      id: 'component-1',
+      environmentId: 'env-1',
+      type: 'postgres',
+      externalId: 'production-postgres',
+      bindings: {
+        provider: 'cloudsql',
+        database: 'app',
+        providerScope: { projectId: 'gcp-project', region: 'us-central1' },
+      },
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const result = await adapter.ensureDatabase(component);
+    const destroyed = await adapter.destroy(component);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('not bound region us-central1');
+    expect(destroyed.success).toBe(false);
+    expect(destroyed.error).toContain('not bound region us-central1');
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/databases'))).toBe(false);
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
+  });
+
   it('creates a missing logical database on an existing Cloud SQL instance', async () => {
     const adapter = new CloudSqlAdapter();
     await adapter.connect({
@@ -282,6 +760,14 @@ describe('CloudSqlAdapter', () => {
       const url = String(input);
       const method = init?.method ?? 'GET';
 
+      if (url.endsWith('/instances/app-postgres') && method === 'GET') {
+        return Response.json({
+          name: 'app-postgres',
+          state: 'RUNNABLE',
+          databaseVersion: 'POSTGRES_15',
+          region: 'us-central1',
+        });
+      }
       if (url.endsWith('/instances/app-postgres/databases/app') && method === 'GET') {
         return new Response('missing', { status: 404 });
       }
@@ -305,6 +791,7 @@ describe('CloudSqlAdapter', () => {
       bindings: {
         provider: 'cloudsql',
         database: 'app',
+        providerScope: { projectId: 'gcp-project', region: 'us-central1' },
       },
       createdAt: now,
       updatedAt: now,
@@ -345,6 +832,14 @@ describe('CloudSqlAdapter', () => {
       const url = String(input);
       const method = init?.method ?? 'GET';
 
+      if (url.endsWith('/instances/app-postgres') && method === 'GET') {
+        return Response.json({
+          name: 'app-postgres',
+          state: 'RUNNABLE',
+          databaseVersion: 'POSTGRES_15',
+          region: 'us-central1',
+        });
+      }
       if (url.endsWith('/instances/app-postgres/databases/app') && method === 'GET') {
         return Response.json({ name: 'app' });
       }
@@ -362,6 +857,7 @@ describe('CloudSqlAdapter', () => {
       bindings: {
         provider: 'cloudsql',
         database: 'app',
+        providerScope: { projectId: 'gcp-project', region: 'us-central1' },
       },
       createdAt: now,
       updatedAt: now,
@@ -375,7 +871,7 @@ describe('CloudSqlAdapter', () => {
       databaseName: 'app',
       created: false,
     });
-    expect(fetchMock.mock.calls).toHaveLength(1);
+    expect(fetchMock.mock.calls).toHaveLength(2);
   });
 
   it('observes a provisioned Cloud SQL instance for an environment', async () => {
@@ -526,7 +1022,7 @@ describe('CloudSqlAdapter', () => {
       }
       if (url.endsWith('/instances/primary-1') && method === 'GET') {
         return Response.json({
-          name: 'primary-1', state: 'RUNNABLE', databaseVersion: 'POSTGRES_15',
+          name: 'primary-1', state: 'RUNNABLE', databaseVersion: 'POSTGRES_15', region: 'us-central1',
           settings: {
             backupConfiguration: {
               enabled: true,
@@ -543,7 +1039,12 @@ describe('CloudSqlAdapter', () => {
     const now = new Date();
     const component: Component = {
       id: 'component-1', environmentId: 'env-1', type: 'postgres', externalId: 'primary-1',
-      bindings: { provider: 'cloudsql', instanceId: 'primary-1' }, createdAt: now, updatedAt: now,
+      bindings: {
+        provider: 'cloudsql',
+        instanceId: 'primary-1',
+        providerScope: { projectId: 'gcp-project', region: 'us-central1' },
+      },
+      createdAt: now, updatedAt: now,
     };
     const environment: Environment = {
       id: 'env-1', projectId: 'project-1', name: 'production', platformBindings: {}, createdAt: now, updatedAt: now,
@@ -597,7 +1098,15 @@ describe('CloudSqlAdapter', () => {
     const now = new Date();
     const component: Component = {
       id: 'component-1', environmentId: 'env-1', type: 'postgres', externalId: 'primary-1',
-      bindings: { provider: 'cloudsql', instanceId: 'primary-1', username: 'app', password: 'secret', database: 'app', port: 5432 },
+      bindings: {
+        provider: 'cloudsql',
+        instanceId: 'primary-1',
+        providerScope: { projectId: 'gcp-project', region: 'us-central1' },
+        username: 'app',
+        password: 'secret',
+        database: 'app',
+        port: 5432,
+      },
       createdAt: now, updatedAt: now,
     };
     const environment: Environment = {
@@ -638,7 +1147,12 @@ describe('CloudSqlAdapter', () => {
     const now = new Date();
     const component: Component = {
       id: 'component-1', environmentId: 'env-1', type: 'postgres', externalId: 'primary-1',
-      bindings: { provider: 'cloudsql', instanceId: 'primary-1' }, createdAt: now, updatedAt: now,
+      bindings: {
+        provider: 'cloudsql',
+        instanceId: 'primary-1',
+        providerScope: { projectId: 'gcp-project', region: 'us-central1' },
+      },
+      createdAt: now, updatedAt: now,
     };
     const environment: Environment = {
       id: 'env-1', projectId: 'project-1', name: 'production', platformBindings: {}, createdAt: now, updatedAt: now,
@@ -689,6 +1203,7 @@ describe('CloudSqlAdapter', () => {
       bindings: {
         provider: 'cloudsql',
         connectionName: 'gcp-project:us-central1:production-postgres',
+        providerScope: { projectId: 'gcp-project', region: 'us-central1' },
         username: 'postgres',
         password: 'db-secret',
         database: 'app',
@@ -729,6 +1244,7 @@ describe('CloudSqlAdapter', () => {
       id: 'component-1', environmentId: environment.id, type: 'postgres', externalId: 'production-postgres',
       bindings: {
         provider: 'cloudsql', connectionName: 'gcp-project:us-central1:production-postgres',
+        providerScope: { projectId: 'gcp-project', region: 'us-central1' },
         username: 'postgres', password: 'db-secret', database: 'app',
       },
       createdAt: now, updatedAt: now,
@@ -753,6 +1269,7 @@ describe('CloudSqlAdapter', () => {
           ? Response.json({
               name: 'production-postgres',
               state: instanceRead === 1 ? 'RUNNABLE' : 'PENDING_DELETE',
+              region: 'us-central1',
             })
           : new Response('not found', { status: 404 });
       }
@@ -770,7 +1287,10 @@ describe('CloudSqlAdapter', () => {
       environmentId: 'env-1',
       type: 'postgres',
       externalId: 'production-postgres',
-      bindings: { provider: 'cloudsql' },
+      bindings: {
+        provider: 'cloudsql',
+        providerScope: { projectId: 'gcp-project', region: 'us-central1' },
+      },
       createdAt: new Date(),
       updatedAt: new Date(),
     } as Component;
@@ -794,7 +1314,10 @@ describe('CloudSqlAdapter', () => {
       environmentId: 'env-1',
       type: 'postgres',
       externalId: 'production-postgres',
-      bindings: { provider: 'cloudsql' },
+      bindings: {
+        provider: 'cloudsql',
+        providerScope: { projectId: 'gcp-project', region: 'us-central1' },
+      },
       createdAt: new Date(),
       updatedAt: new Date(),
     } as Component;
@@ -814,7 +1337,10 @@ describe('CloudSqlAdapter', () => {
       environmentId: 'env-1',
       type: 'postgres',
       externalId: 'production-postgres',
-      bindings: { provider: 'cloudsql' },
+      bindings: {
+        provider: 'cloudsql',
+        providerScope: { projectId: 'gcp-project', region: 'us-central1' },
+      },
       createdAt: new Date(),
       updatedAt: new Date(),
     } as Component;
