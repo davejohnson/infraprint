@@ -6,6 +6,7 @@ import type {
   CacheCapabilities,
   CacheEngine,
   CacheProvisionResult,
+  CacheTargetOptions,
   ICacheAdapter,
 } from '../../../domain/ports/cache.port.js';
 import type { ObservedCache } from '../../../domain/ports/observe.port.js';
@@ -15,17 +16,28 @@ import {
   type ProviderInspectionRequest,
 } from '../../../domain/registry/provider.registry.js';
 
-export const MemorystoreCredentialsSchema = z.object({
+const MemorystoreAuthenticationSchema = z.object({
   projectId: z.string().min(1, 'GCP Project ID is required'),
   credentials: z.string().min(1, 'Service account JSON is required'),
-  region: z.string().default('us-central1'),
-  authorizedNetwork: z.string().optional()
-    .describe('Full Compute Engine VPC network resource name; defaults to the project default network'),
-  connectMode: z.enum(['DIRECT_PEERING', 'PRIVATE_SERVICE_ACCESS'])
-    .default('DIRECT_PEERING'),
-  tier: z.enum(['BASIC', 'STANDARD_HA']).default('BASIC'),
-  memorySizeGb: z.number().int().min(1).default(1),
-});
+}).strict();
+
+/**
+ * Placement used to live in connection credentials. Strip those legacy keys
+ * so existing encrypted connections continue to authenticate, while desired
+ * state is now the sole authority for region/network/tier/size.
+ */
+export const MemorystoreCredentialsSchema = z.preprocess((input) => {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+  const {
+    region: _legacyRegion,
+    authorizedNetwork: _legacyNetwork,
+    connectMode: _legacyConnectMode,
+    tier: _legacyTier,
+    memorySizeGb: _legacyMemorySize,
+    ...authentication
+  } = input as Record<string, unknown>;
+  return authentication;
+}, MemorystoreAuthenticationSchema);
 
 export type MemorystoreCredentials = z.infer<typeof MemorystoreCredentialsSchema>;
 
@@ -72,6 +84,23 @@ interface AuthStringResponse {
   authString?: string;
 }
 
+interface ComputeNetwork {
+  name?: string;
+  selfLink?: string;
+}
+
+interface ComputeSubnetwork {
+  name?: string;
+  selfLink?: string;
+  network?: string;
+  region?: string;
+}
+
+interface ResolvedNetworkPlacement {
+  network: string;
+  subnetwork: string;
+}
+
 class MemorystoreApiError extends Error {
   constructor(
     readonly status: number,
@@ -83,6 +112,8 @@ class MemorystoreApiError extends Error {
 }
 
 const API_ROOT = 'https://redis.googleapis.com/v1';
+const COMPUTE_API_ROOT = 'https://compute.googleapis.com/compute/v1';
+const DEFAULT_REGION = 'us-central1';
 const DEFAULT_ATTEMPTS = 120;
 const DEFAULT_DELAY_MS = 5_000;
 
@@ -98,6 +129,7 @@ export class MemorystoreAdapter implements ICacheAdapter {
     supportsHighAvailability: true,
     supportsPersistence: true,
     serverlessOptimized: false,
+    requiresRuntimeNetwork: true,
   };
 
   private credentials: MemorystoreCredentials | null = null;
@@ -105,6 +137,13 @@ export class MemorystoreAdapter implements ICacheAdapter {
   private auth: GoogleAuth | null = null;
   private accessToken: string | null = null;
   private tokenExpiresAt = 0;
+  private target: CacheTargetOptions = {};
+
+  configureTarget(target: CacheTargetOptions): void {
+    this.target = Object.fromEntries(
+      Object.entries(target).filter(([, value]) => value !== undefined)
+    ) as CacheTargetOptions;
+  }
 
   async connect(credentials: unknown): Promise<void> {
     this.credentials = MemorystoreCredentialsSchema.parse(credentials);
@@ -131,7 +170,7 @@ export class MemorystoreAdapter implements ICacheAdapter {
       return { success: false, error: 'Not connected. Call connect() first.' };
     }
     try {
-      await this.listInstances(this.credentials.region, 1);
+      await this.listInstances(this.target.region ?? DEFAULT_REGION, 1);
       return {
         success: true,
         email: this.serviceAccount.client_email,
@@ -147,15 +186,15 @@ export class MemorystoreAdapter implements ICacheAdapter {
     this.auth = null;
     this.accessToken = null;
     this.tokenExpiresAt = 0;
+    this.target = {};
   }
 
   async provision(
     engine: CacheEngine,
     environment: Environment,
-    options?: {
-      size?: string;
-      region?: string;
+    options?: CacheTargetOptions & {
       resourceName?: string;
+      component?: Component | null;
     }
   ): Promise<CacheProvisionResult> {
     if (!this.credentials) {
@@ -169,51 +208,115 @@ export class MemorystoreAdapter implements ICacheAdapter {
       );
     }
 
-    const region = options?.region ?? this.credentials.region;
+    const boundRegion = options?.component?.externalId
+      ? this.instanceIdentity(options.component.externalId)?.region
+      : undefined;
+    const region = options?.region ?? this.target.region ?? boundRegion ?? DEFAULT_REGION;
     const resourceName = options?.resourceName ?? `${environment.name}-redis`;
     const instanceId = this.sanitizeId(resourceName);
-    const externalId = this.instanceResourceName(region, instanceId);
+    const externalId = options?.component?.externalId ?? this.instanceResourceName(region, instanceId);
     let mutationAttempted = false;
+    let placement: ResolvedNetworkPlacement | undefined;
 
     try {
-      const matches = await this.findInstancesByName(region, resourceName, instanceId);
-      if (matches.length > 0) {
-        throw new Error([
-          `Google Cloud Memorystore instance "${resourceName}" already exists: ${matches
-            .map((instance) => `${instance.displayName ?? this.instanceId(instance.name)} (${instance.name})`)
-            .join(', ')}.`,
-          'Hypervibe will not choose or silently adopt a name match. Bind/import the intended instance or remove the duplicate, then run hv_plan again.',
-        ].join(' '));
+      let existing: MemorystoreInstance | null = null;
+      if (options?.component?.externalId) {
+        this.assertBoundComponentScope(options.component, region);
+        existing = await this.getInstance(options.component.externalId);
+        if (!existing) {
+          throw new Error(
+            `The bound Memorystore instance ${options.component.externalId} is absent. Refusing to create a replacement under an existing durable binding; re-run hv_plan.`
+          );
+        }
+      } else {
+        const matches = await this.findInstancesByName(region, resourceName, instanceId);
+        if (matches.length > 0) {
+          throw new Error([
+            `Google Cloud Memorystore instance "${resourceName}" already exists: ${matches
+              .map((instance) => `${instance.displayName ?? this.instanceId(instance.name)} (${instance.name})`)
+              .join(', ')}.`,
+            'Hypervibe will not choose or silently adopt a name match. Bind/import the intended instance or remove the duplicate, then run hv_plan again.',
+          ].join(' '));
+        }
       }
 
-      mutationAttempted = true;
-      const operation = await this.request<GoogleOperation>(
-        'POST',
-        `/projects/${encodeURIComponent(this.credentials.projectId)}/locations/${encodeURIComponent(region)}/instances`,
-        {
-          query: { instanceId },
-          body: {
-            displayName: resourceName,
-            tier: this.credentials.tier,
-            memorySizeGb: this.memorySize(options?.size),
-            redisVersion: 'REDIS_7_2',
-            authorizedNetwork: this.credentials.authorizedNetwork
-              ?? `projects/${this.credentials.projectId}/global/networks/default`,
-            connectMode: this.credentials.connectMode,
-            authEnabled: true,
-            transitEncryptionMode: 'DISABLED',
-            labels: {
-              managed_by: 'hypervibe',
-              environment: this.sanitizeLabel(environment.name),
-            },
-          },
+      placement = await this.resolveNetworkPlacement({
+        region,
+        network: options?.network ?? this.target.network,
+        subnetwork: options?.subnetwork ?? this.target.subnetwork,
+      });
+
+      let ready: MemorystoreInstance;
+      if (existing) {
+        const liveNetwork = this.normalizeNetworkResource(existing.authorizedNetwork ?? 'default');
+        if (liveNetwork !== placement.network) {
+          throw new Error(
+            `Memorystore authorized network is ${liveNetwork}, but desired state selects ${placement.network}. The instance network is immutable; declare the observed network or explicitly replace the cache.`
+          );
         }
-      );
-      if (!operation.name) {
-        throw new Error('Memorystore create response did not include an operation name.');
+        const desiredTier = options?.tier ?? this.target.tier;
+        const desiredSize = options?.size ?? this.target.size;
+        const patch: Record<string, unknown> = {};
+        const updateMask: string[] = [];
+        if (desiredTier !== undefined) {
+          const tier = this.cacheTier(desiredTier);
+          if (existing.tier !== tier) {
+            patch.tier = tier;
+            updateMask.push('tier');
+          }
+        }
+        if (desiredSize !== undefined) {
+          const memorySizeGb = this.memorySize(desiredSize);
+          if (existing.memorySizeGb !== memorySizeGb) {
+            patch.memorySizeGb = memorySizeGb;
+            updateMask.push('memorySizeGb');
+          }
+        }
+        if (updateMask.length > 0) {
+          mutationAttempted = true;
+          const operation = await this.request<GoogleOperation>('PATCH', `/${existing.name}`, {
+            query: { updateMask: updateMask.join(',') },
+            body: patch,
+          });
+          if (!operation.name) {
+            throw new Error('Memorystore update response did not include an operation name.');
+          }
+          await this.waitForOperation(operation.name, 'update');
+          ready = await this.waitForInstance(existing.name, 'READY');
+        } else {
+          ready = existing.state === 'READY'
+            ? existing
+            : await this.waitForInstance(existing.name, 'READY');
+        }
+      } else {
+        mutationAttempted = true;
+        const operation = await this.request<GoogleOperation>(
+          'POST',
+          `/projects/${encodeURIComponent(this.credentials.projectId)}/locations/${encodeURIComponent(region)}/instances`,
+          {
+            query: { instanceId },
+            body: {
+              displayName: resourceName,
+              tier: this.cacheTier(options?.tier ?? this.target.tier ?? 'BASIC'),
+              memorySizeGb: this.memorySize(options?.size ?? this.target.size ?? '1gb'),
+              redisVersion: 'REDIS_7_2',
+              authorizedNetwork: placement.network,
+              connectMode: 'DIRECT_PEERING',
+              authEnabled: true,
+              transitEncryptionMode: 'DISABLED',
+              labels: {
+                managed_by: 'hypervibe',
+                environment: this.sanitizeLabel(environment.name),
+              },
+            },
+          }
+        );
+        if (!operation.name) {
+          throw new Error('Memorystore create response did not include an operation name.');
+        }
+        await this.waitForOperation(operation.name, 'create');
+        ready = await this.waitForInstance(externalId, 'READY');
       }
-      await this.waitForOperation(operation.name, 'create');
-      const ready = await this.waitForInstance(externalId, 'READY');
       if (!ready.host || !ready.port) {
         throw new Error(
           `Memorystore instance ${ready.name} became READY without a host and port.`
@@ -221,7 +324,7 @@ export class MemorystoreAdapter implements ICacheAdapter {
       }
       const authString = await this.getAuthString(ready.name);
       const connectionUrl = this.connectionUrl(ready.host, ready.port, authString);
-      const component = this.component(environment, ready, connectionUrl);
+      const component = this.component(environment, ready, connectionUrl, placement);
 
       return {
         component,
@@ -229,7 +332,7 @@ export class MemorystoreAdapter implements ICacheAdapter {
         envVars: { REDIS_URL: connectionUrl },
         receipt: {
           success: true,
-          message: `Created and verified Google Cloud Memorystore instance ${instanceId}`,
+          message: `${existing ? 'Reconciled' : 'Created'} and verified Google Cloud Memorystore instance ${this.instanceId(ready.name)}`,
           data: {
             instanceId: ready.name,
             displayName: ready.displayName,
@@ -252,12 +355,7 @@ export class MemorystoreAdapter implements ICacheAdapter {
       }
       return {
         component: mutationAttempted
-          ? this.partialComponent(environment, {
-            name: externalId,
-            displayName: resourceName,
-            state: live?.state,
-            ...(live ?? {}),
-          })
+          ? this.partialComponent(environment, externalId, placement)
           : this.emptyComponent(environment, engine),
         receipt: {
           success: false,
@@ -288,6 +386,9 @@ export class MemorystoreAdapter implements ICacheAdapter {
     if (!component.externalId) {
       return null;
     }
+    const identity = this.instanceIdentity(component.externalId);
+    if (!identity) throw new Error(`Invalid Memorystore instance id: ${component.externalId}`);
+    this.assertBoundComponentScope(component, identity.region);
     const instance = await this.getInstance(component.externalId);
     if (!instance?.host || !instance.port) {
       return null;
@@ -304,6 +405,9 @@ export class MemorystoreAdapter implements ICacheAdapter {
       };
     }
     try {
+      const identity = this.instanceIdentity(component.externalId);
+      if (!identity) throw new Error(`Invalid Memorystore instance id: ${component.externalId}`);
+      this.assertBoundComponentScope(component, identity.region);
       const existing = await this.getInstance(component.externalId);
       if (!existing) {
         return {
@@ -341,6 +445,9 @@ export class MemorystoreAdapter implements ICacheAdapter {
       return { status: 'unknown' };
     }
     try {
+      const identity = this.instanceIdentity(component.externalId);
+      if (!identity) throw new Error(`Invalid Memorystore instance id: ${component.externalId}`);
+      this.assertBoundComponentScope(component, identity.region);
       const instance = await this.getInstance(component.externalId);
       if (!instance) {
         return { status: 'stopped', message: 'Instance is absent' };
@@ -357,19 +464,24 @@ export class MemorystoreAdapter implements ICacheAdapter {
   async observeCache(
     environment: Environment,
     component?: Component | null,
-    options?: { resourceName?: string }
+    options?: CacheTargetOptions & { resourceName?: string }
   ): Promise<ObservedCache | null> {
     if (!this.credentials) {
       throw new Error('Not connected. Call connect() first.');
     }
+    const boundRegion = component?.externalId
+      ? this.instanceIdentity(component.externalId)?.region
+      : undefined;
+    const region = options?.region ?? this.target.region ?? boundRegion ?? DEFAULT_REGION;
     let instance: MemorystoreInstance | null;
     if (component?.externalId) {
+      this.assertBoundComponentScope(component, region);
       instance = await this.getInstance(component.externalId);
     } else {
       const resourceName = options?.resourceName ?? `${environment.name}-redis`;
       const instanceId = this.sanitizeId(resourceName);
       const matches = await this.findInstancesByName(
-        this.credentials.region,
+        region,
         resourceName,
         instanceId
       );
@@ -382,9 +494,15 @@ export class MemorystoreAdapter implements ICacheAdapter {
       }
       instance = matches[0] ?? null;
     }
-    if (!instance) {
+    if (!instance && component?.externalId) {
       return null;
     }
+    const placement = await this.resolveNetworkPlacement({
+      region,
+      network: options?.network ?? this.target.network,
+      subnetwork: options?.subnetwork ?? this.target.subnetwork,
+    });
+    if (!instance) return null;
     return {
       provider: 'memorystore',
       engine: 'redis',
@@ -392,6 +510,13 @@ export class MemorystoreAdapter implements ICacheAdapter {
       providerScope: this.providerScope(instance),
       name: instance.displayName ?? this.instanceId(instance.name),
       status: this.normalizedStatus(instance.state),
+      config: {
+        region: this.providerScope(instance).region,
+        network: this.normalizeNetworkResource(instance.authorizedNetwork ?? placement.network),
+        subnetwork: placement.subnetwork,
+        ...(instance.tier ? { tier: instance.tier } : {}),
+        ...(instance.memorySizeGb ? { size: `${instance.memorySizeGb}gb` } : {}),
+      },
     };
   }
 
@@ -473,8 +598,35 @@ export class MemorystoreAdapter implements ICacheAdapter {
   private async getInstance(
     resourceName: string
   ): Promise<MemorystoreInstance | null> {
+    const expected = this.instanceIdentity(resourceName);
+    if (!this.credentials) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    if (!expected) {
+      throw new Error(`Invalid Memorystore instance id: ${resourceName}`);
+    }
+    if (expected.projectId !== this.credentials.projectId) {
+      throw new Error(
+        `Memorystore instance ${resourceName} belongs to GCP project ${expected.projectId}, not connected project ${this.credentials.projectId}.`
+      );
+    }
     try {
-      return await this.request<MemorystoreInstance>('GET', `/${resourceName}`);
+      const instance = await this.request<MemorystoreInstance>('GET', `/${resourceName}`);
+      const observed = this.instanceIdentity(instance?.name);
+      if (
+        !observed
+        || observed.projectId !== expected.projectId
+        || observed.region !== expected.region
+        || observed.instanceId !== expected.instanceId
+      ) {
+        const observedName = typeof instance?.name === 'string' && instance.name.trim()
+          ? instance.name
+          : '<missing or malformed name>';
+        throw new Error(
+          `Memorystore exact GET for ${resourceName} returned mismatched identity ${observedName}; refusing to use or retain it.`
+        );
+      }
+      return instance;
     } catch (error) {
       if (error instanceof MemorystoreApiError && error.status === 404) {
         return null;
@@ -609,7 +761,8 @@ export class MemorystoreAdapter implements ICacheAdapter {
   private component(
     environment: Environment,
     instance: MemorystoreInstance,
-    connectionUrl: string
+    connectionUrl: string,
+    placement: ResolvedNetworkPlacement
   ): Component {
     return {
       id: '',
@@ -625,7 +778,19 @@ export class MemorystoreAdapter implements ICacheAdapter {
         host: instance.host,
         port: instance.port,
         region: instance.currentLocationId ?? instance.locationId,
-        authorizedNetwork: instance.authorizedNetwork,
+        network: placement.network,
+        authorizedNetwork: placement.network,
+        subnetwork: placement.subnetwork,
+        tier: instance.tier,
+        size: instance.memorySizeGb ? `${instance.memorySizeGb}gb` : undefined,
+        runtimeNetwork: {
+          provider: 'cloudrun',
+          projectId: this.credentials!.projectId,
+          region: this.providerScope(instance).region,
+          network: placement.network,
+          subnetwork: placement.subnetwork,
+          egress: 'PRIVATE_RANGES_ONLY',
+        },
         privateNetworkOnly: true,
         transitEncryptionMode: instance.transitEncryptionMode ?? 'DISABLED',
       },
@@ -636,17 +801,23 @@ export class MemorystoreAdapter implements ICacheAdapter {
 
   private partialComponent(
     environment: Environment,
-    instance: MemorystoreInstance
+    resourceName: string,
+    placement?: ResolvedNetworkPlacement
   ): Component {
     return {
       id: '',
       environmentId: environment.id,
       type: 'redis',
-      externalId: instance.name,
+      externalId: resourceName,
       bindings: {
         provider: 'memorystore',
-        instanceId: instance.name,
-        providerScope: this.providerScope(instance),
+        instanceId: resourceName,
+        providerScope: this.providerScopeForResourceName(resourceName),
+        ...(placement ? {
+          network: placement.network,
+          authorizedNetwork: placement.network,
+          subnetwork: placement.subnetwork,
+        } : {}),
         privateNetworkOnly: true,
       },
       createdAt: new Date(),
@@ -697,17 +868,140 @@ export class MemorystoreAdapter implements ICacheAdapter {
   }
 
   private providerScope(instance: MemorystoreInstance): Record<string, string> {
+    return this.providerScopeForResourceName(instance.name);
+  }
+
+  private providerScopeForResourceName(resourceName: string): Record<string, string> {
     if (!this.credentials) {
       throw new Error('Not connected. Call connect() first.');
     }
-    const segments = instance.name.split('/');
-    const projectId = segments[0] === 'projects' && segments[1]
-      ? segments[1]
-      : this.credentials.projectId;
-    const region = segments[2] === 'locations' && segments[3]
-      ? segments[3]
-      : instance.currentLocationId ?? instance.locationId ?? this.credentials.region;
-    return { projectId, region };
+    const identity = this.instanceIdentity(resourceName);
+    if (!identity) {
+      throw new Error(`Invalid Memorystore instance id: ${resourceName}`);
+    }
+    if (identity.projectId !== this.credentials.projectId) {
+      throw new Error(
+        `Memorystore instance ${resourceName} belongs to GCP project ${identity.projectId}, not connected project ${this.credentials.projectId}.`
+      );
+    }
+    return { projectId: identity.projectId, region: identity.region };
+  }
+
+  private instanceIdentity(resourceName: unknown): { projectId: string; region: string; instanceId: string } | null {
+    if (typeof resourceName !== 'string') return null;
+    const match = /^projects\/([^/]+)\/locations\/([^/]+)\/instances\/([^/]+)$/.exec(resourceName);
+    return match ? { projectId: match[1]!, region: match[2]!, instanceId: match[3]! } : null;
+  }
+
+  private assertBoundComponentScope(component: Component, desiredRegion: string): void {
+    if (!this.credentials || !component.externalId) {
+      throw new Error('Memorystore binding is missing its provider-native instance id.');
+    }
+    const identity = this.instanceIdentity(component.externalId);
+    const rawScope = component.bindings.providerScope;
+    const scope = rawScope && typeof rawScope === 'object' && !Array.isArray(rawScope)
+      ? rawScope as Record<string, unknown>
+      : undefined;
+    if (!identity || typeof scope?.projectId !== 'string' || typeof scope.region !== 'string') {
+      throw new Error(
+        'Memorystore binding is missing its exact GCP project/region scope; re-observe or explicitly import it before mutation.'
+      );
+    }
+    if (
+      identity.projectId !== scope.projectId
+      || identity.region !== scope.region
+      || identity.projectId !== this.credentials.projectId
+      || identity.region !== desiredRegion
+    ) {
+      throw new Error(
+        `Memorystore binding scope ${scope.projectId}/${scope.region} does not match instance ${identity.projectId}/${identity.region} and connected target ${this.credentials.projectId}/${desiredRegion}; refusing cross-scope access.`
+      );
+    }
+  }
+
+  private normalizeNetworkResource(value: string): string {
+    if (!this.credentials) throw new Error('Not connected. Call connect() first.');
+    const normalized = value.replace(/^https:\/\/www\.googleapis\.com\/compute\/v1\//, '');
+    const match = /^projects\/([^/]+)\/global\/networks\/([^/]+)$/.exec(normalized);
+    const networkName = match?.[2] ?? (/^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$/.test(normalized) ? normalized : undefined);
+    const projectId = match?.[1] ?? this.credentials.projectId;
+    if (!networkName || projectId !== this.credentials.projectId) {
+      throw new Error(
+        `Cache network must name an existing VPC in connected GCP project ${this.credentials.projectId}; received ${value}.`
+      );
+    }
+    return `projects/${projectId}/global/networks/${networkName}`;
+  }
+
+  private normalizeSubnetworkResource(value: string, region: string): string {
+    if (!this.credentials) throw new Error('Not connected. Call connect() first.');
+    const normalized = value.replace(/^https:\/\/www\.googleapis\.com\/compute\/v1\//, '');
+    const match = /^projects\/([^/]+)\/regions\/([^/]+)\/subnetworks\/([^/]+)$/.exec(normalized);
+    const subnetworkName = match?.[3] ?? (/^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$/.test(normalized) ? normalized : undefined);
+    const projectId = match?.[1] ?? this.credentials.projectId;
+    const subnetRegion = match?.[2] ?? region;
+    if (!subnetworkName || projectId !== this.credentials.projectId || subnetRegion !== region) {
+      throw new Error(
+        `Cache subnetwork must name an existing subnet in ${this.credentials.projectId}/${region}; received ${value}.`
+      );
+    }
+    return `projects/${projectId}/regions/${subnetRegion}/subnetworks/${subnetworkName}`;
+  }
+
+  private async resolveNetworkPlacement(target: {
+    region: string;
+    network?: string;
+    subnetwork?: string;
+  }): Promise<ResolvedNetworkPlacement> {
+    const network = this.normalizeNetworkResource(target.network ?? 'default');
+    const networkName = network.split('/').at(-1)!;
+    if (networkName !== 'default' && !target.subnetwork) {
+      throw new Error(
+        `Cache network ${network} requires cache.subnetwork. Hypervibe only defaults the subnet for the existing default VPC and never creates networking implicitly.`
+      );
+    }
+    const subnetwork = this.normalizeSubnetworkResource(
+      target.subnetwork ?? 'default',
+      target.region
+    );
+    const subnetworkName = subnetwork.split('/').at(-1)!;
+    const [observedNetwork, observedSubnetwork] = await Promise.all([
+      this.computeGet<ComputeNetwork>(
+        `/projects/${encodeURIComponent(this.credentials!.projectId)}/global/networks/${encodeURIComponent(networkName)}`,
+        `VPC network ${network}`
+      ),
+      this.computeGet<ComputeSubnetwork>(
+        `/projects/${encodeURIComponent(this.credentials!.projectId)}/regions/${encodeURIComponent(target.region)}/subnetworks/${encodeURIComponent(subnetworkName)}`,
+        `subnetwork ${subnetwork}`
+      ),
+    ]);
+    const observedNetworkId = this.normalizeNetworkResource(observedNetwork.selfLink ?? network);
+    const subnetNetwork = observedSubnetwork.network
+      ? this.normalizeNetworkResource(observedSubnetwork.network)
+      : undefined;
+    if (observedNetworkId !== network || subnetNetwork !== network) {
+      throw new Error(
+        `GCP subnetwork ${subnetwork} is not attached to selected cache network ${network}; choose an existing subnet from that exact VPC.`
+      );
+    }
+    return { network, subnetwork };
+  }
+
+  private async computeGet<T>(path: string, label: string): Promise<T> {
+    const token = await this.getAccessToken();
+    const response = await fetch(`${COMPUTE_API_ROOT}${path}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    });
+    if (!response.ok) {
+      const detail = this.safeApiError(await response.text());
+      if (response.status === 404) {
+        throw new Error(
+          `${label} does not exist or is not visible. Declare an existing cache.network/cache.subnetwork; Hypervibe will not create a VPC or subnet implicitly.`
+        );
+      }
+      throw new Error(`Google Compute API could not verify ${label}: ${response.status} ${detail}`);
+    }
+    return await response.json() as T;
   }
 
   private sanitizeId(value: string): string {
@@ -728,11 +1022,16 @@ export class MemorystoreAdapter implements ICacheAdapter {
   }
 
   private memorySize(value?: string): number {
-    if (!value) return this.credentials!.memorySizeGb;
-    const parsed = Number(value.replace(/gb$/i, ''));
-    return Number.isInteger(parsed) && parsed >= 1
-      ? parsed
-      : this.credentials!.memorySizeGb;
+    const parsed = Number((value ?? '').replace(/gb$/i, ''));
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      throw new Error(`Memorystore cache.size must be a positive whole number of GB (for example "1gb"); received ${value ?? 'empty'}.`);
+    }
+    return parsed;
+  }
+
+  private cacheTier(value: string): 'BASIC' | 'STANDARD_HA' {
+    if (value === 'BASIC' || value === 'STANDARD_HA') return value;
+    throw new Error(`Memorystore cache.tier must be BASIC or STANDARD_HA; received ${value}.`);
   }
 
   private normalizedStatus(
@@ -781,20 +1080,29 @@ providerRegistry.register({
     credentialsSchema: MemorystoreCredentialsSchema,
     setupHelpUrl: 'https://console.cloud.google.com/iam-admin/serviceaccounts',
     connectionAliases: ['cloudrun'],
+    maturity: {
+      lifecycle: {
+        cache: {
+          status: 'ready-for-live',
+          reason: 'Mocked lifecycle and Cloud Run Direct VPC contracts pass; a recent complete live create/noop/update/destroy run is still required for supported status.',
+        },
+      },
+    },
     lifecycle: {
       cacheEngines: ['redis'],
+      cacheConnectivity: { compatibleHostingProviders: ['cloudrun'] },
     },
   },
-  factory: (credentials) => {
+  factory: async (credentials) => {
     const adapter = new MemorystoreAdapter();
-    void adapter.connect(credentials);
+    await adapter.connect(credentials);
     return adapter;
   },
   inspection: {
     resources: ['cache'],
     defaultResource: 'cache',
     selectors: {
-      cache: { mode: 'provider-resource', optional: ['id', 'name', 'region', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, scopeKeys: ['projectId', 'region'] },
+      cache: { mode: 'provider-resource', optional: ['project', 'id', 'name', 'region', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, scopeKeys: ['projectId', 'region'] },
     },
     inspect: (adapter, request) => (
       adapter as MemorystoreAdapter

@@ -59,6 +59,59 @@ describe('BitwardenAdapter', () => {
     expect(secretsGet).toHaveBeenCalledWith(SECRET_ID);
   });
 
+  it('rejects key and version selectors instead of ignoring them', async () => {
+    const adapter = new BitwardenAdapter();
+    await adapter.connect(CREDS);
+
+    await expect(adapter.getSecret(SECRET_ID, 'field')).rejects.toThrow('values are scalar');
+    await expect(adapter.getSecret(SECRET_ID, undefined, '2')).rejects.toThrow('historical version');
+    expect(BitwardenClient).not.toHaveBeenCalled();
+  });
+
+  it('blocks duplicate secret names instead of selecting the first match', async () => {
+    secretsList.mockResolvedValue({
+      data: [
+        { id: SECRET_ID, key: 'STRIPE_KEY' },
+        { id: '9c96b34d-6e5f-41dc-9eef-24e819b8cf48', key: 'STRIPE_KEY' },
+      ],
+    });
+
+    const adapter = new BitwardenAdapter();
+    await adapter.connect(CREDS);
+
+    await expect(adapter.getSecret('STRIPE_KEY')).rejects.toThrow('Multiple Bitwarden secrets');
+    expect(secretsGet).not.toHaveBeenCalled();
+  });
+
+  it('enforces prefixes after listing Bitwarden secrets', async () => {
+    secretsList.mockResolvedValue({
+      data: [
+        { id: SECRET_ID, key: 'production/DATABASE_URL' },
+        { id: '9c96b34d-6e5f-41dc-9eef-24e819b8cf48', key: 'staging/DATABASE_URL' },
+      ],
+    });
+
+    const adapter = new BitwardenAdapter();
+    await adapter.connect(CREDS);
+
+    await expect(adapter.listSecrets('production/')).resolves.toEqual([
+      { path: 'production/DATABASE_URL' },
+    ]);
+  });
+
+  it('rejects a fetched Bitwarden secret with a different identity', async () => {
+    secretsGet.mockResolvedValue({
+      id: '9c96b34d-6e5f-41dc-9eef-24e819b8cf48',
+      key: 'DATABASE_URL',
+      value: 'postgres://x',
+    });
+
+    const adapter = new BitwardenAdapter();
+    await adapter.connect(CREDS);
+
+    await expect(adapter.getSecret(SECRET_ID)).rejects.toThrow('not the requested identity');
+  });
+
   it('verify lists org secrets and reports identity', async () => {
     secretsList.mockResolvedValue({ data: [] });
 

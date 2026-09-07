@@ -121,10 +121,11 @@ export class GitHubActionsOperationsAdapter implements CiOperationsPort {
 
   async listArtifacts(repository: CodeRepositoryIdentity, runId?: string, limit = 100): Promise<CiArtifactSummary[]> {
     const [owner, repo] = repositoryParts(repository);
+    const boundedLimit = Math.min(Math.max(limit, 1), 100);
     const response = runId
       ? await this.adapter.listWorkflowRunArtifacts(owner, repo, runId)
-      : await this.adapter.listArtifacts(owner, repo, limit);
-    return response.artifacts.map((artifact) => ({
+      : await this.adapter.listArtifacts(owner, repo, boundedLimit);
+    return response.artifacts.slice(0, boundedLimit).map((artifact) => ({
       id: String(artifact.id),
       name: artifact.name,
       ...(artifact.workflow_run ? { runId: String(artifact.workflow_run.id) } : {}),

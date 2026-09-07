@@ -537,7 +537,7 @@ async function verifyOptInMaintenanceLifecycle(): Promise<void> {
   if (!registered) {
     throw new Error(`Provider ${contract!.provider} is not registered.`);
   }
-  const adapter = registered.factory(requiredCredentials(contract!.credentials));
+  const adapter = await registered.factory(requiredCredentials(contract!.credentials));
   if (!supportsWorkloadMaintenance(adapter)) {
     throw new Error(
       `Provider ${contract!.provider} does not implement the workload-maintenance port.`

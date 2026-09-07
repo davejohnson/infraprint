@@ -4,7 +4,7 @@ import type { PlanAction } from '../plan/plan.types.js';
 import type { EnvironmentSpec } from '../spec/spec.schema.js';
 import type { EnvironmentMaintenanceObservation } from '../ports/observe.port.js';
 import { createHash } from 'node:crypto';
-import { parseStorageBindings, parseStorageProviderContexts } from './storage-plan.service.js';
+import { parseStorageBindings } from './storage-plan.service.js';
 
 export const DATA_MIGRATION_OPERATIONS = {
   databaseCopy: 'dataMigrationDatabaseCopy',
@@ -214,7 +214,6 @@ export function planDataMigration(params: {
   }
 
   const sourceStorageBindings = parseStorageBindings(params.sourceEnvironment);
-  const sourceStorageContexts = parseStorageProviderContexts(params.sourceEnvironment);
   const targetStorageBindings = parseStorageBindings(params.targetEnvironment);
   for (const storageName of migration.include.storage) {
     const sourceStorageSpec = params.sourceSpec.storage![storageName];
@@ -229,7 +228,7 @@ export function planDataMigration(params: {
         ? 'source_storage_not_tracked'
         : sourceBinding.provider !== sourceStorageSpec.provider
           ? 'source_storage_binding_stale'
-          : !sourceStorageContexts[sourceStorageSpec.provider]
+          : !sourceBinding.instanceScope
             ? 'source_storage_context_missing'
             : undefined);
     actions.push(migrationAction({
@@ -252,6 +251,7 @@ export function planDataMigration(params: {
         sourceProvider: sourceStorageSpec.provider,
         targetProvider: targetStorageSpec.provider,
         sourceExternalId: sourceBinding?.externalId,
+        sourceInstanceScope: sourceBinding?.instanceScope,
         sourceWritesMustBeStopped: true,
         sourceMaintenanceFingerprint: maintenanceFingerprint(params.sourceMaintenance),
         targetMaintenanceFingerprint: maintenanceFingerprint(params.targetMaintenance),

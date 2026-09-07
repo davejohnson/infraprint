@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -308,6 +308,136 @@ describe('DeployOrchestrator local rollback', () => {
     expect(result.errors).toEqual([]);
     const updated = envRepo.findById(environment.id)?.platformBindings as { services?: Record<string, { serviceId?: string }> };
     expect(updated.services?.web?.serviceId).toBe('web-staging-service');
+  });
+
+  it('never promotes a failed wrong-name create id to a service binding and retains its recovery marker after rollback', async () => {
+    const projectRepo = new ProjectRepository();
+    const envRepo = new EnvironmentRepository();
+    const serviceRepo = new ServiceRepository();
+    const project = projectRepo.create({ name: 'partial-create-project', defaultPlatform: 'railway' });
+    const originalBindings = {
+      provider: 'railway',
+      projectId: 'rail-project',
+      environmentId: 'rail-staging',
+      services: {},
+    };
+    const environment = envRepo.create({
+      projectId: project.id,
+      name: 'staging',
+      platformBindings: originalBindings,
+    });
+    const service = serviceRepo.create({
+      projectId: project.id,
+      name: 'web',
+      buildConfig: { builder: 'nixpacks' },
+    });
+    const deleteService = vi.fn(async () => ({ success: true }));
+    const recovery = {
+      provider: 'railway',
+      operation: 'create' as const,
+      resourceName: 'web-staging',
+      providerScope: { projectId: 'rail-project', environmentId: 'rail-staging' },
+      state: 'mismatched' as const,
+      serviceId: 'svc-wrong',
+      returnedName: 'not-web-staging',
+    };
+    const adapter: IHostingAdapter = {
+      name: 'railway',
+      capabilities: {
+        supportedBuilders: ['nixpacks'], supportsAutoWiring: true, supportsHealthChecks: true,
+        supportsCronSchedule: false, supportsReleaseCommand: true, supportsMultiEnvironment: true,
+        managedTls: true, supportsAutoScaling: false, supportsObserve: false,
+      },
+      async connect() {},
+      async verify() { return { success: true }; },
+      async ensureProject() {
+        return { success: true, message: 'exists', data: { projectId: 'rail-project', environmentId: 'rail-staging' } };
+      },
+      async deploy() {
+        return {
+          serviceId: service.id,
+          externalId: 'svc-wrong',
+          status: 'failed',
+          receipt: {
+            success: false,
+            message: 'wrong identity',
+            error: 'returned service name did not match',
+            data: {
+              phase: 'serviceCreate', environmentId: 'rail-staging', mutationAttempted: true,
+              serviceCreateRecovery: recovery,
+            },
+          },
+        };
+      },
+      async setEnvVars() { return { success: true, message: 'ok' }; },
+      deleteService,
+    };
+
+    const result = await new DeployOrchestrator().execute({ project, environment, services: [service], adapter });
+
+    expect(result.success).toBe(false);
+    expect(deleteService).not.toHaveBeenCalled();
+    expect(envRepo.findById(environment.id)?.platformBindings).toEqual({
+      ...originalBindings,
+      serviceCreateRecovery: { web: recovery },
+    });
+    expect((result.run.receipts.find((receipt) => receipt.step === 'deploy_web')?.result as Record<string, unknown>)).toMatchObject({
+      externalId: 'svc-wrong',
+      serviceCreateRecovery: recovery,
+    });
+  });
+
+  it('derives a conservative durable blocker when a malformed successful deploy has no id', async () => {
+    const projectRepo = new ProjectRepository();
+    const envRepo = new EnvironmentRepository();
+    const serviceRepo = new ServiceRepository();
+    const project = projectRepo.create({ name: 'malformed-success-project', defaultPlatform: 'railway' });
+    const environment = envRepo.create({
+      projectId: project.id,
+      name: 'staging',
+      platformBindings: {
+        provider: 'railway', projectId: 'rail-project', environmentId: 'rail-staging', services: {},
+      },
+    });
+    const service = serviceRepo.create({
+      projectId: project.id, name: 'web', buildConfig: { builder: 'nixpacks' },
+    });
+    const deploy = vi.fn(async () => ({
+      serviceId: service.id,
+      status: 'deploying' as const,
+      receipt: { success: true, message: 'created but malformed response', data: { environmentId: 'rail-staging' } },
+    }));
+    const adapter: IHostingAdapter = {
+      name: 'railway',
+      capabilities: {
+        supportedBuilders: ['nixpacks'], supportsAutoWiring: true, supportsHealthChecks: true,
+        supportsCronSchedule: false, supportsReleaseCommand: true, supportsMultiEnvironment: true,
+        managedTls: true, supportsAutoScaling: false, supportsObserve: false,
+      },
+      async connect() {},
+      async verify() { return { success: true }; },
+      async ensureProject() {
+        return { success: true, message: 'exists', data: { projectId: 'rail-project', environmentId: 'rail-staging' } };
+      },
+      deploy,
+      async setEnvVars() { return { success: true, message: 'ok' }; },
+    };
+
+    const result = await new DeployOrchestrator().execute({ project, environment, services: [service], adapter });
+
+    expect(result.success).toBe(false);
+    expect(envRepo.findById(environment.id)?.platformBindings).toMatchObject({
+      services: {},
+      serviceCreateRecovery: {
+        web: {
+          provider: 'railway',
+          operation: 'create',
+          resourceName: 'web',
+          providerScope: { projectId: 'rail-project', environmentId: 'rail-staging' },
+          state: 'unresolved',
+        },
+      },
+    });
   });
 });
 

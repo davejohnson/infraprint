@@ -9,7 +9,6 @@ export interface BootstrapParams {
   services: string[];
   crons?: DesiredState['crons'];
   domain?: string;
-  databaseProvider?: string;
   serviceConfig?: DesiredState['serviceConfig'];
   envVars?: DesiredState['envVars'];
   deploy?: DesiredState['deploy'];
@@ -26,13 +25,6 @@ export interface BootstrapParams {
   ensureHostingProject?: boolean;
   /** Explicit project runtime projected into service build configuration. */
   runtime?: ProjectRuntimeSpec;
-}
-
-function classifyEnvName(name: string): 'staging' | 'production' | null {
-  const normalized = name.trim().toLowerCase();
-  if (normalized.includes('prod')) return 'production';
-  if (normalized.includes('stag')) return 'staging';
-  return null;
 }
 
 /**
@@ -116,13 +108,10 @@ export function specToBootstrapParams(
 
   let deploy: DesiredState['deploy'];
   if (env.deploy?.strategy) {
-    const kind = classifyEnvName(environmentName);
     deploy = {
       strategy: env.deploy.strategy,
       ...(env.deploy.trigger ? { trigger: env.deploy.trigger } : {}),
-      ...(env.deploy.branch && kind
-        ? { branches: { [kind]: env.deploy.branch } }
-        : {}),
+      ...(env.deploy.branch ? { branch: env.deploy.branch } : {}),
     };
   }
 
@@ -133,7 +122,6 @@ export function specToBootstrapParams(
     services,
     ...(Object.keys(crons).length > 0 ? { crons } : {}),
     ...(env.domain ? { domain: env.domain } : {}),
-    ...(env.database ? { databaseProvider: env.database.provider } : {}),
     ...(Object.keys(serviceConfig).length > 0 ? { serviceConfig } : {}),
     ...(Object.keys(env.envVars).length > 0 ? { envVars: env.envVars } : {}),
     ...(deploy ? { deploy } : {}),
@@ -206,7 +194,6 @@ export function scopeBootstrapParamsToService(
     ...(serviceEnvVars
       ? { envVarsByService: { [serviceName]: serviceEnvVars } }
       : { envVarsByService: undefined }),
-    databaseProvider: undefined,
     domain: undefined,
     ensureHostingProject: false,
   };

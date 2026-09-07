@@ -72,7 +72,8 @@ for (const serviceArn of serviceArns) {
   environment.push({ name: 'HYPERVIBE_DEPLOY_SHA', value: sha }, { name: 'HYPERVIBE_IMAGE_DIGEST', value: digest });
   const startCommand = marker('HYPERVIBE_START_COMMAND');
   const healthPath = marker('HYPERVIBE_HEALTH_CHECK_PATH') || '/';
-  await ecs.send(new UpdateExpressGatewayServiceCommand({ serviceArn, executionRoleArn: config.executionRoleArn, cpu: config.cpu, memory: config.memory, healthCheckPath: healthPath, primaryContainer: { ...config.primaryContainer, image: exactImage, environment, command: startCommand ? ['sh', '-lc', startCommand] : undefined }, scalingTarget: config.scalingTarget }));
+  if (!Array.isArray(config.networkConfiguration?.subnets) || config.networkConfiguration.subnets.length < 2 || !Array.isArray(config.networkConfiguration?.securityGroups) || config.networkConfiguration.securityGroups.length !== 1) throw new Error('ECS Express workload-network configuration is missing or malformed');
+  await ecs.send(new UpdateExpressGatewayServiceCommand({ serviceArn, executionRoleArn: config.executionRoleArn, cpu: config.cpu, memory: config.memory, healthCheckPath: healthPath, primaryContainer: { ...config.primaryContainer, image: exactImage, environment, command: startCommand ? ['sh', '-lc', startCommand] : undefined }, networkConfiguration: config.networkConfiguration, scalingTarget: config.scalingTarget }));
   let endpoint;
   let revision;
   for (let attempt = 0; attempt < 120; attempt++) {

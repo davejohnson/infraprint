@@ -64,7 +64,7 @@ function observed(state: 'inactive' | 'active' | 'partial' = 'inactive'): Observ
         deploymentStatus: active ? 'REMOVED' : 'SUCCESS',
       },
     })),
-    databases: [{ provider: 'railway', engine: 'postgres', externalId: 'database-id', status: 'ready' }],
+    databases: [{ provider: 'railway', engine: 'postgres', externalId: 'database-id', status: 'running' }],
     partial: state === 'partial',
     warnings: [],
     maintenance: {

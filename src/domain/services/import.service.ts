@@ -9,11 +9,11 @@ import type { RailwayProjectDetails } from '../../adapters/providers/railway/rai
 import { getSecretStore } from '../../adapters/secrets/secret-store.js';
 import type { RailwayCredentials } from '../entities/connection.entity.js';
 import type { HostingBindings } from '../ports/hosting.port.js';
+import { parseStorageCreateRecoveryMap } from '../ports/storage.port.js';
 import { projectSpecSchema, type ProjectSpec, type ServiceSpec } from '../spec/spec.schema.js';
 import { SpecStore } from '../spec/spec.store.js';
 import { detectGitRemoteUrl } from '../../lib/git-remote.js';
 import {
-  inspectRailwayProject,
   type ImportComponentSummary,
   type ImportServiceSummary,
 } from '../../adapters/providers/railway/railway-inspection.driver.js';
@@ -26,6 +26,12 @@ const serviceRepo = new ServiceRepository();
 const componentRepo = new ComponentRepository();
 const connectionRepo = new ConnectionRepository();
 const auditRepo = new AuditRepository();
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
 
 export type ImportResult =
   | { status: 'already_exists' }
@@ -46,6 +52,71 @@ export interface ImportRailwayProjectOptions {
   databaseMappings?: Record<string, 'postgres'>;
   /** Explicit service-backed cache adoption: Railway service id -> engine. */
   cacheMappings?: Record<string, 'redis'>;
+}
+
+/**
+ * Validate an explicit Railway bucket adoption against every retained
+ * storage-create marker before import writes local state. A marker is a
+ * blocker/recovery hint, never sufficient identity or deletion authority.
+ */
+export function validateRailwayStorageCreateRecoveryResolution(
+  details: RailwayProjectDetails,
+  environmentMappings: Record<string, string>,
+  options: ImportRailwayProjectOptions = {}
+): Record<string, string[]> {
+  const existingProject = projectRepo.findByName(details.name);
+  if (!existingProject) return {};
+  const resolvedByEnvironment: Record<string, string[]> = {};
+
+  for (const [railwayEnvironmentName, environmentName] of Object.entries(environmentMappings)) {
+    const existingEnvironment = envRepo.findByProjectAndName(existingProject.id, environmentName);
+    if (!existingEnvironment) continue;
+    const rawRecoveries = existingEnvironment.platformBindings.storageCreateRecovery;
+    if (rawRecoveries === undefined) continue;
+    const recoveries = parseStorageCreateRecoveryMap(rawRecoveries);
+    if (!recoveries) {
+      throw new Error(
+        `Environment "${environmentName}" has malformed storage create-recovery state. Repair it before importing Railway storage.`
+      );
+    }
+    const railwayEnvironment = details.environments.edges.find(
+      (edge) => edge.node.name === railwayEnvironmentName
+    )?.node;
+    if (!railwayEnvironment) {
+      throw new Error(`Railway environment "${railwayEnvironmentName}" was not found while resolving storage recovery state.`);
+    }
+
+    for (const [resourceName, recovery] of Object.entries(recoveries)) {
+      const mappedBuckets = Object.entries(options.storageMappings ?? {})
+        .filter(([, desiredName]) => desiredName === resourceName);
+      if (mappedBuckets.length !== 1) {
+        throw new Error(
+          `Storage "${resourceName}" has retained create-recovery state. Map exactly one inspected Railway bucket id to "${resourceName}" with storageMappings.`
+        );
+      }
+      const [bucketId] = mappedBuckets[0]!;
+      const bucket = details.buckets?.edges.find((edge) => edge.node.id === bucketId)?.node;
+      const instance = railwayEnvironment.config?.buckets?.[bucketId];
+      const exactScope = recovery.provider === 'railway'
+        && Object.keys(recovery.providerScope).length === 2
+        && recovery.providerScope.projectId === details.id
+        && recovery.providerScope.environmentId === railwayEnvironment.id;
+      const exactIdentity = recovery.state === 'unresolved'
+        ? bucket?.name === resourceName
+        : recovery.externalId === bucketId
+          && (recovery.state === 'identified'
+            ? bucket?.name === resourceName
+            : recovery.returnedName === undefined || bucket?.name === recovery.returnedName);
+      if (!bucket || !instance || instance.isDeleted === true || !instance.region
+        || !exactScope || !exactIdentity) {
+        throw new Error(
+          `storageMappings does not exactly resolve retained storage create state for "${resourceName}" in Railway project ${details.id}, environment ${railwayEnvironment.id}.`
+        );
+      }
+      (resolvedByEnvironment[railwayEnvironment.id] ??= []).push(resourceName);
+    }
+  }
+  return resolvedByEnvironment;
 }
 
 function importedGitRemoteUrl(services: ImportServiceSummary[]): string | undefined {
@@ -80,6 +151,11 @@ export function buildImportedRailwaySpec(
   components: ImportComponentSummary[],
   options: ImportRailwayProjectOptions = {}
 ): ProjectSpec {
+  if (components.length > 0) {
+    throw new Error(
+      'Railway legacy plugin datastore adoption is unsupported because Hypervibe cannot verify exact plugin teardown. Migrate it to a service-backed datastore before import.'
+    );
+  }
   const datastoreServiceIds = new Set([
     ...services
       .filter((service) => service.datastoreEngine !== undefined)
@@ -104,11 +180,9 @@ export function buildImportedRailwaySpec(
         return instance ? [[service.name, importedServiceSpec(instance)] as const] : [];
       })
     );
-    const hasPluginDatabase = components.some((component) => component.type === 'postgres');
     const hasMappedDatabase = Object.keys(options.databaseMappings ?? {}).some((serviceId) =>
       Boolean(services.find((service) => service.railwayId === serviceId)?.instancesByEnv[railwayEnvironment.id])
     );
-    const hasPluginCache = components.some((component) => component.type === 'redis');
     const hasMappedCache = Object.keys(options.cacheMappings ?? {}).some((serviceId) =>
       Boolean(services.find((service) => service.railwayId === serviceId)?.instancesByEnv[railwayEnvironment.id])
     );
@@ -129,10 +203,10 @@ export function buildImportedRailwaySpec(
     environments[environmentName] = {
       hosting: { provider: 'railway' },
       services: importedServices,
-      ...(hasPluginDatabase || hasMappedDatabase
+      ...(hasMappedDatabase
         ? { database: { provider: 'railway', engine: 'postgres' as const } }
         : {}),
-      ...(hasPluginCache || hasMappedCache
+      ...(hasMappedCache
         ? { cache: { provider: 'railway', engine: 'redis' as const } }
         : {}),
       ...(Object.keys(storage).length > 0 ? { storage } : {}),
@@ -192,6 +266,11 @@ export async function importRailwayProject(
     components,
     options
   );
+  const resolvedStorageRecoveries = validateRailwayStorageCreateRecoveryResolution(
+    details,
+    environmentMappings,
+    options
+  );
   const gitRemoteUrl = importedSpec.gitRemoteUrl;
 
   const project = existingProject
@@ -246,9 +325,30 @@ export async function importRailwayProject(
       }] as const];
     });
     if (adoptedStorage.length > 0) {
+      const latestEnvironment = envRepo.findById(env.id) ?? env;
+      const existingStorage = asRecord(latestEnvironment.platformBindings.storage) ?? {};
+      const existingStorageProviders = asRecord(latestEnvironment.platformBindings.storageProviders) ?? {};
+      const parsedRecoveries = latestEnvironment.platformBindings.storageCreateRecovery === undefined
+        ? {}
+        : parseStorageCreateRecoveryMap(latestEnvironment.platformBindings.storageCreateRecovery);
+      if (!parsedRecoveries) {
+        throw new Error(
+          `Environment "${infraType}" storage create-recovery state changed during import. No recovery marker was cleared.`
+        );
+      }
+      const remainingRecoveries = { ...parsedRecoveries };
+      for (const resourceName of resolvedStorageRecoveries[railwayEnv.node.id] ?? []) {
+        delete remainingRecoveries[resourceName];
+      }
       envRepo.updatePlatformBindings(env.id, {
-        storageProviders: { railway: { projectId: details.id, environmentId: railwayEnv.node.id } },
-        storage: Object.fromEntries(adoptedStorage),
+        storageProviders: {
+          ...existingStorageProviders,
+          railway: { projectId: details.id, environmentId: railwayEnv.node.id },
+        },
+        storage: { ...existingStorage, ...Object.fromEntries(adoptedStorage) },
+        storageCreateRecovery: Object.keys(remainingRecoveries).length > 0
+          ? remainingRecoveries
+          : undefined,
       });
     }
 
@@ -334,51 +434,6 @@ export async function importRailwayProject(
   // Create components for each environment
   const createdComponents: Array<{ type: string; environmentId: string; railwayId: string }> = [];
 
-  for (const comp of components) {
-    for (const env of createdEnvironments) {
-      const existingComponent = componentRepo.findByEnvironmentAndType(env.id, comp.type);
-      if (existingComponent) {
-        componentRepo.update(existingComponent.id, {
-          type: comp.type,
-          externalId: comp.railwayId,
-          bindings: {
-            ...existingComponent.bindings,
-            provider: 'railway',
-            projectId: details.id,
-            environmentId: env.railwayId,
-            resourceKind: 'plugin',
-            pluginName: comp.name,
-            ...(comp.type === 'redis'
-              ? { connectionUrl: '${{' + comp.name + '.REDIS_URL}}' }
-              : {}),
-          },
-        });
-      } else {
-        componentRepo.create({
-          environmentId: env.id,
-          type: comp.type,
-          externalId: comp.railwayId,
-          bindings: {
-            provider: 'railway',
-            projectId: details.id,
-            environmentId: env.railwayId,
-            resourceKind: 'plugin',
-            pluginName: comp.name,
-            ...(comp.type === 'redis'
-              ? { connectionUrl: '${{' + comp.name + '.REDIS_URL}}' }
-              : {}),
-          },
-        });
-      }
-
-      createdComponents.push({
-        type: comp.type,
-        environmentId: env.id,
-        railwayId: comp.railwayId,
-      });
-    }
-  }
-
   // Current Railway databases and caches are ordinary services. Adoption must be
   // explicit because a name alone is not enough evidence that a service is a
   // datastore; mapped services are components, never application services.
@@ -395,6 +450,10 @@ export async function importRailwayProject(
         provider: 'railway',
         projectId: details.id,
         environmentId: env.railwayId,
+        providerScope: {
+          projectId: details.id,
+          ...(type === 'redis' ? { environmentId: env.railwayId } : {}),
+        },
         resourceKind: 'service',
         serviceId,
         pluginName: service.name,

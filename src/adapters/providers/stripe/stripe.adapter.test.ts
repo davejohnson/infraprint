@@ -7,6 +7,33 @@ function adapter(): StripeAdapter {
   return stripe;
 }
 
+function product(id: string) {
+  return {
+    id,
+    name: id,
+    description: null,
+    active: true,
+    metadata: {},
+    created: 1,
+    updated: 1,
+  };
+}
+
+function price(id: string) {
+  return {
+    id,
+    product: 'prod_1',
+    active: true,
+    currency: 'usd',
+    unit_amount: 100,
+    recurring: { interval: 'month', interval_count: 1 },
+    type: 'recurring',
+    metadata: {},
+    nickname: null,
+    created: 1,
+  };
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
@@ -89,6 +116,75 @@ describe('StripeAdapter observation semantics', () => {
       status: 502,
       kind: 'malformed_response',
     } satisfies Partial<StripeApiError>);
+  });
+
+  it('honors product and price limits at the provider boundary', async () => {
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const resource = String(url).includes('/products?') ? 'prod' : 'price';
+      return new Response(JSON.stringify({
+        data: [1, 2, 3].map((index) => resource === 'prod'
+          ? product(`${resource}_${index}`)
+          : price(`${resource}_${index}`)),
+        has_more: false,
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const stripe = adapter();
+
+    const products = await stripe.listProducts('sandbox', 2);
+    const prices = await stripe.listPrices('sandbox', 2);
+
+    expect(products.map((product) => product.id)).toEqual(['prod_1', 'prod_2']);
+    expect(prices.map((price) => price.id)).toEqual(['price_1', 'price_2']);
+    for (const [url] of fetchMock.mock.calls) {
+      expect(new URL(String(url)).searchParams.get('limit')).toBe('2');
+    }
+  });
+
+  it('does not treat an empty page with has_more as complete observation', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ data: [], has_more: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const stripe = adapter();
+
+    await expect(stripe.listProducts('sandbox', 2)).rejects.toThrow(/without a continuation cursor/);
+    await expect(stripe.listPrices('sandbox', 2)).rejects.toThrow(/without a continuation cursor/);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects malformed successful list envelopes instead of treating them as complete', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ data: [] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })));
+
+    await expect(adapter().listProducts('sandbox', 2)).rejects.toMatchObject({
+      kind: 'malformed_response',
+      status: 200,
+    });
+    await expect(adapter().listPrices('sandbox', 2)).rejects.toMatchObject({
+      kind: 'malformed_response',
+      status: 200,
+    });
+  });
+
+  it('does not loop forever when Stripe repeats a pagination cursor', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      data: [product('prod_repeated')],
+      has_more: true,
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(adapter().listProducts('sandbox', 3)).rejects.toThrow(/repeated continuation cursor/);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('sends tax_code when creating a product', async () => {

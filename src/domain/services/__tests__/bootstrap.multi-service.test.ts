@@ -6,16 +6,14 @@ import { initializeDatabase, SqliteAdapter } from '../../../adapters/db/sqlite.a
 import { EnvironmentRepository } from '../../../adapters/db/repositories/environment.repository.js';
 import { ProjectRepository } from '../../../adapters/db/repositories/project.repository.js';
 import { ServiceRepository } from '../../../adapters/db/repositories/service.repository.js';
-import { ComponentRepository } from '../../../adapters/db/repositories/component.repository.js';
 import { ConnectionRepository } from '../../../adapters/db/repositories/connection.repository.js';
 import { getSecretStore } from '../../../adapters/secrets/secret-store.js';
 import { adapterFactory } from '../adapter.factory.js';
 import { CLOUD_PREPARE_PROFILES } from '../cloud-prepare.js';
 import { CloudflareAdapter } from '../../../adapters/providers/cloudflare/cloudflare.adapter.js';
-import type { IDatabaseAdapter } from '../../ports/database.port.js';
 import type { IHostingAdapter } from '../../ports/hosting.port.js';
 import { executeBootstrap } from '../bootstrap.service.js';
-import { resolveDesiredState, resolveDatabaseProviderForProject, normalizeCrons, type DesiredState } from '../spec.service.js';
+import { resolveDesiredState, normalizeCrons, type DesiredState } from '../spec.service.js';
 
 type JsonObj = Record<string, unknown>;
 
@@ -28,7 +26,6 @@ async function applyInfra(args: {
   crons?: Record<string, { schedule: string; command?: string; timeZone?: string }>;
   serviceName?: string;
   domain?: string;
-  databaseProvider?: 'supabase' | 'cloudsql' | 'railway';
   setupEmail?: boolean;
   serviceConfig?: Record<string, Record<string, unknown>>;
   envVars?: Record<string, string>;
@@ -39,19 +36,12 @@ async function applyInfra(args: {
   // project policies plus overrides, then run the bootstrap converge.
   const project = new ProjectRepository().findByName(args.projectName);
   const policyState = (project?.policies?.desiredState ?? {}) as Partial<DesiredState>;
-  const resolvedDatabaseProvider = project
-    ? resolveDatabaseProviderForProject(project, policyState, {
-      environmentName: args.environmentName,
-      databaseProvider: args.databaseProvider,
-    })
-    : args.databaseProvider;
   const desired = resolveDesiredState(policyState, {
     environmentName: args.environmentName,
     services: args.services,
     crons: normalizeCrons(args.crons),
     serviceName: args.serviceName,
     domain: args.domain,
-    databaseProvider: resolvedDatabaseProvider,
     setupEmail: args.setupEmail,
     serviceConfig: args.serviceConfig as Partial<DesiredState>['serviceConfig'],
     envVars: args.envVars,
@@ -64,7 +54,6 @@ async function applyInfra(args: {
     services: desired.services,
     crons: desired.crons,
     domain: desired.domain,
-    databaseProvider: desired.databaseProvider,
     serviceConfig: desired.serviceConfig,
     envVars: desired.envVars,
     deploy: desired.deploy,
@@ -107,68 +96,13 @@ describe('infra_apply multi-service convergence', () => {
     expect(new ProjectRepository().findByName('uninitialized-project')).toBeNull();
   });
 
-  it('provisions one shared database and deploys all desired services in a single apply', async () => {
+  it('deploys all desired services without resolving a database adapter', async () => {
     const projectRepo = new ProjectRepository();
     const serviceRepo = new ServiceRepository();
     const project = projectRepo.create({ name: 'multi-service-project', defaultPlatform: 'railway' });
 
-    const provisionCalls: string[] = [];
     const deployCalls: string[] = [];
     const targetCalls: Array<{ region?: string }> = [];
-
-    const fakeDatabaseAdapter: IDatabaseAdapter = {
-      name: 'railway',
-      capabilities: {
-        supportedDatabases: ['postgres'],
-        supportsPooling: false,
-        supportsReadReplicas: false,
-        supportsPointInTimeRecovery: false,
-        serverlessOptimized: false,
-      },
-      async connect() {},
-      async verify() {
-        return { success: true };
-      },
-      async observeDatabase() {
-        return null;
-      },
-      async provision(type, environment) {
-        provisionCalls.push(`${type}:${environment.name}`);
-        return {
-          component: {
-            id: '',
-            environmentId: environment.id,
-            type: 'postgres',
-            bindings: {
-              provider: 'railway',
-              connectionString: 'postgres://shared-db',
-            },
-            externalId: 'rail-db-1',
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          },
-          receipt: {
-            success: true,
-            message: 'db ready',
-            data: {
-              providerProjectId: 'rail-project-1',
-              ensureProjectCreated: false,
-            },
-          },
-          connectionUrl: 'postgres://shared-db',
-          envVars: {
-            DATABASE_URL: 'postgres://shared-db',
-            DIRECT_URL: 'postgres://shared-db',
-          },
-        };
-      },
-      async getConnectionUrl() {
-        return 'postgres://shared-db';
-      },
-      async destroy() {
-        return { success: true, message: 'destroyed' };
-      },
-    };
 
     const fakeHostingAdapter: IHostingAdapter = {
       name: 'railway',
@@ -230,10 +164,7 @@ describe('infra_apply multi-service convergence', () => {
       },
     };
 
-    vi.spyOn(adapterFactory, 'getDatabaseAdapter').mockResolvedValue({
-      success: true,
-      adapter: fakeDatabaseAdapter,
-    });
+    const databaseAdapterSpy = vi.spyOn(adapterFactory, 'getDatabaseAdapter');
     vi.spyOn(adapterFactory, 'getHostingAdapter').mockResolvedValue({
       success: true,
       adapter: fakeHostingAdapter,
@@ -244,164 +175,17 @@ describe('infra_apply multi-service convergence', () => {
       hostingRegion: 'us-west1',
       environmentName: 'staging',
       services: ['web', 'worker'],
-      databaseProvider: 'railway',
       setupEmail: false,
       confirm: true,
     });
 
     expect(payload.success).toBe(true);
     expect(payload.services).toEqual(['web', 'worker']);
-    expect(provisionCalls).toEqual(['postgres:staging']);
+    expect(databaseAdapterSpy).not.toHaveBeenCalled();
     expect(targetCalls).toEqual([{ region: 'us-west1' }]);
     expect(deployCalls).toEqual(['web', 'worker']);
     const createdServices = serviceRepo.findByProjectId(project.id).map((service) => service.name);
     expect(createdServices).toEqual(['web', 'worker']);
-  });
-
-  it('reuses an existing managed postgres component during apply', async () => {
-    const projectRepo = new ProjectRepository();
-    const envRepo = new EnvironmentRepository();
-    const serviceRepo = new ServiceRepository();
-    const componentRepo = new ComponentRepository();
-    const project = projectRepo.create({ name: 'reuse-db-project', defaultPlatform: 'railway' });
-    const environment = envRepo.create({ projectId: project.id, name: 'production' });
-
-    componentRepo.create({
-      environmentId: environment.id,
-      type: 'postgres',
-      bindings: {
-        provider: 'railway',
-        pluginName: 'postgres-db',
-        connectionUrl: 'postgres://shared-db',
-      },
-      externalId: 'rail-db-existing',
-    });
-
-    const deployCalls: string[] = [];
-    const deployEnvVarCalls: Array<{ serviceName: string; vars: Record<string, string> }> = [];
-
-    const databaseAdapterSpy = vi.spyOn(adapterFactory, 'getDatabaseAdapter');
-    const fakeHostingAdapter: IHostingAdapter = {
-      name: 'railway',
-      capabilities: {
-        supportedBuilders: ['nixpacks'],
-        supportsAutoWiring: true,
-        supportsHealthChecks: true,
-        supportsCronSchedule: false,
-        supportsReleaseCommand: true,
-        supportsMultiEnvironment: true,
-        managedTls: true,
-        supportsAutoScaling: false,
-        supportsObserve: false,
-      },
-      async connect() {},
-      async verify() {
-        return { success: true };
-      },
-      async ensureProject() {
-        return {
-          success: true,
-          message: 'bound',
-          data: {
-            projectId: 'rail-project-1',
-            environmentId: 'rail-env-1',
-          },
-        };
-      },
-      async deploy(service, _environment, vars) {
-        deployCalls.push(service.name);
-        deployEnvVarCalls.push({ serviceName: service.name, vars });
-        return {
-          serviceId: `deploy-${service.name}`,
-          externalId: `rail-${service.name}`,
-          url: `https://${service.name}.example.com`,
-          status: 'deployed',
-          receipt: {
-            success: true,
-            message: 'deployed',
-            data: {
-              environmentId: 'rail-env-1',
-            },
-          },
-        };
-      },
-      async setEnvVars() {
-        return {
-          success: true,
-          message: 'vars synced',
-        };
-      },
-      async getDeployStatus(_environment, deploymentId) {
-        return {
-          status: 'deployed',
-          url: `https://${deploymentId}.example.com`,
-        };
-      },
-    };
-
-    databaseAdapterSpy.mockResolvedValue({
-      success: true,
-      adapter: {
-        name: 'railway',
-        capabilities: {
-          supportedDatabases: ['postgres'],
-          supportsPooling: false,
-          supportsReadReplicas: false,
-          supportsPointInTimeRecovery: false,
-          serverlessOptimized: false,
-        },
-        async connect() {},
-        async verify() {
-          return { success: true };
-        },
-        async observeDatabase() {
-          return null;
-        },
-        async provision() {
-          throw new Error('db provision should not be called when a matching component already exists');
-        },
-        async getConnectionUrl() {
-          return 'postgres://shared-db';
-        },
-        async destroy() {
-          return { success: true, message: 'destroyed' };
-        },
-      } as IDatabaseAdapter,
-    });
-    vi.spyOn(adapterFactory, 'getHostingAdapter').mockResolvedValue({
-      success: true,
-      adapter: fakeHostingAdapter,
-    });
-
-    const payload = await applyInfra({
-      projectName: project.name,
-      environmentName: 'production',
-      services: ['web', 'worker'],
-      databaseProvider: 'railway',
-      setupEmail: false,
-      confirm: true,
-    });
-
-    expect(payload.success).toBe(true);
-    expect(databaseAdapterSpy).not.toHaveBeenCalled();
-    expect(deployCalls).toEqual(['web', 'worker']);
-    expect(serviceRepo.findByProjectId(project.id).map((service) => service.name)).toEqual(['web', 'worker']);
-    expect(deployEnvVarCalls).toEqual([
-      {
-        serviceName: 'web',
-        vars: {
-          DATABASE_URL: '${{postgres-db.DATABASE_URL}}',
-          DIRECT_URL: '${{postgres-db.DATABASE_PRIVATE_URL}}',
-        },
-      },
-      {
-        serviceName: 'worker',
-        vars: {
-          DATABASE_URL: '${{postgres-db.DATABASE_URL}}',
-          DIRECT_URL: '${{postgres-db.DATABASE_PRIVATE_URL}}',
-        },
-      },
-    ]);
   });
 
   it('shows per-service runtime configuration in preview and persists it for apply', async () => {
@@ -411,60 +195,6 @@ describe('infra_apply multi-service convergence', () => {
       name: 'service-config-project',
       defaultPlatform: 'railway',
     });
-
-    const fakeDatabaseAdapter: IDatabaseAdapter = {
-      name: 'railway',
-      capabilities: {
-        supportedDatabases: ['postgres'],
-        supportsPooling: false,
-        supportsReadReplicas: false,
-        supportsPointInTimeRecovery: false,
-        serverlessOptimized: false,
-      },
-      async connect() {},
-      async verify() {
-        return { success: true };
-      },
-      async observeDatabase() {
-        return null;
-      },
-      async provision(_type, environment) {
-        return {
-          component: {
-            id: '',
-            environmentId: environment.id,
-            type: 'postgres',
-            bindings: {
-              provider: 'railway',
-              pluginName: 'postgres-db',
-              connectionString: 'postgres://shared-db',
-            },
-            externalId: 'rail-db-1',
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          },
-          receipt: {
-            success: true,
-            message: 'db ready',
-            data: {
-              providerProjectId: 'rail-project-1',
-              ensureProjectCreated: false,
-            },
-          },
-          connectionUrl: 'postgres://shared-db',
-          envVars: {
-            DATABASE_URL: '${{postgres-db.DATABASE_URL}}',
-            DIRECT_URL: '${{postgres-db.DATABASE_PRIVATE_URL}}',
-          },
-        };
-      },
-      async getConnectionUrl() {
-        return 'postgres://shared-db';
-      },
-      async destroy() {
-        return { success: true, message: 'destroyed' };
-      },
-    };
 
     const fakeHostingAdapter: IHostingAdapter = {
       name: 'railway',
@@ -522,10 +252,6 @@ describe('infra_apply multi-service convergence', () => {
       },
     };
 
-    vi.spyOn(adapterFactory, 'getDatabaseAdapter').mockResolvedValue({
-      success: true,
-      adapter: fakeDatabaseAdapter,
-    });
     vi.spyOn(adapterFactory, 'getHostingAdapter').mockResolvedValue({
       success: true,
       adapter: fakeHostingAdapter,
@@ -535,7 +261,6 @@ describe('infra_apply multi-service convergence', () => {
       projectName: project.name,
       environmentName: 'production',
       services: ['web', 'worker'],
-      databaseProvider: 'railway',
       setupEmail: false,
       serviceConfig: {
         web: {
@@ -574,60 +299,6 @@ describe('infra_apply multi-service convergence', () => {
       defaultPlatform: 'railway',
       gitRemoteUrl: 'git@github.com:davejohnson/billforge.git',
     });
-
-    const fakeDatabaseAdapter: IDatabaseAdapter = {
-      name: 'railway',
-      capabilities: {
-        supportedDatabases: ['postgres'],
-        supportsPooling: false,
-        supportsReadReplicas: false,
-        supportsPointInTimeRecovery: false,
-        serverlessOptimized: false,
-      },
-      async connect() {},
-      async verify() {
-        return { success: true };
-      },
-      async observeDatabase() {
-        return null;
-      },
-      async provision(_type, environment) {
-        return {
-          component: {
-            id: '',
-            environmentId: environment.id,
-            type: 'postgres',
-            bindings: {
-              provider: 'railway',
-              pluginName: 'postgres-db',
-              connectionString: 'postgres://shared-db',
-            },
-            externalId: 'rail-db-1',
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          },
-          receipt: {
-            success: true,
-            message: 'db ready',
-            data: {
-              providerProjectId: 'rail-project-1',
-              ensureProjectCreated: false,
-            },
-          },
-          connectionUrl: 'postgres://shared-db',
-          envVars: {
-            DATABASE_URL: '${{postgres-db.DATABASE_URL}}',
-            DIRECT_URL: '${{postgres-db.DATABASE_PRIVATE_URL}}',
-          },
-        };
-      },
-      async getConnectionUrl() {
-        return 'postgres://shared-db';
-      },
-      async destroy() {
-        return { success: true, message: 'destroyed' };
-      },
-    };
 
     const connectServiceToRepo = vi.fn(async () => ({
       success: true,
@@ -693,10 +364,6 @@ describe('infra_apply multi-service convergence', () => {
       connectServiceToRepo,
     };
 
-    vi.spyOn(adapterFactory, 'getDatabaseAdapter').mockResolvedValue({
-      success: true,
-      adapter: fakeDatabaseAdapter,
-    });
     vi.spyOn(adapterFactory, 'getHostingAdapter').mockResolvedValue({
       success: true,
       adapter: fakeHostingAdapter,
@@ -706,7 +373,6 @@ describe('infra_apply multi-service convergence', () => {
       projectName: project.name,
       environmentName: 'production',
       services: ['web', 'worker'],
-      databaseProvider: 'railway',
       setupEmail: false,
       deploy: {
         strategy: 'branch',
@@ -853,60 +519,6 @@ describe('infra_apply multi-service convergence', () => {
       gitRemoteUrl: 'git@github.com:davejohnson/billforge.git',
     });
 
-    const fakeDatabaseAdapter: IDatabaseAdapter = {
-      name: 'railway',
-      capabilities: {
-        supportedDatabases: ['postgres'],
-        supportsPooling: false,
-        supportsReadReplicas: false,
-        supportsPointInTimeRecovery: false,
-        serverlessOptimized: false,
-      },
-      async connect() {},
-      async verify() {
-        return { success: true };
-      },
-      async observeDatabase() {
-        return null;
-      },
-      async provision(_type, environment) {
-        return {
-          component: {
-            id: '',
-            environmentId: environment.id,
-            type: 'postgres',
-            bindings: {
-              provider: 'railway',
-              pluginName: 'postgres-db',
-              connectionString: 'postgres://shared-db',
-            },
-            externalId: 'rail-db-1',
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          },
-          receipt: {
-            success: true,
-            message: 'db ready',
-            data: {
-              providerProjectId: 'rail-project-1',
-              ensureProjectCreated: false,
-            },
-          },
-          connectionUrl: 'postgres://shared-db',
-          envVars: {
-            DATABASE_URL: '${{postgres-db.DATABASE_URL}}',
-            DIRECT_URL: '${{postgres-db.DATABASE_PRIVATE_URL}}',
-          },
-        };
-      },
-      async getConnectionUrl() {
-        return 'postgres://shared-db';
-      },
-      async destroy() {
-        return { success: true, message: 'destroyed' };
-      },
-    };
-
     const fakeHostingAdapter: IHostingAdapter & {
       connectServiceToRepo: (params: { serviceId: string; repo: string; branch: string }) => Promise<{ success: boolean; message: string; error?: string }>;
     } = {
@@ -972,10 +584,6 @@ describe('infra_apply multi-service convergence', () => {
       },
     };
 
-    vi.spyOn(adapterFactory, 'getDatabaseAdapter').mockResolvedValue({
-      success: true,
-      adapter: fakeDatabaseAdapter,
-    });
     vi.spyOn(adapterFactory, 'getHostingAdapter').mockResolvedValue({
       success: true,
       adapter: fakeHostingAdapter,
@@ -985,7 +593,6 @@ describe('infra_apply multi-service convergence', () => {
       projectName: project.name,
       environmentName: 'production',
       services: ['web'],
-      databaseProvider: 'railway',
       setupEmail: false,
       deploy: {
         strategy: 'branch',
@@ -1024,60 +631,6 @@ describe('infra_apply multi-service convergence', () => {
       credentialsEncrypted: secretStore.encryptObject({ apiToken: 'cf-token' }),
     });
     connectionRepo.updateStatus(cloudflareConnection.id, 'verified');
-
-    const fakeDatabaseAdapter: IDatabaseAdapter = {
-      name: 'railway',
-      capabilities: {
-        supportedDatabases: ['postgres'],
-        supportsPooling: false,
-        supportsReadReplicas: false,
-        supportsPointInTimeRecovery: false,
-        serverlessOptimized: false,
-      },
-      async connect() {},
-      async verify() {
-        return { success: true };
-      },
-      async observeDatabase() {
-        return null;
-      },
-      async provision(_type, environment) {
-        return {
-          component: {
-            id: '',
-            environmentId: environment.id,
-            type: 'postgres',
-            bindings: {
-              provider: 'railway',
-              pluginName: 'postgres-db',
-              connectionString: 'postgres://shared-db',
-            },
-            externalId: 'rail-db-1',
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          },
-          receipt: {
-            success: true,
-            message: 'db ready',
-            data: {
-              providerProjectId: 'rail-project-1',
-              ensureProjectCreated: false,
-            },
-          },
-          connectionUrl: 'postgres://shared-db',
-          envVars: {
-            DATABASE_URL: '${{postgres-db.DATABASE_URL}}',
-            DIRECT_URL: '${{postgres-db.DATABASE_PRIVATE_URL}}',
-          },
-        };
-      },
-      async getConnectionUrl() {
-        return 'postgres://shared-db';
-      },
-      async destroy() {
-        return { success: true, message: 'destroyed' };
-      },
-    };
 
     const attachCustomDomain = vi.fn(async () => ({
       success: true,
@@ -1152,10 +705,6 @@ describe('infra_apply multi-service convergence', () => {
       attachCustomDomain,
     };
 
-    vi.spyOn(adapterFactory, 'getDatabaseAdapter').mockResolvedValue({
-      success: true,
-      adapter: fakeDatabaseAdapter,
-    });
     vi.spyOn(adapterFactory, 'getHostingAdapter').mockResolvedValue({
       success: true,
       adapter: fakeHostingAdapter,
@@ -1191,7 +740,6 @@ describe('infra_apply multi-service convergence', () => {
       projectName: project.name,
       environmentName: 'production',
       services: ['web'],
-      databaseProvider: 'railway',
       domain: 'usebillforge.com',
       setupEmail: false,
       confirm: true,
@@ -1224,60 +772,6 @@ describe('infra_apply multi-service convergence', () => {
       credentialsEncrypted: secretStore.encryptObject({ apiToken: 'cf-token' }),
     });
     connectionRepo.updateStatus(cloudflareConnection.id, 'verified');
-
-    const fakeDatabaseAdapter: IDatabaseAdapter = {
-      name: 'railway',
-      capabilities: {
-        supportedDatabases: ['postgres'],
-        supportsPooling: false,
-        supportsReadReplicas: false,
-        supportsPointInTimeRecovery: false,
-        serverlessOptimized: false,
-      },
-      async connect() {},
-      async verify() {
-        return { success: true };
-      },
-      async observeDatabase() {
-        return null;
-      },
-      async provision(_type, environment) {
-        return {
-          component: {
-            id: '',
-            environmentId: environment.id,
-            type: 'postgres',
-            bindings: {
-              provider: 'railway',
-              pluginName: 'postgres-db',
-              connectionString: 'postgres://shared-db',
-            },
-            externalId: 'rail-db-1',
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          },
-          receipt: {
-            success: true,
-            message: 'db ready',
-            data: {
-              providerProjectId: 'rail-project-1',
-              ensureProjectCreated: false,
-            },
-          },
-          connectionUrl: 'postgres://shared-db',
-          envVars: {
-            DATABASE_URL: '${{postgres-db.DATABASE_URL}}',
-            DIRECT_URL: '${{postgres-db.DATABASE_PRIVATE_URL}}',
-          },
-        };
-      },
-      async getConnectionUrl() {
-        return 'postgres://shared-db';
-      },
-      async destroy() {
-        return { success: true, message: 'destroyed' };
-      },
-    };
 
     const attachCustomDomain = vi.fn(async () => ({
       success: false,
@@ -1344,10 +838,6 @@ describe('infra_apply multi-service convergence', () => {
       attachCustomDomain,
     };
 
-    vi.spyOn(adapterFactory, 'getDatabaseAdapter').mockResolvedValue({
-      success: true,
-      adapter: fakeDatabaseAdapter,
-    });
     vi.spyOn(adapterFactory, 'getHostingAdapter').mockResolvedValue({
       success: true,
       adapter: fakeHostingAdapter,
@@ -1367,7 +857,6 @@ describe('infra_apply multi-service convergence', () => {
       projectName: project.name,
       environmentName: 'production',
       services: ['web'],
-      databaseProvider: 'railway',
       domain: 'usebillforge.com',
       setupEmail: false,
       confirm: true,
@@ -1401,49 +890,6 @@ describe('infra_apply multi-service convergence', () => {
       buildConfig: { builder: 'nixpacks' },
       envVarSpec: {},
     });
-    const fakeDatabaseAdapter: IDatabaseAdapter = {
-      name: 'railway',
-      capabilities: {
-        supportedDatabases: ['postgres'],
-        supportsPooling: false,
-        supportsReadReplicas: false,
-        supportsPointInTimeRecovery: false,
-        serverlessOptimized: false,
-      },
-      async connect() {},
-      async verify() {
-        return { success: true };
-      },
-      async observeDatabase() {
-        return null;
-      },
-      async provision(_type, environment) {
-        return {
-          component: {
-            id: '',
-            environmentId: environment.id,
-            type: 'postgres',
-            bindings: { provider: 'railway', connectionString: 'postgres://shared-db' },
-            externalId: 'rail-db-1',
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          },
-          receipt: {
-            success: true,
-            message: 'db ready',
-            data: { providerProjectId: 'rail-project-1' },
-          },
-          connectionUrl: 'postgres://shared-db',
-          envVars: { DATABASE_URL: 'postgres://shared-db' },
-        };
-      },
-      async getConnectionUrl() {
-        return 'postgres://shared-db';
-      },
-      async destroy() {
-        return { success: true, message: 'destroyed' };
-      },
-    };
 
     const fakeHostingAdapter: IHostingAdapter = {
       name: 'railway',
@@ -1481,14 +927,12 @@ describe('infra_apply multi-service convergence', () => {
       },
     };
 
-    vi.spyOn(adapterFactory, 'getDatabaseAdapter').mockResolvedValue({ success: true, adapter: fakeDatabaseAdapter });
     vi.spyOn(adapterFactory, 'getHostingAdapter').mockResolvedValue({ success: true, adapter: fakeHostingAdapter });
 
     const payload = await applyInfra({
       projectName: project.name,
       environmentName: 'production',
       services: ['web'],
-      databaseProvider: 'railway',
       setupEmail: false,
       confirm: true,
     });
@@ -1536,46 +980,6 @@ describe('infra_apply multi-service convergence', () => {
     });
 
     const deployedPublicFlags: Array<boolean | undefined> = [];
-    const fakeDatabaseAdapter: IDatabaseAdapter = {
-      name: 'cloudsql',
-      capabilities: {
-        supportedDatabases: ['postgres'],
-        supportsPooling: false,
-        supportsReadReplicas: false,
-        supportsPointInTimeRecovery: true,
-        serverlessOptimized: true,
-      },
-      async connect() {},
-      async verify() {
-        return { success: true };
-      },
-      async observeDatabase() {
-        return null;
-      },
-      async provision(_type, environment) {
-        return {
-          component: {
-            id: '',
-            environmentId: environment.id,
-            type: 'postgres',
-            bindings: {
-              provider: 'cloudsql',
-              connectionString: 'postgres://cloudsql',
-            },
-            externalId: 'cloudsql-instance',
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          },
-          receipt: { success: true, message: 'provisioned' },
-        };
-      },
-      async getConnectionUrl() {
-        return 'postgres://cloudsql';
-      },
-      async destroy() {
-        return { success: true, message: 'destroyed' };
-      },
-    };
     const fakeHostingAdapter: IHostingAdapter = {
       name: 'cloudrun',
       capabilities: {
@@ -1614,14 +1018,12 @@ describe('infra_apply multi-service convergence', () => {
       },
     };
 
-    vi.spyOn(adapterFactory, 'getDatabaseAdapter').mockResolvedValue({ success: true, adapter: fakeDatabaseAdapter });
     vi.spyOn(adapterFactory, 'getHostingAdapter').mockResolvedValue({ success: true, adapter: fakeHostingAdapter });
 
     const payload = await applyInfra({
       projectName: project.name,
       environmentName: 'production',
       services: ['web'],
-      databaseProvider: 'cloudsql',
       serviceConfig: {
         web: {
           startCommand: 'npm start',
@@ -1640,7 +1042,6 @@ describe('infra_apply multi-service convergence', () => {
       projectName: project.name,
       environmentName: 'production',
       services: ['web'],
-      databaseProvider: 'cloudsql',
       serviceConfig: {
         web: {
           startCommand: 'npm start',
@@ -1657,21 +1058,19 @@ describe('infra_apply multi-service convergence', () => {
     expect(serviceRepo.findByProjectAndName(project.id, 'web')?.buildConfig.public).toBe(false);
   });
 
-  it('blocks Cloud Run infra_apply before provisioning when cloud_prepare has not been recorded', async () => {
+  it('blocks Cloud Run infra_apply before resolving hosting when cloud_prepare has not been recorded', async () => {
     const projectRepo = new ProjectRepository();
     const project = projectRepo.create({
       name: 'unprepared-cloudrun-project',
       defaultPlatform: 'cloudrun',
       gitRemoteUrl: 'git@github.com:davejohnson/hls-property-care.git',
     });
-    const databaseAdapterSpy = vi.spyOn(adapterFactory, 'getDatabaseAdapter');
     const hostingAdapterSpy = vi.spyOn(adapterFactory, 'getHostingAdapter');
 
     const payload = await applyInfra({
       projectName: project.name,
       environmentName: 'production',
       services: ['web'],
-      databaseProvider: 'cloudsql',
       setupEmail: false,
       confirm: true,
     });
@@ -1683,7 +1082,6 @@ describe('infra_apply multi-service convergence', () => {
       provider: 'cloudrun',
       requiredVersion: 'gcp-cloudrun-v1',
     });
-    expect(databaseAdapterSpy).not.toHaveBeenCalled();
     expect(hostingAdapterSpy).not.toHaveBeenCalled();
   });
 });

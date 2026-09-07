@@ -46,12 +46,9 @@ describe('environmentSpecSchema queues', () => {
     }
   });
 
-  it('rejects railway queues without a database (pg-boss model)', () => {
+  it('leaves provider-owned queue/database constraints to registry validation', () => {
     const result = envWithQueues();
-    expect(result.success).toBe(false);
-    const message = JSON.stringify(result.success ? '' : result.error.issues);
-    expect(message).toContain('pg-boss');
-    expect(message).toContain('database');
+    expect(result.success).toBe(true);
   });
 
   it('accepts railway queues when a database is declared', () => {

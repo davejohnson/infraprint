@@ -27,7 +27,11 @@ import {
   type ObservedService,
   type ObservedState,
 } from '../../../domain/ports/observe.port.js';
-import { providerRegistry, type ProviderInspectionRequest } from '../../../domain/registry/provider.registry.js';
+import {
+  providerRegistry,
+  standardDatabaseRuntimeProjection,
+  type ProviderInspectionRequest,
+} from '../../../domain/registry/provider.registry.js';
 import { environmentForInspection } from '../../../domain/registry/provider-inspection.js';
 import { DigitalOceanCacheAdapter } from './digitalocean-cache.adapter.js';
 import {
@@ -2155,6 +2159,13 @@ providerRegistry.register({
         ['DIGITALOCEAN_TOKEN', 'HYPERVIBE_DIGITALOCEAN_TOKEN'],
       ],
     },
+    maturity: {
+      lifecycle: {
+        hosting: { status: 'ready-for-live' },
+        database: { status: 'ready-for-live' },
+        cache: { status: 'ready-for-live' },
+      },
+    },
     orchestration: {
       project: { shareAcrossEnvironments: false },
       diff: {
@@ -2175,14 +2186,14 @@ providerRegistry.register({
       },
     },
     lifecycle: {
-      hosting: { customDomains: 'managed', maintenance: 'managed', teardownBoundary: 'project' },
+      hosting: { workloadKinds: ['web', 'worker', 'cron'], customDomains: 'managed', maintenance: 'managed', teardownBoundary: 'project' },
       databaseEngines: ['postgres'],
       cacheEngines: ['redis'],
     },
   },
-  factory: (credentials) => {
+  factory: async (credentials) => {
     const adapter = new DigitalOceanAdapter();
-    void adapter.connect(credentials);
+    await adapter.connect(credentials);
     return adapter;
   },
   inspection: {
@@ -2197,6 +2208,7 @@ providerRegistry.register({
       adapter as DigitalOceanAdapter
     ).inspectEnvironmentResources(request),
   },
+  databaseRuntime: standardDatabaseRuntimeProjection,
   derivedAdapters: {
     database: (adapter) =>
       (adapter as DigitalOceanAdapter).createDatabaseAdapter(),

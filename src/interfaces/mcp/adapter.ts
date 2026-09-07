@@ -3,8 +3,8 @@ import { z, type ZodRawShape } from 'zod';
 import type {
   CommandDefinition,
   CommandRegistrar,
-  CommandRegistry,
 } from '../../application/commands.js';
+import { CommandRegistry } from '../../application/commands.js';
 import type { CommandEnvelope } from '../../application/results.js';
 import { formatCommandResult } from '../../application/presentation.js';
 import { fileURLToPath } from 'node:url';
@@ -33,10 +33,19 @@ function registerDefinition(
   registry: CommandRegistry,
   definition: CommandDefinition
 ): void {
-  server.tool(
+  server.registerTool(
     definition.id,
-    definition.description,
-    definition.inputShape,
+    {
+      description: definition.description,
+      // The SDK validates before invoking our callback. Preserve unknown keys
+      // at that transport boundary so the canonical strict command runner can
+      // return the same structured VALIDATION envelope as the CLI instead of
+      // silently stripping a misspelled option.
+      inputSchema: definition.inputSchema.passthrough(),
+      annotations: {
+        readOnlyHint: definition.access === 'read',
+      },
+    },
     async (args) => {
       const capabilities = server.server.getClientCapabilities();
       let workspaceDirectories: string[] | undefined;
@@ -87,21 +96,9 @@ export function createMcpCommandRegistrar(server: McpServer): CommandRegistrar {
         args: z.infer<z.ZodObject<Args>>
       ) => Promise<CommandEnvelope> | CommandEnvelope
     ): void {
-      const registerTool = server.tool.bind(server) as unknown as (
-        name: string,
-        description: string,
-        inputShape: ZodRawShape,
-        callback: (args: Record<string, unknown>) => Promise<McpToolResponse>
-      ) => unknown;
-      registerTool(
-        name,
-        description,
-        inputShape,
-        async (args) => toMcpToolResponse(
-          await handler(args as z.infer<z.ZodObject<Args>>),
-          name
-        )
-      );
+      const registry = new CommandRegistry();
+      registry.register(name, description, inputShape, handler);
+      registerDefinition(server, registry, registry.get(name)!);
     },
   };
 }

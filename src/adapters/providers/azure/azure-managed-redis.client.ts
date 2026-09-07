@@ -17,6 +17,7 @@ export interface AzureManagedRedisCluster {
     resourceState?: string;
     hostName?: string;
     minimumTlsVersion?: string;
+    publicNetworkAccess?: string;
   };
   tags?: Record<string, string>;
 }
@@ -28,6 +29,7 @@ export interface AzureManagedRedisDatabase {
     provisioningState?: string;
     resourceState?: string;
     clientProtocol?: string;
+    accessKeysAuthentication?: string;
     port?: number;
     redisVersion?: string;
   };
@@ -42,10 +44,7 @@ export class AzureManagedRedisClient {
   constructor(private readonly arm: AzureResourceManagerClient) {}
 
   async verifyScope(): Promise<void> {
-    await Promise.all([
-      this.arm.verifyResourceGroup(),
-      this.listClusters(),
-    ]);
+    await this.arm.verifySubscription();
   }
 
   clusterResourceId(name: string): string {
@@ -93,13 +92,14 @@ export class AzureManagedRedisClient {
     resourceId: string
   ): Promise<AzureManagedRedisCluster | null> {
     const identity = this.parseClusterId(resourceId);
+    const expectedResourceId = this.clusterResourceIdForIdentity(identity);
     const cluster = await this.arm.getNullable<AzureManagedRedisCluster>(
-      this.clusterResourceId(identity.name),
+      expectedResourceId,
       AZURE_MANAGED_REDIS_API_VERSION
     );
     if (cluster) {
-      const observed = this.parseClusterId(cluster.id);
-      if (observed.name.toLowerCase() !== identity.name.toLowerCase()) {
+      this.parseClusterId(cluster.id);
+      if (cluster.id.toLowerCase() !== expectedResourceId.toLowerCase()) {
         throw new Error(
           `Azure Managed Redis returned ${cluster.id} for ${resourceId}.`
         );
@@ -120,11 +120,24 @@ export class AzureManagedRedisClient {
     );
   }
 
+  async updateCluster(
+    resourceId: string,
+    body: Record<string, unknown>
+  ): Promise<void> {
+    const identity = this.parseClusterId(resourceId);
+    await this.arm.request(
+      'PATCH',
+      this.clusterResourceIdForIdentity(identity),
+      AZURE_MANAGED_REDIS_API_VERSION,
+      body
+    );
+  }
+
   async createDatabase(clusterResourceId: string): Promise<void> {
     const identity = this.parseClusterId(clusterResourceId);
     await this.arm.request(
       'PUT',
-      `${this.clusterResourceId(identity.name)}/databases/${AZURE_MANAGED_REDIS_DATABASE}`,
+      `${this.clusterResourceIdForIdentity(identity)}/databases/${AZURE_MANAGED_REDIS_DATABASE}`,
       AZURE_MANAGED_REDIS_API_VERSION,
       {
         properties: {
@@ -142,17 +155,22 @@ export class AzureManagedRedisClient {
     clusterResourceId: string
   ): Promise<AzureManagedRedisDatabase | null> {
     const identity = this.parseClusterId(clusterResourceId);
-    return this.arm.getNullable(
-      `${this.clusterResourceId(identity.name)}/databases/${AZURE_MANAGED_REDIS_DATABASE}`,
+    const resourceId = `${this.clusterResourceIdForIdentity(identity)}/databases/${AZURE_MANAGED_REDIS_DATABASE}`;
+    const database = await this.arm.getNullable<AzureManagedRedisDatabase>(
+      resourceId,
       AZURE_MANAGED_REDIS_API_VERSION
     );
+    if (database && (!database.id || database.id.toLowerCase() !== resourceId.toLowerCase())) {
+      throw new Error(`Azure Managed Redis returned database ${database.id ?? 'without an ID'} for ${resourceId}.`);
+    }
+    return database;
   }
 
   async listKeys(clusterResourceId: string): Promise<string> {
     const identity = this.parseClusterId(clusterResourceId);
     const keys = await this.arm.request<AzureManagedRedisKeys>(
       'POST',
-      `${this.clusterResourceId(identity.name)}/databases/${AZURE_MANAGED_REDIS_DATABASE}/listKeys`,
+      `${this.clusterResourceIdForIdentity(identity)}/databases/${AZURE_MANAGED_REDIS_DATABASE}/listKeys`,
       AZURE_MANAGED_REDIS_API_VERSION
     );
     if (typeof keys.primaryKey !== 'string' || keys.primaryKey.length === 0) {
@@ -168,7 +186,7 @@ export class AzureManagedRedisClient {
     try {
       await this.arm.request(
         'DELETE',
-        this.clusterResourceId(identity.name),
+        this.clusterResourceIdForIdentity(identity),
         AZURE_MANAGED_REDIS_API_VERSION
       );
     } catch (error) {
@@ -179,5 +197,11 @@ export class AzureManagedRedisClient {
         throw error;
       }
     }
+  }
+
+  private clusterResourceIdForIdentity(identity: AzureArmResourceIdentity): string {
+    return `/subscriptions/${encodeURIComponent(identity.subscriptionId)}`
+      + `/resourceGroups/${encodeURIComponent(identity.resourceGroup)}`
+      + `/providers/Microsoft.Cache/redisEnterprise/${encodeURIComponent(identity.name)}`;
   }
 }

@@ -26,6 +26,11 @@ function makeComponent(externalId = 'neon-project-1'): Component {
     bindings: {
       provider: 'neon',
       instanceId: externalId,
+      providerScope: {
+        projectId: externalId,
+        organizationId: 'org-hypervibe',
+        regionId: 'aws-us-west-2',
+      },
       database: 'app',
       roleName: 'app_owner',
     },
@@ -193,6 +198,11 @@ describe('NeonAdapter', () => {
     expect(result.component.bindings).toMatchObject({
       provider: 'neon',
       instanceId: 'neon-created',
+      providerScope: {
+        projectId: 'neon-created',
+        organizationId: 'org-hypervibe',
+        regionId: 'aws-us-west-2',
+      },
       connectionString: directUri,
       pooledUrl: pooledUri,
       database: 'app',
@@ -266,6 +276,11 @@ describe('NeonAdapter', () => {
     expect(result.component.bindings).toMatchObject({
       provider: 'neon',
       instanceId: 'neon-pending',
+      providerScope: {
+        projectId: 'neon-pending',
+        organizationId: 'org-hypervibe',
+        regionId: 'aws-us-west-2',
+      },
     });
     expect(result.receipt.data).toMatchObject({
       projectId: 'neon-pending',
@@ -273,6 +288,167 @@ describe('NeonAdapter', () => {
       operationStatus: 'failed',
     });
     expect(result.connectionUrl).toBeUndefined();
+  });
+
+  it('recovers a unique project when the create transport loses its response', async () => {
+    vi.stubEnv('HYPERVIBE_NEON_CREATE_RECOVERY_ATTEMPTS', '2');
+    vi.stubEnv('HYPERVIBE_NEON_CREATE_RECOVERY_DELAY_MS', '0');
+    let listReads = 0;
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname === '/api/v2/projects' && method === 'GET') {
+        listReads += 1;
+        return jsonResponse({
+          projects: listReads < 3 ? [] : [{
+            id: 'neon-recovered',
+            name: 'production-db',
+            org_id: 'org-hypervibe',
+            region_id: 'aws-us-west-2',
+          }],
+          pagination: {},
+        });
+      }
+      if (url.pathname === '/api/v2/projects' && method === 'POST') {
+        throw new Error('connection closed after request transmission');
+      }
+      throw new Error(`unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connectedAdapter();
+
+    const result = await adapter.provision('postgres', makeEnvironment(), {
+      resourceName: 'production-db',
+    });
+
+    expect(result.receipt).toMatchObject({
+      success: false,
+      data: { projectId: 'neon-recovered', regionId: 'aws-us-west-2' },
+    });
+    expect(result.component).toMatchObject({
+      externalId: 'neon-recovered',
+      bindings: {
+        provider: 'neon',
+        providerScope: {
+          projectId: 'neon-recovered',
+          organizationId: 'org-hypervibe',
+          regionId: 'aws-us-west-2',
+        },
+      },
+    });
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+  });
+
+  it('retains an unresolved scoped create marker when transport recovery stays empty', async () => {
+    vi.stubEnv('HYPERVIBE_NEON_CREATE_RECOVERY_ATTEMPTS', '1');
+    vi.stubEnv('HYPERVIBE_NEON_CREATE_RECOVERY_DELAY_MS', '0');
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname === '/api/v2/projects' && method === 'GET') {
+        return jsonResponse({ projects: [], pagination: {} });
+      }
+      if (url.pathname === '/api/v2/projects' && method === 'POST') {
+        throw new Error('connection closed after request transmission');
+      }
+      throw new Error(`unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connectedAdapter();
+
+    const result = await adapter.provision('postgres', makeEnvironment(), {
+      resourceName: 'production-db',
+    });
+
+    expect(result.receipt).toMatchObject({
+      success: false,
+      data: {
+        mutationAttempted: true,
+        resourceCreated: 'unknown',
+        unresolvedCreateRetained: true,
+      },
+    });
+    expect(result.component).toMatchObject({
+      externalId: null,
+      bindings: {
+        provider: 'neon',
+        providerScope: { organizationId: 'org-hypervibe' },
+        unresolvedMutation: {
+          resourceKind: 'database',
+          operation: 'create',
+          resourceName: 'production-db',
+          providerScope: { organizationId: 'org-hypervibe' },
+        },
+      },
+    });
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+  });
+
+  it('does not retain an unresolved marker after a definitive 4xx create rejection', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname === '/api/v2/projects' && method === 'GET') {
+        return jsonResponse({ projects: [], pagination: {} });
+      }
+      if (url.pathname === '/api/v2/projects' && method === 'POST') {
+        return jsonResponse({ message: 'invalid region' }, 422);
+      }
+      throw new Error(`unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connectedAdapter();
+
+    const result = await adapter.provision('postgres', makeEnvironment(), {
+      resourceName: 'production-db',
+    });
+
+    expect(result.receipt.success).toBe(false);
+    expect(result.component.bindings).not.toHaveProperty('unresolvedMutation');
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'GET')).toHaveLength(1);
+  });
+
+  it('retains a provider-acknowledged project ID when create metadata is mismatched', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname === '/api/v2/projects' && method === 'GET') {
+        return jsonResponse({ projects: [], pagination: {} });
+      }
+      if (url.pathname === '/api/v2/projects' && method === 'POST') {
+        return jsonResponse({
+          project: {
+            id: 'neon-acknowledged',
+            name: 'wrong-name',
+            org_id: 'org-hypervibe',
+            region_id: 'aws-us-west-2',
+          },
+        }, 201);
+      }
+      throw new Error(`unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connectedAdapter();
+
+    const result = await adapter.provision('postgres', makeEnvironment(), {
+      resourceName: 'production-db',
+    });
+
+    expect(result.receipt.success).toBe(false);
+    expect(result.receipt.error).toContain('without the exact expected');
+    expect(result.component).toMatchObject({
+      externalId: 'neon-acknowledged',
+      bindings: {
+        provider: 'neon',
+        instanceId: 'neon-acknowledged',
+        providerScope: {
+          projectId: 'neon-acknowledged',
+          organizationId: 'org-hypervibe',
+          regionId: 'aws-us-west-2',
+        },
+      },
+    });
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
   });
 
   it('observes a bound project by durable ID and propagates non-404 failures', async () => {
@@ -295,11 +471,69 @@ describe('NeonAdapter', () => {
       engine: 'postgres',
       externalId: 'neon-project-1',
       name: 'invoice-perfect-production-postgres',
-      status: 'ready',
+      status: 'running',
     });
     await expect(
       adapter.observeDatabase(makeEnvironment(), makeComponent())
     ).rejects.toThrow(/503/);
+  });
+
+  it('does not turn a malformed exact project response into absence', async () => {
+    const fetchMock = vi.fn(async (
+      _input: string | URL | Request,
+      _init?: RequestInit
+    ) => jsonResponse({}));
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connectedAdapter();
+
+    await expect(
+      adapter.observeDatabase(makeEnvironment(), makeComponent())
+    ).rejects.toThrow(/invalid project response.*absence was not confirmed/i);
+    await expect(adapter.destroy(makeComponent())).resolves.toMatchObject({
+      success: false,
+      error: expect.stringContaining('absence was not confirmed'),
+    });
+    expect(fetchMock.mock.calls.every((call) =>
+      ((call[1] as RequestInit | undefined)?.method ?? 'GET') === 'GET'
+    )).toBe(true);
+  });
+
+  it('does not infer not-found from an arbitrary transport error message', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error('socket closed after Neon API error: 404 from an intermediary');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connectedAdapter();
+
+    await expect(adapter.destroy(makeComponent())).resolves.toMatchObject({
+      success: false,
+      error: expect.stringContaining('socket closed'),
+    });
+  });
+
+  it('blocks a bound project before lookup when the selected organization changed', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connectedAdapter();
+    const component = makeComponent();
+    component.bindings.providerScope = {
+      projectId: component.externalId,
+      organizationId: 'org-other',
+      regionId: 'aws-us-west-2',
+    };
+
+    await expect(
+      adapter.observeDatabase(makeEnvironment(), component)
+    ).rejects.toThrow(
+      /scope organization org-other does not match connected organization org-hypervibe/
+    );
+    await expect(adapter.destroy(component)).resolves.toMatchObject({
+      success: false,
+      error: expect.stringContaining(
+        'scope organization org-other does not match connected organization org-hypervibe'
+      ),
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('blocks an incomplete project list instead of treating it as absence', async () => {
@@ -313,6 +547,21 @@ describe('NeonAdapter', () => {
     await expect(adapter.observeDatabase(makeEnvironment())).rejects.toThrow(
       /incomplete/i
     );
+  });
+
+  it('blocks project inventories with missing durable identities', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({
+      projects: [{ name: 'some-other-project' }],
+      pagination: {},
+    })));
+    const adapter = await connectedAdapter();
+
+    const result = await adapter.provision('postgres', makeEnvironment(), {
+      resourceName: 'invoice-perfect-production-postgres',
+    });
+
+    expect(result.receipt).toMatchObject({ success: false });
+    expect(result.receipt.error).toContain('without a durable ID and name');
   });
 
   it('waits until a deleted project is terminally absent', async () => {

@@ -48,8 +48,13 @@ export interface LoadBalancerScope {
 }
 
 export interface LoadBalancerEnsureResult<T> {
+  /** Exact provider identity returned by the acknowledged mutation. */
   resource: T;
   created: boolean;
+  /** True only after the adapter re-observed the exact desired resource. */
+  verified: boolean;
+  /** Safe provider-owned reason when read-after-write did not converge. */
+  verificationError?: string;
 }
 
 export interface ILoadBalancerAdapter {

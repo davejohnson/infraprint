@@ -4,6 +4,7 @@ import {
   DeleteDBInstanceCommand,
   DescribeDBInstancesCommand,
 } from '@aws-sdk/client-rds';
+import { GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import type { Component } from '../../../domain/entities/component.entity.js';
 import type { Environment } from '../../../domain/entities/environment.entity.js';
 import type { ObservedState } from '../../../domain/ports/observe.port.js';
@@ -74,6 +75,10 @@ async function setupSupabase(
   const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(String(input));
     const method = init?.method ?? 'GET';
+
+    if (method === 'GET' && url.pathname === '/v1/organizations') {
+      return Response.json([{ id: 'org-1', name: 'Primary' }]);
+    }
 
     if (method === 'GET' && url.pathname === '/v1/projects') {
       if (scenario === 'observation_unknown') {
@@ -211,6 +216,7 @@ async function setupCloudSql(
         name: EXTERNAL_IDS[0],
         state: itemReads > 1 ? 'PENDING_DELETE' : 'RUNNABLE',
         databaseVersion: 'POSTGRES_15',
+        region: 'us-central1',
       });
     }
 
@@ -268,6 +274,7 @@ async function setupRds(
       return {
         DBInstances: [{
           DBInstanceIdentifier: EXTERNAL_IDS[0],
+          DBInstanceArn: `arn:aws:rds:us-west-2:123456789012:db:${EXTERNAL_IDS[0]}`,
           DBInstanceStatus: observations > 1 ? 'deleting' : 'available',
         }],
       };
@@ -284,6 +291,11 @@ async function setupRds(
   });
   (adapter as unknown as { rds: { send: typeof rdsSend } }).rds = { send: rdsSend };
   (adapter as unknown as { ec2: { send: typeof ec2Send } }).ec2 = { send: ec2Send };
+  const stsSend = vi.fn(async (command: unknown) => {
+    if (command instanceof GetCallerIdentityCommand) return { Account: '123456789012' };
+    throw new Error(`Unexpected STS command: ${(command as { constructor?: { name?: string } }).constructor?.name}`);
+  });
+  (adapter as unknown as { sts: { send: typeof stsSend } }).sts = { send: stsSend };
   vi.stubEnv('HYPERVIBE_RDS_READY_ATTEMPTS', '4');
   vi.stubEnv('HYPERVIBE_RDS_READY_DELAY_MS', '0');
   return {
@@ -399,10 +411,46 @@ const providers: Array<{
   platformBindings?: Record<string, unknown>;
   componentBindings?: Record<string, unknown>;
 }> = [
-  { displayName: 'Railway', provider: 'railway', setup: setupRailway, platformBindings: { projectId: 'rail-project', environmentId: 'rail-env' } },
-  { displayName: 'Supabase', provider: 'supabase', setup: setupSupabase },
-  { displayName: 'Cloud SQL', provider: 'cloudsql', setup: setupCloudSql },
-  { displayName: 'Amazon RDS', provider: 'rds', setup: setupRds },
+  {
+    displayName: 'Railway',
+    provider: 'railway',
+    setup: setupRailway,
+    platformBindings: { projectId: 'rail-project', environmentId: 'rail-env' },
+    componentBindings: {
+      providerScope: { projectId: 'rail-project' },
+      resourceKind: 'service',
+    },
+  },
+  {
+    displayName: 'Supabase',
+    provider: 'supabase',
+    setup: setupSupabase,
+    componentBindings: {
+      providerScope: { organizationId: 'org-1', region: 'us-east-1' },
+    },
+  },
+  {
+    displayName: 'Cloud SQL',
+    provider: 'cloudsql',
+    setup: setupCloudSql,
+    componentBindings: {
+      providerScope: { projectId: 'gcp-project', region: 'us-central1' },
+    },
+  },
+  {
+    displayName: 'Amazon RDS',
+    provider: 'rds',
+    setup: setupRds,
+    platformBindings: {
+      provider: 'ecs',
+      projectId: 'arn:aws:ecs:us-west-2:123456789012:cluster/hv-parity-production',
+      environmentId: 'arn:aws:ecs:us-west-2:123456789012:cluster/hv-parity-production',
+      services: {},
+    },
+    componentBindings: {
+      providerScope: { accountId: '123456789012', region: 'us-west-2' },
+    },
+  },
   {
     displayName: 'Fly Managed Postgres',
     provider: 'fly',

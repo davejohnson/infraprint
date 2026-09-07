@@ -90,6 +90,9 @@ export class EnvironmentRepository {
 
   delete(id: string): boolean {
     const db = getDb();
+    const existing = this.findById(id);
+    if (!existing) return false;
+    this.syncRepoBindings({ ...existing, platformBindings: {} });
     const result = db.prepare('DELETE FROM environments WHERE id = ?').run(id);
     return result.changes > 0;
   }
@@ -106,16 +109,12 @@ export class EnvironmentRepository {
   }
 
   private syncRepoBindings(environment: Environment): void {
-    if (Object.keys(environment.platformBindings).length === 0) {
-      return;
-    }
-    try {
-      const project = new ProjectRepository().findById(environment.projectId);
-      if (project) {
-        writeRepoBindingsForEnvironment(project, environment);
-      }
-    } catch (error) {
-      console.warn(`[hypervibe] Failed to sync repo bindings for environment ${environment.id}: ${error instanceof Error ? error.message : String(error)}`);
+    const project = new ProjectRepository().findById(environment.projectId);
+    if (project) {
+      // Persisted provider identity is part of the apply receipt boundary. A
+      // malformed or unwritable repository export must fail the operation;
+      // the SQLite mutation has already retained the exact identity for retry.
+      writeRepoBindingsForEnvironment(project, environment);
     }
   }
 }

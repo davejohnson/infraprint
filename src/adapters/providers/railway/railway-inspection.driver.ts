@@ -69,12 +69,12 @@ function normalizeRailwayPreDeployCommand(value: unknown): string | undefined {
   return commands.length > 0 ? commands.join(' && ') : undefined;
 }
 
-export async function listRailwayImportCandidates(
+async function railwayImportCandidatePage(
   adapter: RailwayAdapter,
-  limit = 25
-): Promise<ImportCandidate[]> {
-  const projects = (await adapter.listProjects()).slice(0, limit);
-  return Promise.all(projects.map(async (project) => {
+  limit: number
+): Promise<{ projects: ImportCandidate[]; truncated: boolean }> {
+  const allProjects = await adapter.listProjects();
+  const projects = await Promise.all(allProjects.slice(0, limit).map(async (project) => {
     const details = await adapter.getProjectDetails(project.id);
     return {
       name: project.name,
@@ -83,6 +83,7 @@ export async function listRailwayImportCandidates(
       serviceCount: details?.services.edges.length ?? 0,
     };
   }));
+  return { projects, truncated: allProjects.length > limit };
 }
 
 export async function inspectRailwayProject(
@@ -208,18 +209,36 @@ export async function inspectRailwayResources(
           if (service.datastoreEngine !== expectedEngine) continue;
           if (request.id && service.railwayId !== request.id) continue;
           if (request.name && service.name.toLowerCase() !== request.name.toLowerCase()) continue;
-          resources.push({
-            id: service.railwayId,
-            name: service.name,
-            engine: expectedEngine,
-            status: 'unknown',
-            resourceKind: 'service',
-            project: { id: project.id, name: project.name },
-            providerScope: { projectId: project.id },
-          });
+          const environmentIds = Object.keys(service.instancesByEnv);
+          if (resource === 'cache') {
+            for (const environmentId of environmentIds) {
+              resources.push({
+                id: service.railwayId,
+                name: service.name,
+                engine: expectedEngine,
+                status: 'unknown',
+                resourceKind: 'service',
+                project: { id: project.id, name: project.name },
+                providerScope: { projectId: project.id, environmentId },
+              });
+            }
+          } else {
+            resources.push({
+              id: service.railwayId,
+              name: service.name,
+              engine: expectedEngine,
+              status: 'unknown',
+              resourceKind: 'service',
+              project: { id: project.id, name: project.name },
+              providerScope: { projectId: project.id },
+            });
+          }
         }
         for (const component of inspection.components) {
           if (component.type !== expectedEngine) continue;
+          // Legacy Redis plugins have no exact environment-scoped lifecycle or
+          // supported teardown port. They are not cache-lifecycle candidates.
+          if (resource === 'cache') continue;
           if (request.id && component.railwayId !== request.id) continue;
           if (request.name && component.name.toLowerCase() !== request.name.toLowerCase()) continue;
           resources.push({
@@ -254,10 +273,16 @@ export async function inspectRailwayResources(
   const selectedId = request.id ?? bindingProjectId;
   const selectedName = request.name ?? request.project?.name;
   if (!selectedId && !selectedName) {
+    const page = await railwayImportCandidatePage(adapter, request.limit);
     return {
-      observation: 'present',
+      observation: page.projects.length > 0 ? 'present' : 'absent',
       resource: 'project',
-      projects: await listRailwayImportCandidates(adapter, request.limit),
+      projects: page.projects.map((project) => ({
+        ...project,
+        id: project.railwayId,
+      })),
+      truncated: page.truncated,
+      partial: page.truncated,
     };
   }
 
@@ -266,14 +291,24 @@ export async function inspectRailwayResources(
   if (!projectId) {
     matches = await adapter.findProjectsByName(selectedName!);
     if (matches.length === 0) {
-      return { observation: 'absent', resource: request.resource ?? 'project', name: selectedName };
+      return {
+        observation: 'absent',
+        resource: request.resource ?? 'project',
+        name: selectedName,
+        projects: [],
+        truncated: false,
+        partial: false,
+      };
     }
     if (matches.length > 1) {
+      const truncated = matches.length > request.limit;
       return {
         observation: 'ambiguous',
         resource: request.resource ?? 'project',
         name: selectedName,
         projects: matches.slice(0, request.limit).map((project) => ({ id: project.id, name: project.name })),
+        truncated,
+        partial: truncated,
       };
     }
     projectId = matches[0].id;
@@ -281,7 +316,14 @@ export async function inspectRailwayResources(
 
   const inspection = await inspectRailwayProject(adapter, projectId);
   if (!inspection) {
-    return { observation: 'absent', resource: request.resource ?? 'project', id: projectId };
+    return {
+      observation: 'absent',
+      resource: request.resource ?? 'project',
+      id: projectId,
+      projects: [],
+      truncated: false,
+      partial: false,
+    };
   }
   if (request.resource === 'environment') {
     const boundEnvironmentId = typeof request.binding?.environmentId === 'string'
@@ -301,51 +343,92 @@ export async function inspectRailwayResources(
       };
     }
     if (candidates.length > 1) {
+      const truncated = candidates.length > request.limit;
       return {
         observation: 'ambiguous',
         resource: 'environment',
         project: { id: inspection.details.id, name: inspection.details.name },
-        environments: candidates.map((environment) => ({ id: environment.railwayId, name: environment.name })),
+        environments: candidates
+          .slice(0, request.limit)
+          .map((environment) => ({ id: environment.railwayId, name: environment.name })),
+        truncated,
+        partial: truncated,
       };
     }
     const selectedEnvironment = candidates[0]!;
+    const services = inspection.services.filter((service) => (
+      Boolean(service.instancesByEnv[selectedEnvironment.railwayId])
+    ));
+    const storage = inspection.storage.filter((bucket) => (
+      bucket.environments.some((environment) => environment.name === selectedEnvironment.name)
+    ));
+    const truncated = services.length > request.limit
+      || inspection.components.length > request.limit
+      || storage.length > request.limit;
     return {
       observation: 'present',
       resource: 'environment',
       project: { id: inspection.details.id, name: inspection.details.name },
       environment: { id: selectedEnvironment.railwayId, name: selectedEnvironment.name },
-      services: inspection.services
-        .filter((service) => Boolean(service.instancesByEnv[selectedEnvironment.railwayId]))
+      services: services
+        .slice(0, request.limit)
         .map((service) => ({
           id: service.railwayId,
           name: service.name,
           instance: service.instancesByEnv[selectedEnvironment.railwayId],
           datastoreEngine: service.datastoreEngine,
         })),
-      components: inspection.components.map((component) => ({ id: component.railwayId, name: component.name, type: component.type })),
-      storage: inspection.storage
-        .filter((bucket) => bucket.environments.some((environment) => environment.name === selectedEnvironment.name))
+      components: inspection.components
+        .slice(0, request.limit)
+        .map((component) => ({ id: component.railwayId, name: component.name, type: component.type })),
+      storage: storage
+        .slice(0, request.limit)
         .map((bucket) => ({ id: bucket.railwayId, name: bucket.name })),
+      truncated,
+      partial: truncated,
     };
   }
+  const environments = inspection.environments.slice(0, request.limit);
+  const returnedEnvironmentNames = new Set(environments.map((environment) => environment.name));
+  const returnedEnvironmentIds = new Set(environments.map((environment) => environment.railwayId));
+  const truncated = inspection.environments.length > request.limit
+    || inspection.services.length > request.limit
+    || inspection.components.length > request.limit
+    || inspection.storage.length > request.limit
+    || inspection.envVarNames.length > request.limit;
   return {
     observation: 'present',
     resource: 'project',
     project: { id: inspection.details.id, name: inspection.details.name },
-    environments: inspection.environments.map((environment) => ({ id: environment.railwayId, name: environment.name })),
-    services: inspection.services.map((service) => ({
+    projects: [{ id: inspection.details.id, name: inspection.details.name }],
+    environments: environments.map((environment) => ({ id: environment.railwayId, name: environment.name })),
+    services: inspection.services.slice(0, request.limit).map((service) => ({
       id: service.railwayId,
       name: service.name,
       repo: service.repo,
       branch: service.branch,
       hasGitHubDeploy: service.hasGitHubDeploy,
       datastoreEngine: service.datastoreEngine,
-      instancesByEnvironmentId: service.instancesByEnv,
+      instancesByEnvironmentId: Object.fromEntries(
+        Object.entries(service.instancesByEnv).filter(([environmentId]) => returnedEnvironmentIds.has(environmentId))
+      ),
     })),
-    components: inspection.components.map((component) => ({ id: component.railwayId, name: component.name, type: component.type })),
-    storage: inspection.storage.map((bucket) => ({ id: bucket.railwayId, name: bucket.name, environments: bucket.environments })),
-    envVarNames: inspection.envVarNames,
-    autoDetected: inspection.autoDetected,
-    needsMapping: inspection.needsMapping,
+    components: inspection.components
+      .slice(0, request.limit)
+      .map((component) => ({ id: component.railwayId, name: component.name, type: component.type })),
+    storage: inspection.storage
+      .slice(0, request.limit)
+      .map((bucket) => ({
+        id: bucket.railwayId,
+        name: bucket.name,
+        environments: bucket.environments.filter((environment) => returnedEnvironmentNames.has(environment.name)),
+      })),
+    envVarNames: inspection.envVarNames.slice(0, request.limit),
+    autoDetected: Object.fromEntries(
+      Object.entries(inspection.autoDetected).filter(([name]) => returnedEnvironmentNames.has(name))
+    ),
+    needsMapping: inspection.needsMapping.filter((name) => returnedEnvironmentNames.has(name)),
+    truncated,
+    partial: truncated,
   };
 }

@@ -105,16 +105,21 @@ export function readRepoSpecFile(startDir = primaryWorkspaceDirectory()): RepoSp
   }
 
   const specPath = repoSpecPath(root);
-  if (!existsSync(specPath)) {
-    return null;
+  let raw: string;
+  try {
+    raw = readFileSync(specPath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+      return null;
+    }
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    throw new Error(`${specPath} could not be read${code ? ` (${code})` : ''}. Fix the file permissions and retry.`);
   }
-
-  const raw = readFileSync(specPath, 'utf8');
   let document: unknown;
   try {
     document = JSON.parse(raw);
-  } catch (error) {
-    throw new Error(`${specPath} is not valid JSON: ${error instanceof Error ? error.message : String(error)}. Fix the file (or delete it to fall back to the local spec) and retry.`);
+  } catch {
+    throw new Error(`${specPath} is not valid JSON. Fix the file (or intentionally delete it to fall back to the local spec) and retry.`);
   }
   const parsed = projectSpecSchema.safeParse(document);
   if (!parsed.success) {
@@ -134,6 +139,14 @@ export function writeRepoSpecFile(spec: ProjectSpec, startDir = primaryWorkspace
 
   const root = findRepoRoot(startDir);
   if (!root) {
+    return null;
+  }
+
+  // A writer must distinguish a missing file from corrupt/conflicting desired
+  // state just as strictly as a reader. Repair or intentionally delete a bad
+  // file first; never make a lifecycle write silently erase the evidence.
+  const existing = readRepoSpecFile(root);
+  if (existing && existing.spec.project !== spec.project) {
     return null;
   }
 

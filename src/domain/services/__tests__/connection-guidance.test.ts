@@ -63,6 +63,19 @@ describe('connection guidance', () => {
     }
   });
 
+  it('documents the AWS Secrets Manager default credential chain honestly', () => {
+    const guidance = formatConnectionGuidance('aws-secrets');
+    const metadata = secretManagerRegistry.getMetadata('aws-secrets');
+
+    expect(metadata?.credentials?.supportsNativeCliAuth).toBe(true);
+    expect(guidance).toContain('AWS SDK default credential chain');
+    expect(guidance).toContain('shared profiles and SSO');
+    expect(guidance).toContain('web identity');
+    expect(guidance).toContain('ECS task credentials');
+    expect(guidance).toContain('EC2 instance role');
+    expect(guidance).not.toContain('profiles, SSO, and instance roles are not read');
+  });
+
   it('tells users the Cloudflare token type, URL, permissions, and scoped connect command', () => {
     const guidance = formatConnectionGuidance('cloudflare', { scope: 'invoiceperfect.com' });
 
@@ -290,6 +303,7 @@ describe('connection guidance', () => {
         'roles/storage.admin',
         'memorystoreAccess="inspect"',
         'roles/redis.viewer',
+        'roles/compute.networkViewer',
         'queueAccess="lifecycle"',
         'roles/pubsub.editor',
         'adminAuth="default"',
@@ -306,9 +320,11 @@ describe('connection guidance', () => {
         'https://console.cloud.google.com/iam-admin/serviceaccounts',
         'roles/redis.viewer',
         'roles/redis.admin',
+        'roles/compute.networkViewer',
+        'roles/compute.networkUser',
         'roles/serviceusage.serviceUsageConsumer',
         'redis.googleapis.com',
-        'declarative VPC egress',
+        'Direct VPC egress',
         'cloudrun',
         'memorystoreAccess="inspect"',
         'credentialsRef="file:/absolute/path/memorystore.json"',
@@ -319,18 +335,21 @@ describe('connection guidance', () => {
         'rds:DescribeDBInstances',
         'ec2:AuthorizeSecurityGroupIngress',
         'ec2:RevokeSecurityGroupIngress',
+        'provider="ecs"',
+        'exact default-VPC workload network',
         'credentialsRef="file:/absolute/path/rds.json"',
       ],
       elasticache: [
         'https://console.aws.amazon.com/iam/home#/security_credentials',
         'AWS IAM access key',
+        'Reuse the verified ecs connection',
         'elasticache:DescribeServerlessCaches',
         'elasticache:CreateServerlessCache',
         'ec2:AuthorizeSecurityGroupIngress',
         'iam:CreateServiceLinkedRole',
-        'subnetIds',
-        'securityGroupIds',
-        'credentialsRef="file:/absolute/path/elasticache.json"',
+        'Region and size belong in environments.<name>.cache',
+        'network, subnet, and security-group IDs are never connection credentials',
+        'credentialsRef="file:/absolute/path/aws-ecs.json"',
       ],
       supabase: [
         'https://supabase.com/dashboard/account/tokens',
@@ -505,6 +524,7 @@ describe('credentialFieldsFromSchema', () => {
     expect(providerRegistry.connectionProviders('gcs')).toEqual(['gcs', 'cloudrun']);
     expect(providerRegistry.connectionProviders('azureblob')).toEqual(['azureblob', 'azure-container-apps']);
     expect(providerRegistry.connectionProviders('memorystore')).toEqual(['memorystore', 'cloudrun']);
+    expect(providerRegistry.connectionProviders('elasticache')).toEqual(['elasticache', 'ecs']);
   });
 
   it('describes required, optional, secret, multiline, and choice fields', () => {

@@ -24,9 +24,6 @@ export async function runCli(
   options: CliRunOptions = {}
 ): Promise<number> {
   const io = options.io ?? createProcessCliIo();
-  if (options.initialize !== false) {
-    initializeDatabase();
-  }
   const registry = options.registry ?? createCommandRegistry(createCommandContext());
 
   let invocation;
@@ -48,6 +45,12 @@ export async function runCli(
   if (invocation.help) {
     io.writeOut(commandHelp(invocation.command));
     return 0;
+  }
+
+  // Help, version, and parse failures must not create or migrate local state.
+  // Initialize only once we know a real command is going to execute.
+  if (options.initialize !== false) {
+    initializeDatabase();
   }
 
   let result = await registry.execute(invocation.command.id, invocation.input);

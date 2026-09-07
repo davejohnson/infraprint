@@ -34,6 +34,10 @@ import {
 } from './azure-container-apps-ci.workflow.js';
 import { buildAzureContainerAppsPortableRecipe } from './azure-container-apps-ci.recipe.js';
 import { AzureResourceManagerClient } from './azure-resource-manager.client.js';
+import {
+  azureEnvironmentResourceGroupScope,
+  parseAzureResourceGroupScope,
+} from './azure-environment-scope.js';
 
 const RESOURCE_API = '2024-11-01';
 const RESOURCE_LIST_API = '2021-04-01';
@@ -846,21 +850,26 @@ export class AzureContainerAppsAdapter implements IProviderAdapter, IWorkloadMai
   }
 
   private desiredProject(projectName: string, environment: Environment): AzureProject {
-    const groupName = this.safeName(`hv-${projectName}-${environment.name}`, 54, `${environment.projectId}:${environment.name}`);
-    return this.projectFromResourceGroup(`/subscriptions/${this.connected().credentials.subscriptionId}/resourceGroups/${groupName}`);
+    const scope = azureEnvironmentResourceGroupScope({
+      subscriptionId: this.connected().credentials.subscriptionId,
+      projectName,
+      environmentId: environment.projectId,
+      environmentName: environment.name,
+    });
+    return this.projectFromResourceGroup(scope.resourceGroupId);
   }
 
   private projectFromResourceGroup(resourceGroupId: string): AzureProject {
-    const match = resourceGroupId.match(/^\/subscriptions\/([^/]+)\/resourceGroups\/([^/]+)$/i);
-    if (!match || match[1]!.toLowerCase() !== this.connected().credentials.subscriptionId.toLowerCase()) {
-      throw new Error(`Invalid or cross-subscription Azure resource group ID: ${resourceGroupId}`);
-    }
-    const canonical = `/subscriptions/${this.connected().credentials.subscriptionId}/resourceGroups/${match[2]}`;
+    const scope = parseAzureResourceGroupScope(
+      resourceGroupId,
+      this.connected().credentials.subscriptionId
+    );
+    const canonical = scope.resourceGroupId;
     const registryName = azureRegistryName(canonical);
-    const environmentName = this.safeName(`hv-${match[2]}-env`, 50, canonical);
+    const environmentName = this.safeName(`hv-${scope.resourceGroup}-env`, 50, canonical);
     return {
       resourceGroupId: canonical,
-      resourceGroupName: match[2]!,
+      resourceGroupName: scope.resourceGroup,
       registryName,
       registryServer: `${registryName}.azurecr.io`,
       registryId: `${canonical}/providers/Microsoft.ContainerRegistry/registries/${registryName}`,
@@ -1329,6 +1338,11 @@ providerRegistry.register({
         ['HYPERVIBE_AZURE_CLIENT_SECRET', 'AZURE_CLIENT_SECRET'],
       ],
     },
+    maturity: {
+      lifecycle: {
+        hosting: { status: 'ready-for-live' },
+      },
+    },
     orchestration: {
       project: { shareAcrossEnvironments: false },
       diff: { workloadKindObservation: 'exact' },
@@ -1347,12 +1361,12 @@ providerRegistry.register({
       },
     },
     lifecycle: {
-      hosting: { customDomains: 'managed', domainTrafficProxy: 'dns-only', maintenance: 'managed', teardownBoundary: 'project' },
+      hosting: { workloadKinds: ['web'], customDomains: 'managed', domainTrafficProxy: 'dns-only', maintenance: 'managed', teardownBoundary: 'project' },
     },
   },
-  factory: (credentials) => {
+  factory: async (credentials) => {
     const adapter = new AzureContainerAppsAdapter();
-    void adapter.connect(credentials);
+    await adapter.connect(credentials);
     return adapter;
   },
   inspection: {

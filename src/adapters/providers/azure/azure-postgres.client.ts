@@ -19,6 +19,9 @@ export interface AzurePostgresServer {
     fullyQualifiedDomainName?: string;
     administratorLogin?: string;
     version?: string;
+    network?: {
+      publicNetworkAccess?: string;
+    };
   };
   tags?: Record<string, string>;
 }
@@ -45,10 +48,7 @@ export class AzurePostgresClient {
   constructor(private readonly arm: AzureResourceManagerClient) {}
 
   async verifyScope(): Promise<void> {
-    await Promise.all([
-      this.arm.verifyResourceGroup(),
-      this.listServers(),
-    ]);
+    await this.arm.verifySubscription();
   }
 
   serverResourceId(name: string): string {
@@ -94,13 +94,14 @@ export class AzurePostgresClient {
 
   async getServer(resourceId: string): Promise<AzurePostgresServer | null> {
     const identity = this.parseServerId(resourceId);
+    const expectedResourceId = this.serverResourceIdForIdentity(identity);
     const server = await this.arm.getNullable<AzurePostgresServer>(
-      this.serverResourceId(identity.name),
+      expectedResourceId,
       AZURE_POSTGRES_API_VERSION
     );
     if (server) {
-      const observed = this.parseServerId(server.id);
-      if (observed.name.toLowerCase() !== identity.name.toLowerCase()) {
+      this.parseServerId(server.id);
+      if (server.id.toLowerCase() !== expectedResourceId.toLowerCase()) {
         throw new Error(
           `Azure PostgreSQL returned ${server.id} for ${resourceId}.`
         );
@@ -128,7 +129,7 @@ export class AzurePostgresClient {
     const identity = this.parseServerId(serverResourceId);
     await this.arm.request(
       'PUT',
-      `${this.serverResourceId(identity.name)}/databases/${encodeURIComponent(databaseName)}`,
+      `${this.serverResourceIdForIdentity(identity)}/databases/${encodeURIComponent(databaseName)}`,
       AZURE_POSTGRES_API_VERSION,
       {
         properties: {
@@ -145,7 +146,7 @@ export class AzurePostgresClient {
     const identity = this.parseServerId(serverResourceId);
     await this.arm.request(
       'PUT',
-      `${this.serverResourceId(identity.name)}/firewallRules/hypervibe-azure-services`,
+      `${this.serverResourceIdForIdentity(identity)}/firewallRules/hypervibe-azure-services`,
       AZURE_POSTGRES_API_VERSION,
       {
         properties: {
@@ -164,7 +165,7 @@ export class AzurePostgresClient {
     const identity = this.parseServerId(serverResourceId);
     await this.arm.request(
       'PUT',
-      `${this.serverResourceId(identity.name)}/firewallRules/${encodeURIComponent(ruleName)}`,
+      `${this.serverResourceIdForIdentity(identity)}/firewallRules/${encodeURIComponent(ruleName)}`,
       AZURE_POSTGRES_API_VERSION,
       { properties: { startIpAddress: address, endIpAddress: address } }
     );
@@ -175,10 +176,15 @@ export class AzurePostgresClient {
     ruleName: string
   ): Promise<AzurePostgresFirewallRule | null> {
     const identity = this.parseServerId(serverResourceId);
-    return this.arm.getNullable(
-      `${this.serverResourceId(identity.name)}/firewallRules/${encodeURIComponent(ruleName)}`,
+    const resourceId = `${this.serverResourceIdForIdentity(identity)}/firewallRules/${encodeURIComponent(ruleName)}`;
+    const rule = await this.arm.getNullable<AzurePostgresFirewallRule>(
+      resourceId,
       AZURE_POSTGRES_API_VERSION
     );
+    if (rule && (!rule.id || rule.id.toLowerCase() !== resourceId.toLowerCase())) {
+      throw new Error(`Azure PostgreSQL returned firewall rule ${rule.id ?? 'without an ID'} for ${resourceId}.`);
+    }
+    return rule;
   }
 
   async deleteFirewallRule(
@@ -189,7 +195,7 @@ export class AzurePostgresClient {
     try {
       await this.arm.request(
         'DELETE',
-        `${this.serverResourceId(identity.name)}/firewallRules/${encodeURIComponent(ruleName)}`,
+        `${this.serverResourceIdForIdentity(identity)}/firewallRules/${encodeURIComponent(ruleName)}`,
         AZURE_POSTGRES_API_VERSION
       );
     } catch (error) {
@@ -201,10 +207,15 @@ export class AzurePostgresClient {
     serverResourceId: string
   ): Promise<AzurePostgresFirewallRule | null> {
     const identity = this.parseServerId(serverResourceId);
-    return this.arm.getNullable(
-      `${this.serverResourceId(identity.name)}/firewallRules/hypervibe-azure-services`,
+    const resourceId = `${this.serverResourceIdForIdentity(identity)}/firewallRules/hypervibe-azure-services`;
+    const rule = await this.arm.getNullable<AzurePostgresFirewallRule>(
+      resourceId,
       AZURE_POSTGRES_API_VERSION
     );
+    if (rule && (!rule.id || rule.id.toLowerCase() !== resourceId.toLowerCase())) {
+      throw new Error(`Azure PostgreSQL returned firewall rule ${rule.id ?? 'without an ID'} for ${resourceId}.`);
+    }
+    return rule;
   }
 
   async getDatabase(
@@ -212,10 +223,15 @@ export class AzurePostgresClient {
     databaseName: string
   ): Promise<AzurePostgresDatabase | null> {
     const identity = this.parseServerId(serverResourceId);
-    return this.arm.getNullable(
-      `${this.serverResourceId(identity.name)}/databases/${encodeURIComponent(databaseName)}`,
+    const resourceId = `${this.serverResourceIdForIdentity(identity)}/databases/${encodeURIComponent(databaseName)}`;
+    const database = await this.arm.getNullable<AzurePostgresDatabase>(
+      resourceId,
       AZURE_POSTGRES_API_VERSION
     );
+    if (database && (!database.id || database.id.toLowerCase() !== resourceId.toLowerCase())) {
+      throw new Error(`Azure PostgreSQL returned database ${database.id ?? 'without an ID'} for ${resourceId}.`);
+    }
+    return database;
   }
 
   async deleteServer(resourceId: string): Promise<void> {
@@ -223,7 +239,7 @@ export class AzurePostgresClient {
     try {
       await this.arm.request(
         'DELETE',
-        this.serverResourceId(identity.name),
+        this.serverResourceIdForIdentity(identity),
         AZURE_POSTGRES_API_VERSION
       );
     } catch (error) {
@@ -234,5 +250,11 @@ export class AzurePostgresClient {
         throw error;
       }
     }
+  }
+
+  private serverResourceIdForIdentity(identity: AzureArmResourceIdentity): string {
+    return `/subscriptions/${encodeURIComponent(identity.subscriptionId)}`
+      + `/resourceGroups/${encodeURIComponent(identity.resourceGroup)}`
+      + `/providers/Microsoft.DBforPostgreSQL/flexibleServers/${encodeURIComponent(identity.name)}`;
   }
 }

@@ -77,6 +77,119 @@ export interface AppScreenshot {
 }
 
 const APP_STORE_CONNECT_API = 'https://api.appstoreconnect.apple.com/v1';
+const APP_STORE_CONNECT_PAGE_LIMIT = 200;
+const MAX_APP_STORE_CONNECT_PAGES = 1_000;
+
+const paginationLinksSchema = z.object({
+  next: z.string().url().nullable().optional(),
+}).passthrough();
+
+const betaGroupResourceSchema = z.object({
+  id: z.string().min(1),
+  attributes: z.object({
+    name: z.string().min(1),
+    isInternalGroup: z.boolean(),
+    hasAccessToAllBuilds: z.boolean().nullable().optional(),
+    publicLinkEnabled: z.boolean().nullable().optional(),
+    publicLink: z.string().nullable().optional(),
+    publicLinkLimit: z.number().int().nullable().optional(),
+    feedbackEnabled: z.boolean().nullable().optional(),
+  }).passthrough(),
+}).passthrough();
+
+const betaGroupListResponseSchema = z.object({
+  data: z.array(betaGroupResourceSchema),
+  links: paginationLinksSchema.optional(),
+}).passthrough();
+
+const betaGroupResponseSchema = z.object({
+  data: betaGroupResourceSchema,
+}).passthrough();
+
+const bundleIdResourceSchema = z.object({
+  id: z.string().min(1),
+  attributes: z.object({
+    identifier: z.string().min(1),
+    name: z.string().min(1),
+    platform: z.string().min(1),
+  }).passthrough(),
+}).passthrough();
+
+const bundleIdListResponseSchema = z.object({
+  data: z.array(bundleIdResourceSchema),
+  links: paginationLinksSchema.optional(),
+}).passthrough();
+
+const reviewSubmissionResourceSchema = z.object({
+  id: z.string().min(1),
+  attributes: z.object({
+    state: z.string().min(1),
+    platform: z.string().min(1),
+  }).passthrough(),
+}).passthrough();
+
+const reviewSubmissionListResponseSchema = z.object({
+  data: z.array(reviewSubmissionResourceSchema),
+  links: paginationLinksSchema.optional(),
+}).passthrough();
+
+const reviewSubmissionResponseSchema = z.object({
+  data: reviewSubmissionResourceSchema,
+}).passthrough();
+
+function malformedResponse(context: string): Error {
+  return new Error(
+    `App Store Connect returned a malformed ${context} response; provider state is unknown.`
+  );
+}
+
+function requireUniqueResourceIds<T extends { id: string }>(resources: T[], context: string): T[] {
+  const seen = new Set<string>();
+  for (const resource of resources) {
+    if (seen.has(resource.id)) {
+      throw new Error(
+        `App Store Connect returned duplicate ${context} identity ${resource.id}; provider state is unknown.`
+      );
+    }
+    seen.add(resource.id);
+  }
+  return resources;
+}
+
+function mapBetaGroup(resource: z.infer<typeof betaGroupResourceSchema>): AppStoreBetaGroup {
+  return {
+    id: resource.id,
+    name: resource.attributes.name,
+    isInternal: resource.attributes.isInternalGroup,
+    hasAccessToAllBuilds: resource.attributes.hasAccessToAllBuilds ?? undefined,
+    publicLinkEnabled: resource.attributes.publicLinkEnabled ?? undefined,
+    publicLink: resource.attributes.publicLink ?? undefined,
+    publicLinkLimit: resource.attributes.publicLinkLimit ?? undefined,
+    feedbackEnabled: resource.attributes.feedbackEnabled ?? undefined,
+  };
+}
+
+function mapBundleId(resource: z.infer<typeof bundleIdResourceSchema>): {
+  id: string;
+  identifier: string;
+  name: string;
+  platform: string;
+} {
+  return {
+    id: resource.id,
+    identifier: resource.attributes.identifier,
+    name: resource.attributes.name,
+    platform: resource.attributes.platform,
+  };
+}
+
+function mapReviewSubmission(resource: z.infer<typeof reviewSubmissionResourceSchema>): ReviewSubmission {
+  return {
+    id: resource.id,
+    state: resource.attributes.state,
+    platform: resource.attributes.platform,
+  };
+}
 
 export class AppStoreConnectAdapter {
   private credentials: AppStoreConnectCredentials | null = null;
@@ -177,6 +290,74 @@ export class AppStoreConnectAdapter {
   }
 
   /**
+   * Fetch every page before treating a missing resource as absent. App Store
+   * Connect returns absolute next links; only follow links back to its v1 API
+   * and fail if the provider repeats a page or returns an unbounded sequence.
+   */
+  private async collectPages<T>(
+    initialPath: string,
+    context: string,
+    parsePage: (response: unknown) => { data: T[]; next?: string | null },
+  ): Promise<T[]> {
+    const results: T[] = [];
+    const seen = new Set<string>();
+    const expectedPathname = new URL(this.canonicalPageUrl(initialPath, context)).pathname;
+    let path: string | null = initialPath;
+
+    while (path) {
+      const canonical = this.canonicalPageUrl(path, context);
+      if (new URL(canonical).pathname !== expectedPathname) {
+        throw new Error(
+          `App Store Connect ${context} pagination changed collection identity; provider state is unknown.`
+        );
+      }
+      if (seen.has(canonical)) {
+        throw new Error(
+          `App Store Connect ${context} pagination repeated a page; provider state is unknown.`
+        );
+      }
+      if (seen.size >= MAX_APP_STORE_CONNECT_PAGES) {
+        throw new Error(
+          `App Store Connect ${context} pagination exceeded ${MAX_APP_STORE_CONNECT_PAGES} pages; provider state is unknown.`
+        );
+      }
+      seen.add(canonical);
+
+      const page = parsePage(await this.apiRequest<unknown>('GET', path));
+      results.push(...page.data);
+      path = page.next ?? null;
+    }
+
+    return results;
+  }
+
+  private canonicalPageUrl(path: string, context: string): string {
+    let url: URL;
+    try {
+      url = path.startsWith('http://') || path.startsWith('https://')
+        ? new URL(path)
+        : new URL(`${APP_STORE_CONNECT_API}${path.startsWith('/') ? path : `/${path}`}`);
+    } catch {
+      throw malformedResponse(`${context} pagination link`);
+    }
+
+    const api = new URL(APP_STORE_CONNECT_API);
+    if (
+      url.origin !== api.origin
+      || (url.pathname !== api.pathname && !url.pathname.startsWith(`${api.pathname}/`))
+      || url.username
+      || url.password
+      || url.hash
+    ) {
+      throw new Error(
+        `App Store Connect returned an unsafe ${context} pagination link; provider state is unknown.`
+      );
+    }
+    url.searchParams.sort();
+    return url.toString();
+  }
+
+  /**
    * Verify the API key works by listing bundle IDs.
    */
   async verify(): Promise<{ success: boolean; error?: string }> {
@@ -199,26 +380,21 @@ export class AppStoreConnectAdapter {
   // Builds
   // ---------------------------------------------------------------------------
 
-  /**
-   * List recent builds, optionally filtered by app ID or bundle ID.
-   */
+  /** List recent builds, optionally filtered by App Store Connect app ID. */
   async listBuilds(options?: {
     appId?: string;
-    bundleId?: string;
     limit?: number;
   }): Promise<AppStoreConnectBuild[]> {
+    const limit = options?.limit ?? 10;
     const params = new URLSearchParams();
     params.set('sort', '-uploadedDate');
-    params.set('limit', String(options?.limit ?? 10));
+    params.set('limit', String(limit));
     params.set('fields[builds]', 'version,uploadedDate,processingState,usesNonExemptEncryption,buildAudienceType');
     params.set('fields[preReleaseVersions]', 'version');
     params.set('include', 'preReleaseVersion,app');
 
     if (options?.appId) {
       params.set('filter[app]', options.appId);
-    }
-    if (options?.bundleId) {
-      params.set('filter[app]', options.bundleId);
     }
 
     const result = await this.apiRequest<{
@@ -248,7 +424,7 @@ export class AppStoreConnectAdapter {
         .map(i => [i.id, i.attributes.version ?? ''])
     );
 
-    return result.data.map(build => ({
+    return result.data.slice(0, limit).map(build => ({
       id: build.id,
       version: preReleaseVersions.get(build.relationships?.preReleaseVersion?.data?.id ?? '') ?? '',
       buildNumber: build.attributes.version,
@@ -263,36 +439,32 @@ export class AppStoreConnectAdapter {
    * List beta groups for an app.
    */
   async listBetaGroups(appId: string): Promise<AppStoreBetaGroup[]> {
-    const result = await this.apiRequest<{
-      data: Array<{
-        id: string;
-        attributes: {
-          name: string;
-          isInternalGroup: boolean;
-          hasAccessToAllBuilds?: boolean;
-          publicLinkEnabled?: boolean;
-          publicLink?: string;
-          publicLinkLimit?: number;
-          feedbackEnabled?: boolean;
-        };
-      }>;
-    }>('GET', `/apps/${appId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,hasAccessToAllBuilds,publicLinkEnabled,publicLink,publicLinkLimit,feedbackEnabled`);
-
-    return result.data.map(g => ({
-      id: g.id,
-      name: g.attributes.name,
-      isInternal: g.attributes.isInternalGroup,
-      hasAccessToAllBuilds: g.attributes.hasAccessToAllBuilds,
-      publicLinkEnabled: g.attributes.publicLinkEnabled,
-      publicLink: g.attributes.publicLink,
-      publicLinkLimit: g.attributes.publicLinkLimit,
-      feedbackEnabled: g.attributes.feedbackEnabled,
-    }));
+    const params = new URLSearchParams({
+      limit: String(APP_STORE_CONNECT_PAGE_LIMIT),
+      'fields[betaGroups]': 'name,isInternalGroup,hasAccessToAllBuilds,publicLinkEnabled,publicLink,publicLinkLimit,feedbackEnabled',
+    });
+    const resources = await this.collectPages(
+      `/apps/${encodeURIComponent(appId)}/betaGroups?${params.toString()}`,
+      'beta-group list',
+      (raw) => {
+        const parsed = betaGroupListResponseSchema.safeParse(raw);
+        if (!parsed.success) throw malformedResponse('beta-group list');
+        return { data: parsed.data.data, next: parsed.data.links?.next };
+      }
+    );
+    return requireUniqueResourceIds(resources, 'beta-group').map(mapBetaGroup);
   }
 
   async findBetaGroupByName(appId: string, name: string): Promise<AppStoreBetaGroup | null> {
     const groups = await this.listBetaGroups(appId);
-    return groups.find((group) => group.name.toLowerCase() === name.toLowerCase()) ?? null;
+    const normalized = name.toLowerCase();
+    const matches = groups.filter((group) => group.name.toLowerCase() === normalized);
+    if (matches.length > 1) {
+      throw new Error(
+        `Multiple TestFlight beta groups named "${name}" exist for app ${appId}; make the group name unique in App Store Connect before retrying.`
+      );
+    }
+    return matches[0] ?? null;
   }
 
   async createBetaGroup(input: {
@@ -317,20 +489,7 @@ export class AppStoreConnectAdapter {
       attributes.publicLinkLimit = input.publicLinkLimit;
     }
 
-    const response = await this.apiRequest<{
-      data: {
-        id: string;
-        attributes: {
-          name: string;
-          isInternalGroup: boolean;
-          hasAccessToAllBuilds?: boolean;
-          publicLinkEnabled?: boolean;
-          publicLink?: string;
-          publicLinkLimit?: number;
-          feedbackEnabled?: boolean;
-        };
-      };
-    }>('POST', '/betaGroups', {
+    const raw = await this.apiRequest<unknown>('POST', '/betaGroups', {
       data: {
         type: 'betaGroups',
         attributes,
@@ -341,17 +500,16 @@ export class AppStoreConnectAdapter {
         },
       },
     });
-
-    return {
-      id: response.data.id,
-      name: response.data.attributes.name,
-      isInternal: response.data.attributes.isInternalGroup,
-      hasAccessToAllBuilds: response.data.attributes.hasAccessToAllBuilds,
-      publicLinkEnabled: response.data.attributes.publicLinkEnabled,
-      publicLink: response.data.attributes.publicLink,
-      publicLinkLimit: response.data.attributes.publicLinkLimit,
-      feedbackEnabled: response.data.attributes.feedbackEnabled,
-    };
+    const response = betaGroupResponseSchema.safeParse(raw);
+    if (!response.success) throw malformedResponse('beta-group creation');
+    const group = mapBetaGroup(response.data.data);
+    const expectedInternal = input.isInternal ?? false;
+    if (group.name !== input.name || group.isInternal !== expectedInternal) {
+      throw new Error(
+        `App Store Connect acknowledged beta-group creation as ${group.id}, but returned a different name or group type; creation outcome is unknown.`
+      );
+    }
+    return group;
   }
 
   async updateBetaGroup(groupId: string, attrs: {
@@ -425,8 +583,9 @@ export class AppStoreConnectAdapter {
     groupId?: string;
     limit?: number;
   }): Promise<AppStoreBetaTester[]> {
+    const limit = options?.limit ?? 200;
     const params = new URLSearchParams();
-    params.set('limit', String(options?.limit ?? 200));
+    params.set('limit', String(limit));
     params.set('fields[betaTesters]', 'firstName,lastName,email,inviteType,state');
     if (options?.email && !options?.groupId) {
       params.set('filter[email]', options.email);
@@ -460,9 +619,10 @@ export class AppStoreConnectAdapter {
       state: tester.attributes.state,
     }));
 
-    return options?.email && options.groupId
+    const selected = options?.email && options.groupId
       ? testers.filter((tester) => tester.email?.toLowerCase() === options.email!.toLowerCase())
       : testers;
+    return selected.slice(0, limit);
   }
 
   async findBetaTesterByEmail(email: string): Promise<AppStoreBetaTester | null> {
@@ -551,42 +711,42 @@ export class AppStoreConnectAdapter {
   /**
    * List all registered Bundle IDs (App IDs).
    */
-  async listBundleIds(): Promise<Array<{ id: string; identifier: string; name: string; platform: string }>> {
-    const results: Array<{ id: string; identifier: string; name: string; platform: string }> = [];
-    type BundleIdListResponse = {
-      data: Array<{
-        id: string;
-        attributes: { identifier: string; name: string; platform: string };
-      }>;
-      links?: { next?: string };
-    };
+  async listBundleIds(options?: { identifier?: string }): Promise<Array<{
+    id: string;
+    identifier: string;
+    name: string;
+    platform: string;
+  }>> {
+    const params = new URLSearchParams({
+      limit: String(APP_STORE_CONNECT_PAGE_LIMIT),
+      'fields[bundleIds]': 'identifier,name,platform',
+    });
+    if (options?.identifier) params.set('filter[identifier]', options.identifier);
 
-    let url: string | null = '/bundleIds?limit=200&fields[bundleIds]=identifier,name,platform';
-
-    while (url) {
-      const response: BundleIdListResponse = await this.apiRequest<BundleIdListResponse>('GET', url);
-
-      for (const item of response.data) {
-        results.push({
-          id: item.id,
-          identifier: item.attributes.identifier,
-          name: item.attributes.name,
-          platform: item.attributes.platform,
-        });
+    const resources = await this.collectPages(
+      `/bundleIds?${params.toString()}`,
+      'bundle-id list',
+      (raw) => {
+        const parsed = bundleIdListResponseSchema.safeParse(raw);
+        if (!parsed.success) throw malformedResponse('bundle-id list');
+        return { data: parsed.data.data, next: parsed.data.links?.next };
       }
-
-      url = response.links?.next ?? null;
-    }
-
-    return results;
+    );
+    return requireUniqueResourceIds(resources, 'bundle-id').map(mapBundleId);
   }
 
   /**
    * Find a Bundle ID by its identifier string (e.g., "com.example.app").
    */
   async findBundleIdByIdentifier(identifier: string): Promise<{ id: string; identifier: string; name: string; platform: string } | null> {
-    const all = await this.listBundleIds();
-    return all.find(b => b.identifier === identifier) ?? null;
+    const matches = (await this.listBundleIds({ identifier }))
+      .filter((bundleId) => bundleId.identifier === identifier);
+    if (matches.length > 1) {
+      throw new Error(
+        `Multiple App Store Connect Bundle ID resources use identifier "${identifier}"; make the identifier unique before retrying.`
+      );
+    }
+    return matches[0] ?? null;
   }
 
   /**
@@ -674,13 +834,6 @@ export class AppStoreConnectAdapter {
     return { enabled, alreadyEnabled, errors };
   }
 
-  /**
-   * Disable (remove) a capability by its capability ID.
-   */
-  async disableCapability(capabilityId: string): Promise<void> {
-    await this.apiRequest('DELETE', `/bundleIdCapabilities/${capabilityId}`);
-  }
-
   // ---------------------------------------------------------------------------
   // Apps
   // ---------------------------------------------------------------------------
@@ -722,8 +875,9 @@ export class AppStoreConnectAdapter {
     appId: string,
     options?: { platform?: 'IOS' | 'MAC_OS' | 'TV_OS'; limit?: number }
   ): Promise<AppStoreVersion[]> {
+    const limit = options?.limit ?? 10;
     const params = new URLSearchParams();
-    params.set('limit', String(options?.limit ?? 10));
+    params.set('limit', String(limit));
     params.set('fields[appStoreVersions]', 'versionString,appStoreState,platform');
     if (options?.platform) {
       params.set('filter[platform]', options.platform);
@@ -740,7 +894,7 @@ export class AppStoreConnectAdapter {
       }>;
     }>('GET', `/apps/${appId}/appStoreVersions?${params.toString()}`);
 
-    return result.data.map(v => ({
+    return result.data.slice(0, limit).map(v => ({
       id: v.id,
       versionString: v.attributes.versionString,
       appStoreState: v.attributes.appStoreState,
@@ -778,7 +932,7 @@ export class AppStoreConnectAdapter {
     options?: { platform?: string; states?: string[] }
   ): Promise<ReviewSubmission[]> {
     const params = new URLSearchParams();
-    params.set('filter[app]', appId);
+    params.set('limit', String(APP_STORE_CONNECT_PAGE_LIMIT));
     params.set('fields[reviewSubmissions]', 'state,platform');
     if (options?.platform) {
       params.set('filter[platform]', options.platform);
@@ -787,24 +941,28 @@ export class AppStoreConnectAdapter {
       params.set('filter[state]', options.states.join(','));
     }
 
-    const result = await this.apiRequest<{
-      data: Array<{ id: string; attributes: { state: string; platform: string } }>;
-    }>('GET', `/reviewSubmissions?${params.toString()}`);
-
-    return result.data.map(s => ({
-      id: s.id,
-      state: s.attributes.state,
-      platform: s.attributes.platform,
-    }));
+    const resources = await this.collectPages(
+      `/apps/${encodeURIComponent(appId)}/reviewSubmissions?${params.toString()}`,
+      'review-submission list',
+      (raw) => {
+        const parsed = reviewSubmissionListResponseSchema.safeParse(raw);
+        if (!parsed.success) throw malformedResponse('review-submission list');
+        return { data: parsed.data.data, next: parsed.data.links?.next };
+      }
+    );
+    return requireUniqueResourceIds(resources, 'review-submission')
+      .map(mapReviewSubmission)
+      .filter((submission) => (
+        (!options?.platform || submission.platform === options.platform)
+        && (!options?.states?.length || options.states.includes(submission.state))
+      ));
   }
 
   /**
    * Create a review submission for an app on a platform.
    */
   async createReviewSubmission(appId: string, platform: string): Promise<ReviewSubmission> {
-    const result = await this.apiRequest<{
-      data: { id: string; attributes: { state: string; platform: string } };
-    }>('POST', '/reviewSubmissions', {
+    const raw = await this.apiRequest<unknown>('POST', '/reviewSubmissions', {
       data: {
         type: 'reviewSubmissions',
         attributes: { platform },
@@ -815,12 +973,15 @@ export class AppStoreConnectAdapter {
         },
       },
     });
-
-    return {
-      id: result.data.id,
-      state: result.data.attributes.state,
-      platform: result.data.attributes.platform,
-    };
+    const result = reviewSubmissionResponseSchema.safeParse(raw);
+    if (!result.success) throw malformedResponse('review-submission creation');
+    const submission = mapReviewSubmission(result.data.data);
+    if (submission.platform !== platform || submission.state !== 'READY_FOR_REVIEW') {
+      throw new Error(
+        `App Store Connect acknowledged review-submission creation as ${submission.id}, but returned platform/state ${submission.platform}/${submission.state} instead of ${platform}/READY_FOR_REVIEW; creation outcome is unknown.`
+      );
+    }
+    return submission;
   }
 
   /**
@@ -875,10 +1036,13 @@ export class AppStoreConnectAdapter {
     appStoreVersionId: string;
     platform: string;
   }): Promise<{ reviewSubmission: ReviewSubmission; reusedExistingSubmission: boolean }> {
-    const open = await this.listReviewSubmissions(input.appId, {
+    // Observe every state for the platform before creating. Filtering to the
+    // familiar open states can hide a newly introduced or transitional state
+    // and incorrectly make it appear safe to create another submission.
+    const observed = await this.listReviewSubmissions(input.appId, {
       platform: input.platform,
-      states: ['READY_FOR_REVIEW', 'WAITING_FOR_REVIEW', 'IN_REVIEW', 'UNRESOLVED_ISSUES'],
     });
+    const open = observed.filter((submission) => submission.state !== 'COMPLETE');
 
     const inFlight = open.find(s => s.state !== 'READY_FOR_REVIEW');
     if (inFlight) {
@@ -887,7 +1051,14 @@ export class AppStoreConnectAdapter {
       );
     }
 
-    let submission = open.find(s => s.state === 'READY_FOR_REVIEW') ?? null;
+    const ready = open.filter((submission) => submission.state === 'READY_FOR_REVIEW');
+    if (ready.length > 1) {
+      throw new Error(
+        `Multiple READY_FOR_REVIEW submissions exist for ${input.platform}; resolve the duplicate submissions in App Store Connect before retrying.`
+      );
+    }
+
+    let submission = ready[0] ?? null;
     const reusedExistingSubmission = submission !== null;
     if (!submission) {
       submission = await this.createReviewSubmission(input.appId, input.platform);
@@ -910,25 +1081,21 @@ export class AppStoreConnectAdapter {
    * Get the build attached to an App Store version.
    */
   async getAppStoreVersionBuild(appStoreVersionId: string): Promise<{ id: string; version: string } | null> {
-    try {
-      const result = await this.apiRequest<{
-        data: {
-          id: string;
-          attributes: { version: string };
-        } | null;
-      }>('GET', `/appStoreVersions/${appStoreVersionId}/build?fields[builds]=version`);
+    const result = await this.apiRequest<{
+      data: {
+        id: string;
+        attributes: { version: string };
+      } | null;
+    }>('GET', `/appStoreVersions/${appStoreVersionId}/build?fields[builds]=version`);
 
-      if (!result.data) {
-        return null;
-      }
-
-      return {
-        id: result.data.id,
-        version: result.data.attributes.version,
-      };
-    } catch {
+    if (!result.data) {
       return null;
     }
+
+    return {
+      id: result.data.id,
+      version: result.data.attributes.version,
+    };
   }
 
   /**

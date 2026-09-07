@@ -18,7 +18,7 @@ import { RailwayAdapter } from '../../adapters/providers/railway/railway.adapter
 import { CloudSqlAdapter } from '../../adapters/providers/gcp/cloudsql.adapter.js';
 import { RdsAdapter } from '../../adapters/providers/aws/rds.adapter.js';
 import { DatabaseAdapter } from '../../adapters/providers/database/database.adapter.js';
-import { createToolContext } from '../context.js';
+import { createToolContext } from '../../application/context.js';
 import { registerHvDbTools } from '../hv-db.tools.js';
 import { databaseAccessLeaseCoordinator } from '../../domain/services/database-access.service.js';
 

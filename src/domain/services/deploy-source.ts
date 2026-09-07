@@ -4,7 +4,7 @@ import { getProjectScopeHints } from './project-scope.js';
 import { parseGitHubRepoFromRemote, normalizeGitRemoteForBuild } from '../../lib/git-remote.js';
 import type { Project } from '../entities/project.entity.js';
 import type { BuildConfig, WorkloadKind } from '../entities/service.entity.js';
-import type { GitHubCredentials } from '../../adapters/providers/github/github.adapter.js';
+import { isDeploySourceCredentialAdapter } from '../ports/deploy-source.port.js';
 import type { DesiredState } from './spec.service.js';
 
 const connectionRepo = new ConnectionRepository();
@@ -35,10 +35,10 @@ export function resolveGitDeploySource(
   }
 
   const kind = classifyDeployEnvironment(environmentName);
-  if (!kind) {
+  if (!deploy.branch && deploy.branches && !kind) {
     return {
       source: null,
-      error: `Branch deploy strategy only supports staging/production environments; could not map "${environmentName}" to a deploy branch.`,
+      error: `Legacy staging/production branch mapping cannot select a branch for environment "${environmentName}". Set deploy.branch explicitly.`,
     };
   }
 
@@ -50,9 +50,10 @@ export function resolveGitDeploySource(
     };
   }
 
-  const branch = kind === 'production'
-    ? deploy?.branches?.production ?? 'main'
-    : deploy?.branches?.staging ?? 'main';
+  const branch = deploy.branch
+    ?? (kind === 'production' ? deploy.branches?.production : undefined)
+    ?? (kind === 'staging' ? deploy.branches?.staging : undefined)
+    ?? 'main';
 
   return {
     source: {
@@ -62,7 +63,11 @@ export function resolveGitDeploySource(
   };
 }
 
-export function buildDeploySourceEnvVars(project: Project, adapterName: string): Record<string, string> {
+export function buildDeploySourceEnvVars(
+  project: Project,
+  adapter: unknown,
+  sourceRevision = 'main'
+): Record<string, string> {
   const sourceRepoUrl = normalizeGitRemoteForBuild(project.gitRemoteUrl);
   if (!sourceRepoUrl) {
     return {};
@@ -70,17 +75,24 @@ export function buildDeploySourceEnvVars(project: Project, adapterName: string):
 
   const sourceEnvVars: Record<string, string> = {
     HYPERVIBE_SOURCE_REPO_URL: sourceRepoUrl,
-    HYPERVIBE_SOURCE_REVISION: 'main',
+    HYPERVIBE_SOURCE_REVISION: sourceRevision,
   };
 
-  if (adapterName === 'cloudrun') {
-    const githubConnection = connectionRepo.findBestMatchFromHints('github', getProjectScopeHints(project));
-    if (githubConnection) {
-      const githubCredentials = getSecretStore().decryptObject<GitHubCredentials>(githubConnection.credentialsEncrypted);
-      if (githubCredentials.apiToken) {
-        sourceEnvVars.HYPERVIBE_GITHUB_TOKEN = githubCredentials.apiToken;
-      }
-    }
+  if (!isDeploySourceCredentialAdapter(adapter)) {
+    return sourceEnvVars;
+  }
+
+  const projection = adapter.deploySourceCredentialProjection;
+  const connection = connectionRepo.findBestMatchFromHints(
+    projection.connectionProvider,
+    getProjectScopeHints(project)
+  );
+  if (connection) {
+    const credentials = getSecretStore().decryptObject(connection.credentialsEncrypted);
+    Object.assign(sourceEnvVars, projection.projectEnvironmentVariables({
+      credentials,
+      sourceRepoUrl,
+    }));
   }
 
   return sourceEnvVars;

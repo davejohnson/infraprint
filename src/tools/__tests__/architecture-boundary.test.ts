@@ -8,26 +8,28 @@ const genericOrchestrationFiles: Array<[string, URL]> = [
   ['src/tools/hv-ci.tools.ts', new URL('../hv-ci.tools.ts', import.meta.url)],
 ];
 
-const registeredCommandModules = [
-  'connections',
-  'core',
-  'hv-appstore',
-  'hv-ci',
-  'hv-db',
-  'hv-deploy',
-  'hv-devx',
-  'hv-observability',
-  'hv-secrets',
-  'lifecycle',
-].map((name) => [
-  `src/tools/${name}.tools.ts`,
-  new URL(`../${name}.tools.ts`, import.meta.url),
-] as const);
+const commandRegistrySource = readFileSync(
+  new URL('../../application/commands.ts', import.meta.url),
+  'utf8'
+);
+const registeredCommandModules = Array.from(
+  commandRegistrySource.matchAll(/from ['"]\.\.\/tools\/([^'"]+\.tools)\.js['"]/g),
+  (match) => [
+    `src/tools/${match[1]}.ts`,
+    new URL(`../${match[1]}.ts`, import.meta.url),
+  ] as const
+);
 
 const interfaceModules: Array<[string, URL]> = [
   ['src/interfaces/cli/parser.ts', new URL('../../interfaces/cli/parser.ts', import.meta.url)],
   ['src/interfaces/cli/run.ts', new URL('../../interfaces/cli/run.ts', import.meta.url)],
   ['src/interfaces/mcp/adapter.ts', new URL('../../interfaces/mcp/adapter.ts', import.meta.url)],
+];
+
+const providerNeutralHostingServices: Array<[string, URL]> = [
+  ['src/domain/services/hosting-env.service.ts', new URL('../../domain/services/hosting-env.service.ts', import.meta.url)],
+  ['src/domain/services/deploy-source.ts', new URL('../../domain/services/deploy-source.ts', import.meta.url)],
+  ['src/domain/services/bootstrap.service.ts', new URL('../../domain/services/bootstrap.service.ts', import.meta.url)],
 ];
 
 const providerApiMarkers = [
@@ -60,10 +62,19 @@ describe('provider boundary architecture', () => {
   });
 
   it('keeps command declarations transport-neutral', () => {
+    expect(registeredCommandModules.length).toBeGreaterThan(0);
     for (const [label, url] of registeredCommandModules) {
       const source = readFileSync(url, 'utf8');
       expect(source, `${label} must not import MCP`).not.toContain('@modelcontextprotocol');
       expect(source, `${label} must register commands, not MCP-shaped tools`).not.toContain('server.tool(');
+    }
+  });
+
+  it('keeps provider implementations behind the registered command boundary', () => {
+    for (const [label, url] of registeredCommandModules) {
+      const source = readFileSync(url, 'utf8');
+      expect(source, `${label} must route provider behavior through ports, registries, or services`)
+        .not.toContain('/adapters/providers/');
     }
   });
 
@@ -102,6 +113,20 @@ describe('provider boundary architecture', () => {
     const source = readFileSync(new URL('../../domain/plan/diff.engine.ts', import.meta.url), 'utf8');
     for (const branchPattern of hostingProviderBranches) {
       expect(source, `diff.engine.ts should use providerBehavior metadata instead of ${branchPattern}`).not.toMatch(branchPattern);
+    }
+  });
+
+  it('keeps hosting env and source orchestration behind provider-neutral ports', () => {
+    const literalProviderBranch = /\b(?:provider|adapterName)\s*(?:===|!==|==|!=)\s*['"][^'"]+['"]/;
+    const literalAdapterNameBranch = /\bhostingAdapter\.name\s*(?:===|!==|==|!=)\s*['"][^'"]+['"]/;
+    for (const [label, url] of providerNeutralHostingServices) {
+      const source = readFileSync(url, 'utf8');
+      expect(source, `${label} must not import a concrete provider adapter`)
+        .not.toContain('/adapters/providers/');
+      expect(source, `${label} must not select behavior by provider id`)
+        .not.toMatch(literalProviderBranch);
+      expect(source, `${label} must not select behavior by adapter name`)
+        .not.toMatch(literalAdapterNameBranch);
     }
   });
 });

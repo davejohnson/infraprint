@@ -304,6 +304,25 @@ export class S3StorageAdapter implements IStorageAdapter {
         if (tags[ENVIRONMENT_TAG] !== environment.id || tags[STORAGE_NAME_TAG] !== name) {
           throw new Error(`S3 bucket ${bucket} exists but is not owned by this Hypervibe storage binding.`);
         }
+        try {
+          await this.configurePrivateBucket(bucket, environment, context, name, false);
+        } catch (error) {
+          return {
+            receipt: {
+              success: false,
+              message: `Failed to repair AWS S3 bucket "${bucket}" configuration`,
+              error: errorMessage(error),
+              data: {
+                externalId: bucket,
+                created: false,
+                configuration: 'unknown',
+                recoveryRequired: true,
+              },
+            },
+            externalId: bucket,
+            context,
+          };
+        }
         return {
           receipt: { success: true, message: `Using existing AWS S3 bucket "${bucket}"`, data: { created: false } },
           externalId: bucket,
@@ -319,36 +338,73 @@ export class S3StorageAdapter implements IStorageAdapter {
           : { CreateBucketConfiguration: { LocationConstraint: region as BucketLocationConstraint } }),
       }));
       try {
-        await this.s3Client().send(new PutBucketTaggingCommand({
-          Bucket: bucket,
-          Tagging: { TagSet: [
-            { Key: ENVIRONMENT_TAG, Value: environment.id },
-            { Key: STORAGE_NAME_TAG, Value: name },
-            { Key: PROJECT_TAG, Value: context.projectName ?? environment.projectId },
-          ] },
-        }));
-        await this.s3Client().send(new PutPublicAccessBlockCommand({
-          Bucket: bucket,
-          PublicAccessBlockConfiguration: {
-            BlockPublicAcls: true,
-            IgnorePublicAcls: true,
-            BlockPublicPolicy: true,
-            RestrictPublicBuckets: true,
-          },
-        }));
-        await this.s3Client().send(new PutBucketEncryptionCommand({
-          Bucket: bucket,
-          ServerSideEncryptionConfiguration: {
-            Rules: [{ ApplyServerSideEncryptionByDefault: { SSEAlgorithm: 'AES256' } }],
-          },
-        }));
-      } catch (error) {
+        await this.configurePrivateBucket(bucket, environment, context, name);
+      } catch (configurationError) {
         try {
-          await this.s3Client().send(new DeleteBucketCommand({ Bucket: bucket }));
-        } catch {
-          // The exact deterministic bucket remains visible for operator cleanup.
+          await this.s3Client().send(new DeleteBucketCommand({
+            Bucket: bucket,
+            ExpectedBucketOwner: context.accountId,
+          }));
+        } catch (rollbackError) {
+          return {
+            receipt: {
+              success: false,
+              message: `Failed to configure newly created AWS S3 bucket "${bucket}" and rollback failed`,
+              error: `${errorMessage(configurationError)}; rollback failed: ${errorMessage(rollbackError)}`,
+              data: {
+                externalId: bucket,
+                created: true,
+                rollback: 'failed',
+                recoveryRequired: true,
+              },
+            },
+            externalId: bucket,
+            context,
+          };
         }
-        throw error;
+        try {
+          if (await this.bucketExists(bucket, context.accountId)) {
+            return {
+              receipt: {
+                success: false,
+                message: `Failed to configure newly created AWS S3 bucket "${bucket}"; rollback is not yet confirmed`,
+                error: `${errorMessage(configurationError)}; the exact bucket still exists after rollback acknowledgement`,
+                data: {
+                  externalId: bucket,
+                  created: true,
+                  rollback: 'pending',
+                  recoveryRequired: true,
+                },
+              },
+              externalId: bucket,
+              context,
+            };
+          }
+        } catch (rollbackObservationError) {
+          return {
+            receipt: {
+              success: false,
+              message: `Failed to configure newly created AWS S3 bucket "${bucket}"; rollback state is unknown`,
+              error: `${errorMessage(configurationError)}; rollback observation failed: ${errorMessage(rollbackObservationError)}`,
+              data: {
+                externalId: bucket,
+                created: true,
+                rollback: 'unknown',
+                recoveryRequired: true,
+              },
+            },
+            externalId: bucket,
+            context,
+          };
+        }
+        return {
+          receipt: {
+            success: false,
+            message: `Failed to configure newly created AWS S3 bucket "${bucket}"; rollback was confirmed`,
+            error: errorMessage(configurationError),
+            data: { created: true, rollback: 'confirmed', recoveryRequired: false },
+          },
+        };
       }
       return {
         receipt: { success: true, message: `Created private AWS S3 bucket "${bucket}"`, data: { created: true } },
@@ -479,6 +535,40 @@ export class S3StorageAdapter implements IStorageAdapter {
     }
   }
 
+  private async configurePrivateBucket(
+    bucket: string,
+    environment: Environment,
+    context: StorageContext,
+    name: string,
+    writeOwnershipTags = true
+  ): Promise<void> {
+    if (writeOwnershipTags) {
+      await this.s3Client().send(new PutBucketTaggingCommand({
+        Bucket: bucket,
+        Tagging: { TagSet: [
+          { Key: ENVIRONMENT_TAG, Value: environment.id },
+          { Key: STORAGE_NAME_TAG, Value: name },
+          { Key: PROJECT_TAG, Value: context.projectName ?? environment.projectId },
+        ] },
+      }));
+    }
+    await this.s3Client().send(new PutPublicAccessBlockCommand({
+      Bucket: bucket,
+      PublicAccessBlockConfiguration: {
+        BlockPublicAcls: true,
+        IgnorePublicAcls: true,
+        BlockPublicPolicy: true,
+        RestrictPublicBuckets: true,
+      },
+    }));
+    await this.s3Client().send(new PutBucketEncryptionCommand({
+      Bucket: bucket,
+      ServerSideEncryptionConfiguration: {
+        Rules: [{ ApplyServerSideEncryptionByDefault: { SSEAlgorithm: 'AES256' } }],
+      },
+    }));
+  }
+
   private async usage(bucket: string): Promise<{ objectCount: number; sizeBytes: number }> {
     let continuationToken: string | undefined;
     let objectCount = 0;
@@ -539,10 +629,15 @@ providerRegistry.register({
       ],
     },
     connectionAliases: ['ecs'],
+    maturity: {
+      lifecycle: {
+        storage: { status: 'ready-for-live' },
+      },
+    },
   },
-  factory: (credentials) => {
+  factory: async (credentials) => {
     const adapter = new S3StorageAdapter();
-    void adapter.connect(credentials);
+    await adapter.connect(credentials);
     return adapter;
   },
   inspection: {

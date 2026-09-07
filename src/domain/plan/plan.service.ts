@@ -1,4 +1,3 @@
-import { ProjectRepository } from '../../adapters/db/repositories/project.repository.js';
 import { EnvironmentRepository } from '../../adapters/db/repositories/environment.repository.js';
 import { ServiceRepository } from '../../adapters/db/repositories/service.repository.js';
 import { ComponentRepository } from '../../adapters/db/repositories/component.repository.js';
@@ -6,6 +5,7 @@ import { ConnectionRepository } from '../../adapters/db/repositories/connection.
 import { RunRepository } from '../../adapters/db/repositories/run.repository.js';
 import { adapterFactory } from '../services/adapter.factory.js';
 import { providerRegistry } from '../registry/provider.registry.js';
+import { firstProviderSpecValidationFailure } from '../services/provider-spec-validation.js';
 import { SpecStore, type SpecResult } from '../spec/spec.store.js';
 import {
   EMAIL_MANAGED_ENV_KEYS,
@@ -25,7 +25,7 @@ import {
   parseGitHubRepoFromRemote,
 } from '../../lib/git-remote.js';
 import { getSecretStore } from '../../adapters/secrets/secret-store.js';
-import { classifyDeployEnvironment, resolveGitDeploySource } from '../services/deploy-source.js';
+import { resolveGitDeploySource } from '../services/deploy-source.js';
 import { diffEnvironment, diffRetainedHostingCleanup } from './diff.engine.js';
 import type { DiffResult, LocalSnapshot, PlanAction } from './plan.types.js';
 import {
@@ -38,7 +38,7 @@ import {
   DATABASE_ENV_KEYS,
 } from '../services/database-env.js';
 import { buildCacheEnvVarsFromComponent, CACHE_ENV_KEYS } from '../services/cache-env.js';
-import { planCache } from '../services/cache-plan.service.js';
+import { CACHE_OPERATIONS, planCache } from '../services/cache-plan.service.js';
 import { planDatabaseResilience, DATABASE_RESILIENCE_OPERATIONS } from '../services/database-resilience-plan.service.js';
 import {
   addDomainRegistrationDependency,
@@ -61,6 +61,7 @@ import { planIos } from '../services/appstore-plan.service.js';
 import { planQueues } from '../services/queue-plan.service.js';
 import { queueEnvVarSuffix, resolveQueueEnvVars } from '../services/queue-env.js';
 import {
+  parseStorageBindings,
   parseStorageProviderContexts,
   planStorage,
   storageEnvKeys,
@@ -169,13 +170,40 @@ function hasProviderResourceBindings(bindings: Record<string, unknown> | undefin
   });
 }
 
+function nonEmptyStringRecord(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value);
+  if (
+    entries.length === 0
+    || entries.some(([, item]) => typeof item !== 'string' || item.length === 0)
+  ) {
+    return undefined;
+  }
+  return Object.fromEntries(entries) as Record<string, string>;
+}
+
+function scopedStorageIdentityKey(value: {
+  provider: string;
+  externalId: string;
+  instanceScope?: Record<string, string>;
+}): string {
+  return JSON.stringify([
+    value.provider,
+    value.externalId,
+    Object.entries(value.instanceScope ?? {}).sort(([left], [right]) => left.localeCompare(right)),
+  ]);
+}
+
+function storageContextKey(value: Record<string, string>): string {
+  return JSON.stringify(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)));
+}
+
 /**
  * Builds an environment plan: load spec → observe live state (when the
  * provider supports it) → pure diff → persist as a 'plan' run whose id is
  * the handshake token for hv_apply.
  */
 export class PlanService {
-  private projectRepo = new ProjectRepository();
   private envRepo = new EnvironmentRepository();
   private serviceRepo = new ServiceRepository();
   private componentRepo = new ComponentRepository();
@@ -199,6 +227,11 @@ export class PlanService {
     }
 
     const provider = environmentSpec.hosting.provider;
+    const storageBindings = parseStorageBindings(environment);
+    const storageProviders = Array.from(new Set([
+      ...Object.values(environmentSpec.storage ?? {}).map((storage) => storage.provider),
+      ...Object.values(storageBindings).map((binding) => binding.provider),
+    ].filter((value): value is string => typeof value === 'string' && value.length > 0)));
     const unknownObservation = (message: string): { observed: ObservedState; warnings: string[] } => {
       const bindings = parseHostingBindings(environment);
       return {
@@ -219,6 +252,9 @@ export class PlanService {
             databases: 'unknown',
             caches: 'unknown',
             storage: 'unknown',
+            storageByProvider: Object.fromEntries(
+              storageProviders.map((storageProvider) => [storageProvider, 'unknown' as const])
+            ),
           },
           partial: true,
           warnings: [message],
@@ -249,6 +285,7 @@ export class PlanService {
 
     try {
       const observed = await adapter.observe(environment);
+      const reportedCompleteness = observed.completeness;
       const providerHasSeparateEnvironment = providerRegistry
         .getMetadata(provider)
         ?.orchestration
@@ -266,6 +303,12 @@ export class PlanService {
         databases: observed.completeness?.databases ?? 'complete',
         caches: observed.completeness?.caches ?? 'complete',
         storage: observed.completeness?.storage ?? 'complete',
+        storageByProvider: {
+          ...(reportedCompleteness?.storageByProvider ?? {}),
+          ...(storageProviders.includes(provider)
+            ? { [provider]: reportedCompleteness?.storage ?? 'complete' }
+            : {}),
+        },
       };
 
       if (options.hostingOnly) {
@@ -299,6 +342,10 @@ export class PlanService {
         const dbAdapter = dbResult.adapter;
         if (dbResult.success && dbAdapter) {
           try {
+            await dbAdapter.configureTarget?.({
+              projectName: project.name,
+              region: environmentSpec.hosting.region,
+            });
             const engine =
               environmentSpec.database?.engine
               ?? localDatabase?.type
@@ -353,8 +400,30 @@ export class PlanService {
         const cacheResult = await adapterFactory.getCacheAdapter(cacheProvider, project);
         if (cacheResult.success && cacheResult.adapter) {
           try {
+            const cacheBindings = localCache?.bindings as Record<string, unknown> | undefined;
+            const cacheScope = cacheBindings?.providerScope && typeof cacheBindings.providerScope === 'object'
+              && !Array.isArray(cacheBindings.providerScope)
+              ? cacheBindings.providerScope as Record<string, unknown>
+              : undefined;
+            const target = {
+              projectName: project.name,
+              region: environmentSpec.cache?.region
+                ?? (typeof cacheBindings?.region === 'string' ? cacheBindings.region : undefined)
+                ?? (typeof cacheScope?.region === 'string' ? cacheScope.region : undefined),
+              network: environmentSpec.cache?.network
+                ?? (typeof cacheBindings?.network === 'string' ? cacheBindings.network : undefined)
+                ?? (typeof cacheBindings?.authorizedNetwork === 'string' ? cacheBindings.authorizedNetwork : undefined),
+              subnetwork: environmentSpec.cache?.subnetwork
+                ?? (typeof cacheBindings?.subnetwork === 'string' ? cacheBindings.subnetwork : undefined),
+              tier: environmentSpec.cache?.tier
+                ?? (typeof cacheBindings?.tier === 'string' ? cacheBindings.tier : undefined),
+              size: environmentSpec.cache?.size
+                ?? (typeof cacheBindings?.size === 'string' ? cacheBindings.size : undefined),
+            };
+            await cacheResult.adapter.configureTarget?.(target);
             const cache = await cacheResult.adapter.observeCache(environment, localCache, {
               resourceName: `${project.name}-${environment.name}-redis`,
+              ...target,
             });
             observed.caches = [
               ...(observed.caches ?? []).filter((item) =>
@@ -376,46 +445,75 @@ export class PlanService {
         }
       }
 
-      const storageProviders = Array.from(new Set(Object.values(environmentSpec.storage ?? {}).map((storage) => storage.provider)));
       const contexts = parseStorageProviderContexts(environment);
       const hostingBindings = parseHostingBindings(environment);
       for (const storageProvider of storageProviders) {
+        const providerBindings = Object.values(storageBindings).filter(
+          (binding) => binding.provider === storageProvider
+        );
+        const bindingContexts = providerBindings.flatMap((binding) => {
+          const context = nonEmptyStringRecord(binding.instanceScope);
+          return context ? [context] : [];
+        });
+        const hostingContext = storageProvider === provider
+          && hostingBindings.projectId
+          && hostingBindings.environmentId
+          ? {
+              projectId: hostingBindings.projectId,
+              environmentId: hostingBindings.environmentId,
+            }
+          : undefined;
+        const hostingContextKey = hostingContext ? storageContextKey(hostingContext) : undefined;
+        const hostingObservationCoversBindings = bindingContexts.every(
+          (context) => storageContextKey(context) === hostingContextKey
+        );
         if (
           storageProvider === provider
-          && observed.completeness.storage === 'complete'
+          && observed.completeness.storageByProvider?.[storageProvider] === 'complete'
+          && hostingObservationCoversBindings
         ) {
           continue;
         }
-        let context = contexts[storageProvider]
-          ?? (storageProvider === provider
-            && hostingBindings.projectId
-            && hostingBindings.environmentId
-            ? {
-                projectId: hostingBindings.projectId,
-                environmentId: hostingBindings.environmentId,
-              }
-            : undefined);
-        if (!context && storageProvider === provider) {
-          observed.completeness.storage = 'unknown';
+        observed.completeness.storageByProvider![storageProvider] = 'unknown';
+        if (
+          storageProvider === provider
+          && providerBindings.length === 0
+          && !nonEmptyStringRecord(contexts[storageProvider])
+          && (
+            observed.completeness.environment !== 'complete'
+            || typeof observed.environmentId !== 'string'
+            || observed.environmentId.length === 0
+          )
+        ) {
           observed.partial = true;
-          observed.warnings.push(`Storage observation unavailable (${storageProvider}): provider environment context is missing`);
+          observed.warnings.push(
+            `Storage observation unavailable (${storageProvider}): the provider environment identity is not confirmed`
+          );
           continue;
         }
         const storageResult = await adapterFactory.getStorageAdapter(storageProvider, project);
         if (!storageResult.success || !storageResult.adapter) {
           observed.partial = true;
-          observed.completeness.storage = 'unknown';
           observed.warnings.push(`Storage observation failed (${storageProvider}): ${storageResult.error ?? 'adapter unavailable'}`);
           continue;
         }
-        if (!context) {
+        const candidateContexts = [
+          ...bindingContexts,
+          nonEmptyStringRecord(contexts[storageProvider]),
+          hostingContext,
+        ].filter((context): context is Record<string, string> => context !== undefined);
+        let observationContexts = Array.from(
+          new Map(candidateContexts.map((context) => [storageContextKey(context), context])).values()
+        );
+        if (observationContexts.length === 0) {
           const regions = [...new Set(Object.values(environmentSpec.storage ?? {})
             .filter((storage) => storage.provider === storageProvider)
             .map((storage) => storage.region))];
           if (regions.length !== 1 || !storageResult.adapter.resolveObservationContext) {
-            observed.completeness.storage = 'unknown';
             observed.partial = true;
-            observed.warnings.push(`Storage observation unavailable (${storageProvider}): provider context is missing and cannot be resolved read-only`);
+            observed.warnings.push(
+              `Storage observation unavailable (${storageProvider}): provider context is missing and cannot be resolved read-only${providerBindings.length > 0 ? '; the persisted binding cannot prove its provider scope' : ''}`
+            );
             continue;
           }
           const contextResult = await storageResult.adapter.resolveObservationContext(
@@ -424,22 +522,46 @@ export class PlanService {
             regions[0]
           );
           if (!contextResult.receipt.success || !contextResult.context) {
-            observed.completeness.storage = 'unknown';
             observed.partial = true;
             observed.warnings.push(`Storage observation unavailable (${storageProvider}): ${contextResult.receipt.error ?? contextResult.receipt.message}`);
             continue;
           }
-          context = contextResult.context;
+          observationContexts = [contextResult.context];
         }
-        try {
-          const items = await storageResult.adapter.observe(environment, context);
-          observed.storage = [...(observed.storage ?? []), ...items.filter((item) => !(observed.storage ?? []).some((existing) => existing.externalId === item.externalId))];
-        } catch (error) {
-          observed.partial = true;
-          observed.completeness.storage = 'unknown';
-          observed.warnings.push(`Storage observation failed (${storageProvider}): ${error instanceof Error ? error.message : String(error)}`);
+        let providerComplete = true;
+        for (const context of observationContexts) {
+          try {
+            const items = await storageResult.adapter.observe(environment, context);
+            if (items.some((item) => item.provider !== storageProvider)) {
+              throw new Error(`adapter returned an identity for a different provider`);
+            }
+            const knownIdentities = new Set(
+              (observed.storage ?? []).map((item) => scopedStorageIdentityKey(item))
+            );
+            const additions = items.filter((item) => {
+              const identity = scopedStorageIdentityKey(item);
+              if (knownIdentities.has(identity)) return false;
+              knownIdentities.add(identity);
+              return true;
+            });
+            observed.storage = [...(observed.storage ?? []), ...additions];
+          } catch (error) {
+            providerComplete = false;
+            observed.partial = true;
+            observed.warnings.push(`Storage observation failed (${storageProvider}): ${error instanceof Error ? error.message : String(error)}`);
+          }
         }
+        observed.completeness.storageByProvider![storageProvider] = providerComplete
+          ? 'complete'
+          : 'unknown';
       }
+      observed.completeness.storage = storageProviders.every(
+        (storageProvider) => observed.completeness?.storageByProvider?.[storageProvider] === 'complete'
+      )
+        ? 'complete'
+        : storageProviders.length > 0
+          ? 'unknown'
+          : observed.completeness.storage;
 
       if (
         environmentSpec.maintenance
@@ -684,12 +806,9 @@ export class PlanService {
   ): { repo: string; branch: string } | undefined {
     if (environmentSpec.deploy?.strategy !== 'branch') return undefined;
     if (environmentSpec.deploy.trigger !== 'native') return undefined;
-    const kind = classifyDeployEnvironment(environmentName);
     const resolved = resolveGitDeploySource(project, environmentName, {
       strategy: 'branch',
-      ...(environmentSpec.deploy.branch && kind
-        ? { branches: { [kind]: environmentSpec.deploy.branch } }
-        : {}),
+      ...(environmentSpec.deploy.branch ? { branch: environmentSpec.deploy.branch } : {}),
     });
     return resolved.source ?? undefined;
   }
@@ -877,11 +996,13 @@ export class PlanService {
     const previousProvider = previousHosting?.provider;
     const previousDatabase = local.bindings?.previousDatabase;
     const previousDatabaseProvider = previousDatabase?.provider;
+    const previousCache = local.bindings?.previousCache;
+    const previousCacheProvider = previousCache?.provider;
     const previousResource = local.bindings?.previousResource;
     const previousResourceProvider = previousResource?.provider;
-    if ((!previousProvider || previousProvider === environmentSpec.hosting.provider) && !previousDatabaseProvider && !previousResourceProvider) {
+    if ((!previousProvider || previousProvider === environmentSpec.hosting.provider) && !previousDatabaseProvider && !previousCacheProvider && !previousResourceProvider) {
       return {
-        error: `Environment "${environmentName}" has no abandoned hosting provider retained for cleanup and no retained database or provider-resource target.`,
+        error: `Environment "${environmentName}" has no abandoned hosting provider retained for cleanup and no retained database, cache, or provider-resource target.`,
       };
     }
     if (previousProvider && boundHostingProvider && boundHostingProvider !== environmentSpec.hosting.provider) {
@@ -945,7 +1066,9 @@ export class PlanService {
         || engine !== 'postgres'
         || !providerScope
         || Object.keys(providerScope).length === 0
-        || Object.values(providerScope).some((value) => typeof value !== 'string' || !value)
+        || Object.entries(providerScope).some(([key, value]) => (
+          !key.trim() || typeof value !== 'string' || !value.trim()
+        ))
       ) {
         return {
           error: `The retained ${previousDatabaseProvider} database binding is incomplete. Re-import one exact database id and provider scope before planning deletion.`,
@@ -967,7 +1090,6 @@ export class PlanService {
             provider: previousDatabaseProvider,
             instanceId: externalId,
             providerScope,
-            ...providerScope,
             retainedCleanup: true,
           },
           createdAt: environment.createdAt,
@@ -1008,6 +1130,102 @@ export class PlanService {
           operation: 'retainedDatabaseDestroy',
           externalId,
           providerScope,
+          ...(blockedReason ? { blockedReason } : {}),
+        },
+      });
+    }
+    let retainedCacheVerified = true;
+    if (previousCacheProvider) {
+      const externalId = previousCache?.externalId;
+      const engine = previousCache?.engine;
+      const providerEngine = previousCache?.providerEngine;
+      const name = previousCache?.name;
+      const resourceKind = previousCache?.resourceKind;
+      const providerScope = previousCache?.providerScope;
+      if (
+        !externalId
+        || engine !== 'redis'
+        || !name
+        || !providerScope
+        || Object.keys(providerScope).length === 0
+        || Object.entries(providerScope).some(([key, value]) => (
+          !key.trim() || typeof value !== 'string' || !value.trim()
+        ))
+      ) {
+        return {
+          error: `The retained ${previousCacheProvider} cache binding is incomplete. Re-import one exact cache id, name, engine, and provider scope before planning deletion.`,
+        };
+      }
+      let blockedReason: string | undefined;
+      const adapterResult = await adapterFactory.getCacheAdapter(previousCacheProvider, projectForPlan);
+      if (!adapterResult.success || !adapterResult.adapter) {
+        retainedCacheVerified = false;
+        blockedReason = 'retained_cache_connection_unavailable';
+        cleanupWarnings.push(`Retained cache ${externalId} could not be re-observed: ${adapterResult.error ?? 'cache adapter unavailable'}.`);
+      } else {
+        const retainedComponent: Component = {
+          id: `retained:${externalId}`,
+          environmentId: environment.id,
+          type: 'redis',
+          externalId,
+          bindings: {
+            provider: previousCacheProvider,
+            instanceId: externalId,
+            providerScope,
+            retainedCleanup: true,
+            ...(resourceKind ? { resourceKind } : {}),
+          },
+          createdAt: environment.createdAt,
+          updatedAt: environment.updatedAt,
+        };
+        try {
+          const retainedObserved = await adapterResult.adapter.observeCache(environment, retainedComponent);
+          if (retainedObserved) {
+            if (retainedObserved.provider !== previousCacheProvider) {
+              throw new Error(`provider returned ${retainedObserved.provider} for retained ${previousCacheProvider} cache`);
+            }
+            if (retainedObserved.engine !== engine) {
+              throw new Error(`provider returned engine ${retainedObserved.engine} for retained ${engine} cache`);
+            }
+            if (retainedObserved.externalId !== externalId) {
+              throw new Error(`provider returned ${retainedObserved.externalId} for retained id ${externalId}`);
+            }
+            if (retainedObserved.name !== name) {
+              throw new Error(`provider returned name ${retainedObserved.name ?? '(missing)'} for retained cache ${name}`);
+            }
+            if (!retainedObserved.providerScope) {
+              throw new Error(`provider omitted the durable scope for retained id ${externalId}`);
+            }
+            const expectedScope = JSON.stringify(Object.entries(providerScope).sort());
+            const observedScope = JSON.stringify(Object.entries(retainedObserved.providerScope).sort());
+            if (expectedScope !== observedScope) {
+              throw new Error(`provider scope changed from ${expectedScope} to ${observedScope}`);
+            }
+          }
+        } catch (error) {
+          retainedCacheVerified = false;
+          blockedReason = 'retained_cache_observation_unknown';
+          cleanupWarnings.push(`Retained cache ${externalId} observation is unknown: ${error instanceof Error ? error.message : String(error)}.`);
+        } finally {
+          await adapterResult.adapter.disconnect?.();
+        }
+      }
+      actions.push({
+        id: `cache:${previousCacheProvider}:retained-destroy`,
+        type: 'destroy',
+        resource: { kind: 'cache', name: engine, provider: previousCacheProvider },
+        verified: retainedCacheVerified,
+        reason: `Delete exact retained ${previousCacheProvider} cache ${externalId} in its recorded provider scope`,
+        dataBearing: true,
+        requiresConfirm: true,
+        metadata: {
+          operation: CACHE_OPERATIONS.retainedDestroy,
+          externalId,
+          name,
+          engine,
+          providerScope,
+          ...(providerEngine ? { providerEngine } : {}),
+          ...(resourceKind ? { resourceKind } : {}),
           ...(blockedReason ? { blockedReason } : {}),
         },
       });
@@ -1108,6 +1326,22 @@ export class PlanService {
         },
       });
     }
+    const retainedDependentCleanupIds = actions
+      .filter((action) => (
+        action.metadata?.operation === 'retainedDatabaseDestroy'
+        || action.metadata?.operation === CACHE_OPERATIONS.retainedDestroy
+        || action.metadata?.operation === 'retainedResourceDestroy'
+      ))
+      .map((action) => action.id);
+    if (retainedDependentCleanupIds.length > 0) {
+      for (const action of actions) {
+        if (action.metadata?.operation !== 'previousHostingDestroy') continue;
+        action.dependsOn = Array.from(new Set([
+          ...(action.dependsOn ?? []),
+          ...retainedDependentCleanupIds,
+        ]));
+      }
+    }
     try {
       orderActions(actions);
     } catch (error) {
@@ -1149,7 +1383,7 @@ export class PlanService {
       specRevision: specResult.revision,
       specSource: specResult.source ?? { kind: 'local' },
       environmentName,
-      verified: observed !== null && !observed.partial && retainedDatabaseVerified && retainedResourceVerified,
+      verified: observed !== null && !observed.partial && retainedDatabaseVerified && retainedCacheVerified && retainedResourceVerified,
       observed,
       actions,
       unmanaged: [],
@@ -1159,6 +1393,7 @@ export class PlanService {
         environmentSpec.hosting.provider,
         ...(previousProvider ? [previousProvider] : []),
         ...(previousDatabaseProvider ? [previousDatabaseProvider] : []),
+        ...(previousCacheProvider ? [previousCacheProvider] : []),
         ...(previousResourceProvider ? [previousResourceProvider] : []),
       ]),
     };
@@ -1172,6 +1407,10 @@ export class PlanService {
     const specResult = this.specStore.get(project);
     if (!specResult) {
       return { error: `Project "${project.name}" has no spec. Set one with hv_spec.` };
+    }
+    const providerValidation = firstProviderSpecValidationFailure(specResult.spec);
+    if (providerValidation) {
+      return { error: providerValidation.message };
     }
     const scope = options?.scope ?? 'full';
     if (scope === 'retained-cleanup') {
@@ -1582,6 +1821,14 @@ export class PlanService {
       : environmentSpec;
 
     const hostingMetadata = providerRegistry.getMetadata(environmentSpec.hosting.provider);
+    const databaseConnectivity = environmentSpec.database
+      ? providerRegistry.getMetadata(environmentSpec.database.provider)
+        ?.lifecycle?.databaseConnectivity
+      : undefined;
+    const cacheConnectivity = environmentSpec.cache
+      ? providerRegistry.getMetadata(environmentSpec.cache.provider)
+        ?.lifecycle?.cacheConnectivity
+      : undefined;
     const diff = diffEnvironment({
       spec: specForDiff,
       envName: environmentName,
@@ -1596,6 +1843,11 @@ export class PlanService {
       managedCacheEnvVars,
       managedQueueEnvVars,
       projectRuntime: specResult.spec.runtime,
+      databaseDependsOnHostingProject: Boolean(
+        databaseConnectivity?.compatibleHostingProviders.includes(
+          environmentSpec.hosting.provider
+        )
+      ),
     });
     const cache = planCache({
       environmentSpec,
@@ -1603,7 +1855,15 @@ export class PlanService {
       local,
       projectDependency: diff.actions.some((action) =>
         action.id === `project:${environmentSpec.hosting.provider}`
-      ) && environmentSpec.cache?.provider === environmentSpec.hosting.provider
+      ) && Boolean(
+        environmentSpec.cache
+        && (
+          environmentSpec.cache.provider === environmentSpec.hosting.provider
+          || cacheConnectivity?.compatibleHostingProviders.includes(
+            environmentSpec.hosting.provider
+          )
+        )
+      )
         ? [`project:${environmentSpec.hosting.provider}`]
         : undefined,
     });
@@ -1648,12 +1908,14 @@ export class PlanService {
       else actions.splice(firstServiceIndex, 0, ...cache.actions);
     }
     if (cache.serviceDependency) {
+      const dependencyAction = actions.find((action) => action.id === cache.serviceDependency);
+      const dependencyBlocked = typeof dependencyAction?.metadata?.blockedReason === 'string';
       for (const serviceAction of actions.filter((action) =>
         action.resource.kind === 'service'
         && action.type !== 'destroy'
         && !action.id.includes(':env-remove')
       )) {
-        if (serviceAction.type === 'noop') {
+        if (serviceAction.type === 'noop' && !dependencyBlocked) {
           serviceAction.type = 'update';
           serviceAction.reason = `${serviceAction.reason}; wire the newly created ${environmentSpec.cache?.provider} Redis cache`;
         }
@@ -2187,6 +2449,7 @@ export class PlanService {
           || action.metadata?.operation === 'dataMigrationStoragePreviousDestroy'
           || action.metadata?.operation === 'previousHostingDestroy'
           || action.metadata?.operation === 'retainedDatabaseDestroy'
+          || action.metadata?.operation === CACHE_OPERATIONS.retainedDestroy
           || action.metadata?.operation === 'retainedResourceDestroy'
         )
       )

@@ -1,7 +1,6 @@
-export type ProviderImplementationStatus =
-  | 'supported'
-  | 'ready-for-live'
-  | 'planned';
+import type { ProviderImplementationStatus } from '../../src/domain/registry/provider.registry.js';
+
+export type { ProviderImplementationStatus };
 
 export interface ProviderCredentialField {
   /** Key accepted by the provider's Hypervibe credential schema. */
@@ -48,6 +47,8 @@ export interface HostingProviderContract {
   vendor: string;
   service: string;
   status: ProviderImplementationStatus;
+  /** Workload kinds covered by the adapter's complete plan/apply/observe/delete lifecycle. */
+  workloadKinds: Array<'web' | 'worker' | 'cron'>;
   /** Environment custom-domain lifecycle implemented by Hypervibe today. */
   customDomains: 'managed' | 'unsupported';
   /** Whether the provider certificate path permits proxied traffic DNS. */
@@ -90,6 +91,42 @@ export interface CacheProviderContract {
   implementationNote?: string;
 }
 
+export interface StorageProviderContract {
+  kind: 'storage';
+  provider: string;
+  vendor: string;
+  service: string;
+  status: ProviderImplementationStatus;
+  credentials: ProviderCredentialField[];
+  /** Hosting connection whose cloud identity may be reused for lifecycle. */
+  connectionAlias?: string;
+  implementationNote?: string;
+}
+
+export interface QueueProviderContract {
+  kind: 'queue';
+  provider: string;
+  vendor: string;
+  service: string;
+  status: ProviderImplementationStatus;
+  credentials: ProviderCredentialField[];
+  backend: 'pubsub' | 'postgres';
+  resources: 'managed' | 'application-managed';
+  implementationNote?: string;
+}
+
+export interface LoadBalancerProviderContract {
+  kind: 'load-balancer';
+  provider: string;
+  vendor: string;
+  service: string;
+  status: ProviderImplementationStatus;
+  credentials: ProviderCredentialField[];
+  topology: 'monitor-pool-balancer';
+  minimumOrigins: number;
+  implementationNote?: string;
+}
+
 const gcpCredentials: ProviderCredentialField[] = [
   { field: 'projectId', environmentVariable: 'HYPERVIBE_TEST_GCP_PROJECT_ID' },
   { field: 'credentials', environmentVariable: 'HYPERVIBE_TEST_GCP_SERVICE_ACCOUNT_JSON' },
@@ -106,20 +143,6 @@ const awsCredentials: ProviderCredentialField[] = [
 
 const awsHostingCredentials = awsCredentials.filter(({ field }) => field !== 'region');
 
-const awsNetworkCredentials: ProviderCredentialField[] = [
-  ...awsCredentials,
-  {
-    field: 'subnetIds',
-    environmentVariable: 'HYPERVIBE_TEST_AWS_SUBNET_IDS_JSON',
-    parseAs: 'json',
-  },
-  {
-    field: 'securityGroupIds',
-    environmentVariable: 'HYPERVIBE_TEST_AWS_SECURITY_GROUP_IDS_JSON',
-    parseAs: 'json',
-  },
-];
-
 const digitalOceanCredentials: ProviderCredentialField[] = [
   { field: 'apiToken', environmentVariable: 'HYPERVIBE_TEST_DIGITALOCEAN_TOKEN' },
 ];
@@ -129,13 +152,9 @@ const railwayCredentials: ProviderCredentialField[] = [
   { field: 'workspaceId', environmentVariable: 'HYPERVIBE_TEST_RAILWAY_WORKSPACE_ID', optional: true },
 ];
 
-const azureCredentials: ProviderCredentialField[] = [
-  { field: 'tenantId', environmentVariable: 'HYPERVIBE_TEST_AZURE_TENANT_ID' },
-  { field: 'subscriptionId', environmentVariable: 'HYPERVIBE_TEST_AZURE_SUBSCRIPTION_ID' },
-  { field: 'clientId', environmentVariable: 'HYPERVIBE_TEST_AZURE_CLIENT_ID' },
-  { field: 'clientSecret', environmentVariable: 'HYPERVIBE_TEST_AZURE_CLIENT_SECRET' },
-  { field: 'resourceGroup', environmentVariable: 'HYPERVIBE_TEST_AZURE_RESOURCE_GROUP' },
-  { field: 'location', environmentVariable: 'HYPERVIBE_TEST_AZURE_LOCATION' },
+const cloudflareCredentials: ProviderCredentialField[] = [
+  { field: 'apiToken', environmentVariable: 'HYPERVIBE_TEST_CLOUDFLARE_API_TOKEN' },
+  { field: 'accountId', environmentVariable: 'HYPERVIBE_TEST_CLOUDFLARE_ACCOUNT_ID', optional: true },
 ];
 
 const azureHostingCredentials: ProviderCredentialField[] = [
@@ -144,6 +163,8 @@ const azureHostingCredentials: ProviderCredentialField[] = [
   { field: 'clientId', environmentVariable: 'HYPERVIBE_TEST_AZURE_CLIENT_ID' },
   { field: 'clientSecret', environmentVariable: 'HYPERVIBE_TEST_AZURE_CLIENT_SECRET' },
 ];
+
+const azureCredentials = azureHostingCredentials;
 
 const vercelCredentials: ProviderCredentialField[] = [
   { field: 'accessToken', environmentVariable: 'HYPERVIBE_TEST_VERCEL_ACCESS_TOKEN' },
@@ -193,7 +214,8 @@ export const hostingProviderContracts: HostingProviderContract[] = [
     provider: 'railway',
     vendor: 'Railway',
     service: 'Railway',
-    status: 'supported',
+    status: 'ready-for-live',
+    workloadKinds: ['web', 'worker', 'cron'],
     customDomains: 'managed',
     domainTrafficProxy: 'supported',
     maintenance: 'managed',
@@ -204,7 +226,8 @@ export const hostingProviderContracts: HostingProviderContract[] = [
     provider: 'cloudrun',
     vendor: 'Google Cloud',
     service: 'Cloud Run',
-    status: 'supported',
+    status: 'ready-for-live',
+    workloadKinds: ['web', 'worker', 'cron'],
     customDomains: 'managed',
     domainTrafficProxy: 'dns-only',
     maintenance: 'managed',
@@ -216,11 +239,15 @@ export const hostingProviderContracts: HostingProviderContract[] = [
     vendor: 'AWS',
     service: 'ECS Express Mode',
     status: 'ready-for-live',
+    workloadKinds: ['web'],
     customDomains: 'managed',
     domainTrafficProxy: 'dns-only',
     maintenance: 'unsupported',
     credentials: awsHostingCredentials,
-    managedWorkflow: dockerWebManagedWorkflow('deploy-ecs-production.yml'),
+    managedWorkflow: {
+      ...dockerWebManagedWorkflow('deploy-ecs-production.yml'),
+      database: { provider: 'rds', engine: 'postgres' },
+    },
     implementationNote:
       'The authentication-only connection, shared default-VPC prerequisite, project-owned ECR/IAM/cluster bootstrap, ECS Express service lifecycle, phased ACM/ALB domain lifecycle, exact-digest CI workflow, and mocked safety contracts are implemented. Promotion requires a successful opt-in live lifecycle run.',
   },
@@ -230,6 +257,7 @@ export const hostingProviderContracts: HostingProviderContract[] = [
     vendor: 'Microsoft Azure',
     service: 'Container Apps',
     status: 'ready-for-live',
+    workloadKinds: ['web'],
     customDomains: 'managed',
     domainTrafficProxy: 'dns-only',
     maintenance: 'managed',
@@ -244,6 +272,7 @@ export const hostingProviderContracts: HostingProviderContract[] = [
     vendor: 'DigitalOcean',
     service: 'App Platform',
     status: 'ready-for-live',
+    workloadKinds: ['web', 'worker', 'cron'],
     customDomains: 'managed',
     domainTrafficProxy: 'supported',
     maintenance: 'ready-for-live',
@@ -262,6 +291,7 @@ export const hostingProviderContracts: HostingProviderContract[] = [
     vendor: 'Vercel',
     service: 'Vercel Projects and Deployments',
     status: 'ready-for-live',
+    workloadKinds: ['web'],
     customDomains: 'managed',
     domainTrafficProxy: 'supported',
     maintenance: 'ready-for-live',
@@ -293,6 +323,7 @@ export const hostingProviderContracts: HostingProviderContract[] = [
     vendor: 'Fly.io',
     service: 'Fly Apps and Machines',
     status: 'ready-for-live',
+    workloadKinds: ['web', 'worker'],
     customDomains: 'managed',
     domainTrafficProxy: 'supported',
     maintenance: 'unsupported',
@@ -313,7 +344,7 @@ export const databaseProviderContracts: DatabaseProviderContract[] = [
     vendor: 'Google Cloud',
     service: 'Cloud SQL for PostgreSQL',
     engine: 'postgres',
-    status: 'supported',
+    status: 'ready-for-live',
     credentials: gcpCredentials,
     fixtureHostingProvider: 'cloudrun',
   },
@@ -347,9 +378,11 @@ export const databaseProviderContracts: DatabaseProviderContract[] = [
     vendor: 'AWS',
     service: 'RDS for PostgreSQL',
     engine: 'postgres',
-    status: 'supported',
-    credentials: awsCredentials,
-    fixtureHostingProvider: 'railway',
+    status: 'ready-for-live',
+    credentials: awsHostingCredentials,
+    fixtureHostingProvider: 'ecs',
+    implementationNote:
+      'RDS reuses the ECS connection, exact account/region/default-VPC workload-network binding, and workload security group. Its database security group permits durable PostgreSQL ingress only from that exact ECS workload group; promotion requires a successful complete ECS-hosted live lifecycle.',
   },
   {
     kind: 'database',
@@ -357,7 +390,7 @@ export const databaseProviderContracts: DatabaseProviderContract[] = [
     vendor: 'Railway',
     service: 'Railway PostgreSQL',
     engine: 'postgres',
-    status: 'supported',
+    status: 'ready-for-live',
     credentials: railwayCredentials,
     fixtureHostingProvider: 'railway',
   },
@@ -367,7 +400,7 @@ export const databaseProviderContracts: DatabaseProviderContract[] = [
     vendor: 'Supabase',
     service: 'Supabase Postgres',
     engine: 'postgres',
-    status: 'supported',
+    status: 'ready-for-live',
     credentials: [
       { field: 'accessToken', environmentVariable: 'HYPERVIBE_TEST_SUPABASE_ACCESS_TOKEN' },
       { field: 'organizationId', environmentVariable: 'HYPERVIBE_TEST_SUPABASE_ORGANIZATION_ID', optional: true },
@@ -380,11 +413,11 @@ export const databaseProviderContracts: DatabaseProviderContract[] = [
     vendor: 'Microsoft Azure',
     service: 'Azure Database for PostgreSQL Flexible Server',
     engine: 'postgres',
-    status: 'planned',
+    status: 'ready-for-live',
     credentials: azureCredentials,
-    fixtureHostingProvider: 'railway',
+    fixtureHostingProvider: 'azure-container-apps',
     implementationNote:
-      'The PostgreSQL Flexible Server adapter and mocked lifecycle safety contract remain implemented. Azure Container Apps now provides declarative hosting, but this datastore remains planned until its independent network profile and full-stack live lifecycle pass.',
+      'The auth-only connection reuse, deterministic Container Apps resource-group placement, explicit public-network/Azure-services firewall contract, encrypted binding, and mocked lifecycle safety contract are implemented. Promotion requires a successful recent Azure Container Apps plus PostgreSQL full-stack live run.',
   },
   {
     kind: 'database',
@@ -407,11 +440,11 @@ export const cacheProviderContracts: CacheProviderContract[] = [
     vendor: 'Google Cloud',
     service: 'Memorystore for Redis',
     engine: 'redis',
-    status: 'planned',
-    credentials: gcpCredentials,
+    status: 'ready-for-live',
+    credentials: gcpHostingCredentials,
     fixtureHostingProvider: 'cloudrun',
     implementationNote:
-      'The registry, private-IP Redis AUTH adapter, durable observation, and mocked lifecycle safety contract are implemented. Live promotion remains blocked until the Cloud Run adapter can declaratively attach VPC egress to the selected authorizedNetwork.',
+      'The auth-only registry, private-IP Redis AUTH adapter, desired placement drift, existing-network verification, Cloud Run Direct VPC egress, and mocked lifecycle contracts are implemented. Promotion to supported requires a successful recent opt-in live create/noop/update/destroy run.',
   },
   {
     kind: 'cache',
@@ -431,11 +464,11 @@ export const cacheProviderContracts: CacheProviderContract[] = [
     vendor: 'AWS',
     service: 'ElastiCache for Valkey/Redis',
     engine: 'redis',
-    status: 'planned',
-    credentials: awsNetworkCredentials,
-    fixtureHostingProvider: 'railway',
+    status: 'ready-for-live',
+    credentials: awsHostingCredentials,
+    fixtureHostingProvider: 'ecs',
     implementationNote:
-      'The serverless Valkey adapter and mocked lifecycle safety contract remain implemented. Live promotion is blocked until Hypervibe owns a declarative AWS workload-network profile; ECS hosting was removed because it required pre-created infrastructure identifiers.',
+      'The auth-only ECS connection, project-owned default-VPC workload security group, explicit Express networking, isolated serverless Valkey security group, desired region/size placement, and mocked lifecycle safety contract are implemented. Promotion to supported requires a successful recent opt-in live create/noop/update/destroy run.',
   },
   {
     kind: 'cache',
@@ -453,11 +486,92 @@ export const cacheProviderContracts: CacheProviderContract[] = [
     vendor: 'Microsoft Azure',
     service: 'Azure Managed Redis',
     engine: 'redis',
-    status: 'planned',
+    status: 'ready-for-live',
     credentials: azureCredentials,
-    fixtureHostingProvider: 'railway',
+    fixtureHostingProvider: 'azure-container-apps',
     implementationNote:
-      'The Azure Managed Redis adapter and mocked lifecycle safety contract remain implemented. Azure Container Apps now provides declarative hosting, but this datastore remains planned until its independent network profile and full-stack live lifecycle pass.',
+      'The auth-only connection reuse, deterministic Container Apps resource-group placement, explicit public-network/TLS/encrypted-client/access-key contract, desired region/size drift, and mocked lifecycle safety contract are implemented. Promotion requires a successful recent Azure Container Apps plus Managed Redis full-stack live run.',
+  },
+];
+
+export const storageProviderContracts: StorageProviderContract[] = [
+  {
+    kind: 'storage',
+    provider: 's3',
+    vendor: 'AWS',
+    service: 'Amazon S3',
+    status: 'ready-for-live',
+    credentials: awsHostingCredentials,
+    connectionAlias: 'ecs',
+    implementationNote: 'Private bucket creation, scoped observation, streaming data access, workload wiring, rollback, and confirmed teardown are implemented; promotion requires recent live lifecycle evidence.',
+  },
+  {
+    kind: 'storage',
+    provider: 'gcs',
+    vendor: 'Google Cloud',
+    service: 'Cloud Storage',
+    status: 'ready-for-live',
+    credentials: gcpHostingCredentials,
+    connectionAlias: 'cloudrun',
+    implementationNote: 'Private bucket creation, scoped observation, streaming data access, workload wiring, and confirmed teardown are implemented; promotion requires recent live lifecycle evidence.',
+  },
+  {
+    kind: 'storage',
+    provider: 'azureblob',
+    vendor: 'Microsoft Azure',
+    service: 'Blob Storage',
+    status: 'ready-for-live',
+    credentials: azureHostingCredentials,
+    connectionAlias: 'azure-container-apps',
+    implementationNote: 'Private account/container creation, scoped observation, streaming data access, workload wiring, and confirmed teardown are implemented; promotion requires recent live lifecycle evidence.',
+  },
+  {
+    kind: 'storage',
+    provider: 'railway',
+    vendor: 'Railway',
+    service: 'Railway Buckets',
+    status: 'ready-for-live',
+    credentials: railwayCredentials,
+    implementationNote: 'Private S3-compatible bucket creation, scoped observation, streaming data access, and workload wiring are implemented; promotion requires recent live lifecycle evidence.',
+  },
+];
+
+export const queueProviderContracts: QueueProviderContract[] = [
+  {
+    kind: 'queue',
+    provider: 'cloudrun',
+    vendor: 'Google Cloud',
+    service: 'Pub/Sub',
+    status: 'ready-for-live',
+    credentials: gcpHostingCredentials,
+    backend: 'pubsub',
+    resources: 'managed',
+    implementationNote: 'Topic/subscription lifecycle and workload wiring are implemented through the Cloud Run connection; promotion requires recent live lifecycle evidence.',
+  },
+  {
+    kind: 'queue',
+    provider: 'railway',
+    vendor: 'Railway',
+    service: 'PostgreSQL-backed queues',
+    status: 'ready-for-live',
+    credentials: railwayCredentials,
+    backend: 'postgres',
+    resources: 'application-managed',
+    implementationNote: 'Queue declarations are wired to the explicitly declared PostgreSQL database; no provider queue resource is invented or mutated.',
+  },
+];
+
+export const loadBalancerProviderContracts: LoadBalancerProviderContract[] = [
+  {
+    kind: 'load-balancer',
+    provider: 'cloudflare',
+    vendor: 'Cloudflare',
+    service: 'Cloudflare Load Balancing',
+    status: 'ready-for-live',
+    credentials: cloudflareCredentials,
+    topology: 'monitor-pool-balancer',
+    minimumOrigins: 2,
+    implementationNote: 'Separate monitor, pool, and hostname load-balancer actions, scoped observation, dependency-ordered reconciliation, and confirmed reverse teardown are implemented; promotion requires the review-gated live profile.',
   },
 ];
 
@@ -465,4 +579,7 @@ export const providerContracts = [
   ...hostingProviderContracts,
   ...databaseProviderContracts,
   ...cacheProviderContracts,
+  ...storageProviderContracts,
+  ...queueProviderContracts,
+  ...loadBalancerProviderContracts,
 ];

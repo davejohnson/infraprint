@@ -53,6 +53,45 @@ export interface StripeWebhookEndpoint {
   metadata: Record<string, string>;
 }
 
+const stripeProductResponseSchema = z.object({
+  id: z.string().min(1),
+  name: z.string(),
+  description: z.string().nullable(),
+  tax_code: z.string().nullable().optional(),
+  active: z.boolean(),
+  metadata: z.record(z.string()),
+  default_price: z.string().nullable().optional(),
+  created: z.number(),
+  updated: z.number(),
+}).passthrough();
+
+const stripePriceResponseSchema = z.object({
+  id: z.string().min(1),
+  product: z.string().min(1),
+  active: z.boolean(),
+  currency: z.string().min(1),
+  unit_amount: z.number().nullable(),
+  recurring: z.object({
+    interval: z.enum(['day', 'week', 'month', 'year']),
+    interval_count: z.number().int().positive(),
+  }).passthrough().nullable(),
+  type: z.enum(['one_time', 'recurring']),
+  metadata: z.record(z.string()),
+  nickname: z.string().nullable(),
+  lookup_key: z.string().nullable().optional(),
+  created: z.number(),
+}).passthrough();
+
+const stripeProductListResponseSchema = z.object({
+  data: z.array(stripeProductResponseSchema),
+  has_more: z.boolean(),
+}).passthrough();
+
+const stripePriceListResponseSchema = z.object({
+  data: z.array(stripePriceResponseSchema),
+  has_more: z.boolean(),
+}).passthrough();
+
 export type StripeApiErrorKind = 'http' | 'timeout' | 'network' | 'malformed_response';
 
 export class StripeApiError extends Error {
@@ -304,46 +343,84 @@ export class StripeAdapter {
     const products: StripeProduct[] = [];
     let hasMore = true;
     let startingAfter: string | undefined;
+    const seenCursors = new Set<string>();
 
     while (hasMore && products.length < limit) {
       const active = includeInactive ? '' : '&active=true';
+      const pageLimit = Math.min(100, limit - products.length);
       const endpoint = startingAfter
-        ? `/products?limit=100${active}&starting_after=${startingAfter}`
-        : `/products?limit=100${active}`;
+        ? `/products?limit=${pageLimit}${active}&starting_after=${startingAfter}`
+        : `/products?limit=${pageLimit}${active}`;
 
-      const response = await this.request<{ data: StripeProduct[]; has_more: boolean }>(mode, 'GET', endpoint);
+      const raw = await this.request<unknown>(mode, 'GET', endpoint);
+      const parsed = stripeProductListResponseSchema.safeParse(raw);
+      if (!parsed.success) {
+        throw new StripeApiError(
+          'Stripe returned an invalid product-list response; catalog absence is unknown.',
+          200,
+          'malformed_response'
+        );
+      }
+      const response = parsed.data as { data: StripeProduct[]; has_more: boolean };
       products.push(...response.data);
       hasMore = response.has_more;
 
-      if (response.data.length > 0) {
-        startingAfter = response.data[response.data.length - 1].id;
+      if (hasMore) {
+        const nextCursor = response.data.at(-1)?.id;
+        if (!nextCursor) {
+          throw new Error('Stripe product pagination reported more results without a continuation cursor.');
+        }
+        if (seenCursors.has(nextCursor)) {
+          throw new Error(`Stripe product pagination repeated continuation cursor ${nextCursor}.`);
+        }
+        seenCursors.add(nextCursor);
+        startingAfter = nextCursor;
       }
     }
 
-    return products;
+    return products.slice(0, limit);
   }
 
   async listPrices(mode: StripeMode, limit = 100, includeInactive = false): Promise<StripePrice[]> {
     const prices: StripePrice[] = [];
     let hasMore = true;
     let startingAfter: string | undefined;
+    const seenCursors = new Set<string>();
 
     while (hasMore && prices.length < limit) {
       const active = includeInactive ? '' : '&active=true';
+      const pageLimit = Math.min(100, limit - prices.length);
       const endpoint = startingAfter
-        ? `/prices?limit=100${active}&starting_after=${startingAfter}`
-        : `/prices?limit=100${active}`;
+        ? `/prices?limit=${pageLimit}${active}&starting_after=${startingAfter}`
+        : `/prices?limit=${pageLimit}${active}`;
 
-      const response = await this.request<{ data: StripePrice[]; has_more: boolean }>(mode, 'GET', endpoint);
+      const raw = await this.request<unknown>(mode, 'GET', endpoint);
+      const parsed = stripePriceListResponseSchema.safeParse(raw);
+      if (!parsed.success) {
+        throw new StripeApiError(
+          'Stripe returned an invalid price-list response; catalog absence is unknown.',
+          200,
+          'malformed_response'
+        );
+      }
+      const response = parsed.data as { data: StripePrice[]; has_more: boolean };
       prices.push(...response.data);
       hasMore = response.has_more;
 
-      if (response.data.length > 0) {
-        startingAfter = response.data[response.data.length - 1].id;
+      if (hasMore) {
+        const nextCursor = response.data.at(-1)?.id;
+        if (!nextCursor) {
+          throw new Error('Stripe price pagination reported more results without a continuation cursor.');
+        }
+        if (seenCursors.has(nextCursor)) {
+          throw new Error(`Stripe price pagination repeated continuation cursor ${nextCursor}.`);
+        }
+        seenCursors.add(nextCursor);
+        startingAfter = nextCursor;
       }
     }
 
-    return prices;
+    return prices.slice(0, limit);
   }
 
   async getProduct(mode: StripeMode, productId: string): Promise<StripeProduct | null> {

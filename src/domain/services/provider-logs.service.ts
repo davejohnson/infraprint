@@ -1,18 +1,28 @@
 import { adapterFactory } from './adapter.factory.js';
 import { UNCONFIGURED_HOSTING_PROVIDER, type Project } from '../entities/project.entity.js';
+import type { Environment } from '../entities/environment.entity.js';
 import { NotSupportedError } from '../errors/not-supported.error.js';
 import { providerRegistry } from '../registry/provider.registry.js';
+import {
+  isProviderBuildLogsAdapter,
+  isProviderDeploymentsAdapter,
+  isProviderRuntimeLogsAdapter,
+  type ProviderDeployment,
+  type ProviderLogEntry,
+} from '../ports/provider-logs.port.js';
 
-type UnifiedLog = {
-  timestamp: string;
-  severity: string;
-  message: string;
-};
+export type { ProviderDeployment };
 
-type EnvironmentLike = {
-  platformBindings: unknown;
-  name: string;
-};
+const ERROR_LOG_SEVERITIES = new Set([
+  'warn',
+  'warning',
+  'err',
+  'error',
+  'critical',
+  'alert',
+  'emergency',
+  'fatal',
+]);
 
 /** Adapter resolution failed before a provider log API could be called. */
 export class ProviderLogsConnectionError extends Error {}
@@ -88,10 +98,10 @@ async function readProviderOperation<T>(
 }
 
 function boundedProviderLogs(
-  logs: UnifiedLog[],
+  logs: ProviderLogEntry[],
   requestedLimit: number,
   errorsOnly: boolean
-): UnifiedLog[] {
+): ProviderLogEntry[] {
   const limit = Math.max(1, Math.min(500, Math.trunc(requestedLimit)));
   const selected = errorsOnly ? logs.filter(isErrorLike) : logs;
   if (selected.length <= limit) return selected;
@@ -104,11 +114,14 @@ export function detectProviderName(projectDefaultPlatform: string | undefined, b
   return (bindingsProvider || projectDefaultPlatform || UNCONFIGURED_HOSTING_PROVIDER).toLowerCase();
 }
 
-export function isErrorLike(log: UnifiedLog): boolean {
+export function isErrorLike(log: ProviderLogEntry): boolean {
   const message = log.message.trim();
   const normalizedMessage = message.toLowerCase();
   const severity = (log.severity || '').toLowerCase();
-  if (['error', 'warn', 'warning', 'fatal', 'critical', 'alert', 'emergency'].includes(severity)) {
+  // Normalize the provider vocabularies we expose through the shared log
+  // port. In particular, Cloud Logging returns WARNING/CRITICAL/ALERT/
+  // EMERGENCY and would otherwise be dropped by this second-stage filter.
+  if (ERROR_LOG_SEVERITIES.has(severity)) {
     return true;
   }
 
@@ -159,120 +172,39 @@ export function logsBuildUnsupportedMessage(provider: string): string {
 export async function fetchProviderLogs(
   provider: string,
   project: Project,
-  environment: EnvironmentLike,
+  environment: Environment,
   serviceName: string,
   lines: number,
   options: { errorsOnly?: boolean } = {}
-): Promise<{ deploymentStatus?: string; deploymentId?: string; logs: UnifiedLog[] }> {
-  const bindings = environment.platformBindings as {
-    projectId?: string;
-    environmentId?: string;
-    services?: Record<string, { serviceId: string }>;
-  };
-
+): Promise<{ deploymentStatus?: string; deploymentId?: string; logs: ProviderLogEntry[] }> {
   const result = await adapterFactory.getProviderAdapter(provider, project);
   if (!result.success || !result.adapter) {
     throw new ProviderLogsConnectionError(result.error || `Failed to create ${provider} adapter`);
   }
-  const adapter = result.adapter as unknown as {
-    getDeployments?: (
-      projectId: string,
-      environmentId: string,
-      serviceId: string | undefined,
-      limit: number
-    ) => Promise<Array<{ id: string; status: string; createdAt?: string; staticUrl?: string }>>;
-    getDeploymentLogs?: (
-      deploymentId: string,
-      limit: number
-    ) => Promise<Array<{ timestamp: string; severity?: string; message: string }>>;
-    getLogs?: (
-      environment: { platformBindings: unknown; name: string },
-      serviceName: string,
-      options?: { limit?: number; errorsOnly?: boolean }
-    ) => Promise<Array<{ timestamp: Date; severity: string; message: string; raw: string }>>;
-    getDeployStatus?: (
-      environment: { platformBindings: unknown; name: string },
-      deploymentId: string
-    ) => Promise<{ status: string; url?: string }>;
+  const runtimeLogsAdapter = result.adapter;
+  if (!isProviderRuntimeLogsAdapter(runtimeLogsAdapter)) {
+    throw new NotSupportedError(provider, 'log reads');
+  }
+
+  // Some provider APIs do not support server-side severity filters. Preserve
+  // the upstream bounded scan in that case, then enforce the caller's limit
+  // locally so an over-returning provider cannot widen the public result.
+  const scanLimit = options.errorsOnly ? 500 : lines;
+  const providerResult = await readProviderOperation(
+    provider,
+    'service log read',
+    () => runtimeLogsAdapter.readProviderLogs({
+      environment,
+      serviceName,
+      limit: scanLimit,
+      errorsOnly: options.errorsOnly,
+    })
+  );
+  return {
+    ...providerResult,
+    logs: boundedProviderLogs(providerResult.logs, lines, options.errorsOnly === true),
   };
-
-  if (typeof adapter.getDeployments === 'function' && typeof adapter.getDeploymentLogs === 'function') {
-    if (!bindings.projectId || !bindings.environmentId || !bindings.services?.[serviceName]) {
-      throw new Error(`Environment/service not fully bound to ${provider}`);
-    }
-    const deployments = await readProviderOperation(
-      provider,
-      'latest deployment lookup',
-      () => adapter.getDeployments!(
-        bindings.projectId!,
-        bindings.environmentId!,
-        bindings.services![serviceName]!.serviceId,
-        1
-      )
-    );
-    if (deployments.length === 0) {
-      return { logs: [] };
-    }
-
-    const latestDeployment = deployments[0];
-    const scanLimit = options.errorsOnly ? 500 : lines;
-    const providerLogs = await readProviderOperation(
-      provider,
-      'service log read',
-      () => adapter.getDeploymentLogs!(latestDeployment.id, scanLimit)
-    );
-    const logs = boundedProviderLogs(providerLogs.map((log) => ({
-      timestamp: log.timestamp,
-      severity: log.severity || 'info',
-      message: log.message,
-    })), lines, options.errorsOnly === true);
-    return {
-      deploymentStatus: latestDeployment.status,
-      deploymentId: latestDeployment.id,
-      logs,
-    };
-  }
-
-  if (typeof adapter.getLogs === 'function') {
-    const deploymentId = bindings.services?.[serviceName]?.serviceId;
-    const scanLimit = options.errorsOnly ? 500 : lines;
-    const providerLogs = await readProviderOperation(
-      provider,
-      'service log read',
-      () => adapter.getLogs!(environment, serviceName, { limit: scanLimit, errorsOnly: options.errorsOnly })
-    );
-    const status = deploymentId && typeof adapter.getDeployStatus === 'function'
-      ? await readProviderOperation(
-        provider,
-        'deployment status lookup',
-        () => adapter.getDeployStatus!(environment, deploymentId)
-      )
-      : undefined;
-    const logs = boundedProviderLogs(providerLogs.map((log) => ({
-      timestamp: log.timestamp.toISOString(),
-      severity: log.severity || 'info',
-      message: log.message,
-    })), lines, options.errorsOnly === true);
-    return {
-      deploymentStatus: status?.status ?? 'unknown',
-      deploymentId,
-      logs,
-    };
-  }
-
-  throw new NotSupportedError(provider, 'log reads');
 }
-
-export type ProviderDeployment = {
-  id: string;
-  status: string;
-  createdAt?: string;
-  updatedAt?: string;
-  url?: string;
-  service?: string;
-  type?: string;
-  logUri?: string;
-};
 
 /**
  * List recent deployments for an environment (optionally narrowed to one
@@ -282,68 +214,28 @@ export type ProviderDeployment = {
 export async function fetchProviderDeployments(
   provider: string,
   project: Project,
-  environment: EnvironmentLike,
+  environment: Environment,
   serviceName: string | undefined,
   limit: number
 ): Promise<ProviderDeployment[]> {
-  const bindings = environment.platformBindings as {
-    projectId?: string;
-    environmentId?: string;
-    services?: Record<string, { serviceId: string }>;
-  };
-
   const result = await adapterFactory.getProviderAdapter(provider, project);
   if (!result.success || !result.adapter) {
     throw new ProviderLogsConnectionError(result.error || `Failed to create ${provider} adapter`);
   }
-  const adapter = result.adapter as unknown as {
-    listDeployments?: (
-      environment: { platformBindings: unknown; name: string },
-      serviceName?: string,
-      limit?: number
-    ) => Promise<ProviderDeployment[]>;
-    getDeployments?: (
-      projectId: string,
-      environmentId: string,
-      serviceId: string | undefined,
-      limit: number
-    ) => Promise<Array<{ id: string; status: string; createdAt?: string; staticUrl?: string }>>;
-  };
-
-  if (typeof adapter.listDeployments === 'function') {
-    return readProviderOperation(
-      provider,
-      'deployment listing',
-      () => adapter.listDeployments!(environment, serviceName, limit)
-    );
+  const deploymentsAdapter = result.adapter;
+  if (!isProviderDeploymentsAdapter(deploymentsAdapter)) {
+    throw new NotSupportedError(provider, 'deployment listing', logsDeploymentsUnsupportedMessage(provider));
   }
-
-  if (typeof adapter.getDeployments === 'function') {
-    if (!bindings.projectId || !bindings.environmentId) {
-      throw new Error(`Environment not deployed to ${provider}`);
-    }
-    const serviceId = serviceName && bindings.services?.[serviceName]
-      ? bindings.services[serviceName].serviceId
-      : undefined;
-    const deployments = await readProviderOperation(
-      provider,
-      'deployment listing',
-      () => adapter.getDeployments!(
-        bindings.projectId!,
-        bindings.environmentId!,
-        serviceId,
-        limit
-      )
-    );
-    return deployments.map((deployment) => ({
-      id: deployment.id,
-      status: deployment.status,
-      createdAt: deployment.createdAt,
-      url: deployment.staticUrl,
-    }));
-  }
-
-  throw new NotSupportedError(provider, 'deployment listing', logsDeploymentsUnsupportedMessage(provider));
+  const deployments = await readProviderOperation(
+    provider,
+    'deployment listing',
+    () => deploymentsAdapter.listProviderDeployments({
+      environment,
+      serviceName,
+      limit,
+    })
+  );
+  return deployments.slice(0, limit);
 }
 
 /**
@@ -353,58 +245,25 @@ export async function fetchProviderDeployments(
 export async function fetchProviderBuildLogs(
   provider: string,
   project: Project,
-  environment: EnvironmentLike,
+  environment: Environment,
   serviceName: string,
   deploymentId?: string
 ): Promise<{ deploymentId: string; buildLogs: string }> {
-  const bindings = environment.platformBindings as {
-    projectId?: string;
-    environmentId?: string;
-    services?: Record<string, { serviceId: string }>;
-  };
-
   const result = await adapterFactory.getProviderAdapter(provider, project);
   if (!result.success || !result.adapter) {
     throw new ProviderLogsConnectionError(result.error || `Failed to create ${provider} adapter`);
   }
-  const adapter = result.adapter as unknown as {
-    getBuildLogs?: (deploymentId: string) => Promise<string>;
-    getDeployments?: (
-      projectId: string,
-      environmentId: string,
-      serviceId: string | undefined,
-      limit: number
-    ) => Promise<Array<{ id: string; status: string }>>;
-  };
-  if (typeof adapter.getBuildLogs !== 'function' || typeof adapter.getDeployments !== 'function') {
+  const buildLogsAdapter = result.adapter;
+  if (!isProviderBuildLogsAdapter(buildLogsAdapter)) {
     throw new NotSupportedError(provider, 'build log reads', logsBuildUnsupportedMessage(provider));
   }
-  if (!bindings.projectId || !bindings.environmentId) {
-    throw new Error(`Environment not deployed to ${provider}`);
-  }
-
-  let targetDeploymentId = deploymentId;
-  if (!targetDeploymentId) {
-    const deployments = await readProviderOperation(
-      provider,
-      'latest deployment lookup',
-      () => adapter.getDeployments!(
-        bindings.projectId!,
-        bindings.environmentId!,
-        bindings.services?.[serviceName]?.serviceId,
-        1
-      )
-    );
-    if (deployments.length === 0) {
-      throw new Error('No deployments found for service');
-    }
-    targetDeploymentId = deployments[0].id;
-  }
-
-  const buildLogs = await readProviderOperation(
+  return readProviderOperation(
     provider,
     'build log read',
-    () => adapter.getBuildLogs!(targetDeploymentId)
+    () => buildLogsAdapter.readProviderBuildLogs({
+      environment,
+      serviceName,
+      deploymentId,
+    })
   );
-  return { deploymentId: targetDeploymentId, buildLogs: buildLogs || 'No build logs available' };
 }

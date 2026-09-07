@@ -2,6 +2,7 @@ import { DefaultAzureCredential } from '@azure/identity';
 
 const AZURE_MANAGEMENT_URL = 'https://management.azure.com';
 const AZURE_RESOURCE_API_VERSION = '2024-11-01';
+const AZURE_SUBSCRIPTION_API_VERSION = '2022-12-01';
 const PAGE_CAP = 1000;
 
 export type AzureResourceManagerCredentials = {
@@ -86,7 +87,7 @@ export class AzureResourceManagerClient {
     await this.request(
       'GET',
       `/subscriptions/${encodeURIComponent(this.credentials.subscriptionId)}`,
-      AZURE_RESOURCE_API_VERSION
+      AZURE_SUBSCRIPTION_API_VERSION
     );
   }
 

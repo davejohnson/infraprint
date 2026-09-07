@@ -48,6 +48,8 @@ export interface LocalSnapshot {
     projectId?: string;
     environmentId?: string;
     services?: Record<string, { serviceId?: string; url?: string; customDomains?: string[] }>;
+    /** Durable blockers for hosting creates whose exact outcome is unresolved. */
+    serviceCreateRecovery?: Record<string, unknown>;
     domainDns?: {
       name?: string;
       proxied?: boolean;
@@ -74,6 +76,16 @@ export interface LocalSnapshot {
       name?: string;
       providerScope?: Record<string, string>;
     };
+    /** Exact abandoned cache identity retained only for isolated, confirmation-gated cleanup. */
+    previousCache?: {
+      provider?: string;
+      externalId?: string;
+      engine?: string;
+      providerEngine?: string;
+      name?: string;
+      resourceKind?: string;
+      providerScope?: Record<string, string>;
+    };
     /** Exact extra provider identity retained only for isolated, confirmation-gated cleanup. */
     previousResource?: {
       provider?: string;
@@ -83,6 +95,15 @@ export interface LocalSnapshot {
       providerScope?: Record<string, string>;
     };
     storage?: Record<string, { provider?: string; externalId?: string; region?: string }>;
+    /** Runtime network selected by the active cache, consumed by hosting. */
+    cacheNetwork?: {
+      provider?: string;
+      projectId?: string;
+      region?: string;
+      network?: string;
+      subnetwork?: string;
+      egress?: string;
+    } | null;
     maintenance?: Record<string, unknown>;
   };
 }

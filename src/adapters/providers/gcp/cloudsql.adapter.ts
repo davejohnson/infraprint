@@ -14,6 +14,7 @@ import type {
   ProvisionResult,
   ProvisionableType,
 } from '../../../domain/ports/database.port.js';
+import { databaseCreateMayHaveCommitted } from '../../../domain/ports/database.port.js';
 import type { IObservableDatabase, ObservedDatabase } from '../../../domain/ports/observe.port.js';
 import type {
   DatabaseAvailability,
@@ -25,9 +26,13 @@ import type {
 } from '../../../domain/ports/database-resilience.port.js';
 import {
   providerRegistry,
+  type DatabaseRuntimeProjection,
   type ProviderInspectionRequest,
 } from '../../../domain/registry/provider.registry.js';
-import { buildDatabaseEnvVarsFromComponent } from '../../../domain/services/database-env.js';
+import {
+  buildDatabaseEnvVarsFromComponent,
+  databaseReplicaEnvKey,
+} from '../../../domain/services/database-env.js';
 import { buildCloudSqlRestoreDrillWorkflow } from './cloudsql-restore-drill.workflow.js';
 
 // Credentials schema for self-registration
@@ -112,6 +117,90 @@ interface ServiceAccountCredentials {
   project_id: string;
   private_key: string;
   client_email: string;
+}
+
+function databaseRuntimeString(
+  bindings: Record<string, unknown>,
+  key: string
+): string | undefined {
+  const value = bindings[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function cloudSqlSocketDatabaseUrl(params: {
+  username?: string;
+  password?: string;
+  database?: string;
+  socketHost: string;
+}): string | undefined {
+  if (!params.username || !params.password || !params.database) return undefined;
+  return `postgresql://${encodeURIComponent(params.username)}:${encodeURIComponent(params.password)}@/${encodeURIComponent(params.database)}?host=${encodeURIComponent(params.socketHost)}`;
+}
+
+function cloudSqlReplicaBindings(
+  bindings: Record<string, unknown>
+): Record<string, Record<string, unknown>> {
+  const resilience = bindings.resilience;
+  if (!resilience || typeof resilience !== 'object' || Array.isArray(resilience)) return {};
+  const replicas = (resilience as Record<string, unknown>).replicas;
+  if (!replicas || typeof replicas !== 'object' || Array.isArray(replicas)) return {};
+  return replicas as Record<string, Record<string, unknown>>;
+}
+
+function projectCloudSqlDatabaseRuntime(
+  component: Component,
+  standard: DatabaseRuntimeProjection
+): DatabaseRuntimeProjection {
+  const bindings = component.bindings as Record<string, unknown>;
+  const envVars = { ...standard.envVars };
+  const username = databaseRuntimeString(bindings, 'username');
+  const password = databaseRuntimeString(bindings, 'password');
+  const database = databaseRuntimeString(bindings, 'database');
+  const connectionName = databaseRuntimeString(bindings, 'connectionName');
+  const socketHost = connectionName
+    ? `/cloudsql/${connectionName}`
+    : databaseRuntimeString(bindings, 'host');
+  const socketUrl = socketHost
+    ? cloudSqlSocketDatabaseUrl({ username, password, database, socketHost })
+    : undefined;
+
+  if (socketUrl) {
+    envVars.DATABASE_URL = socketUrl;
+    envVars.DIRECT_URL = socketUrl;
+  }
+
+  const replicas = Object.entries(cloudSqlReplicaBindings(bindings))
+    .sort(([left], [right]) => left.localeCompare(right));
+  const replicaConnectionNames = replicas
+    .map(([, replica]) => databaseRuntimeString(replica, 'connectionName'))
+    .filter((value): value is string => Boolean(value));
+  if (connectionName) {
+    const connectionNames = [connectionName, ...replicaConnectionNames].join(',');
+    envVars.CLOUD_SQL_CONNECTION_NAME = connectionNames;
+    envVars.INSTANCE_CONNECTION_NAME = connectionNames;
+  }
+  if (socketHost) {
+    envVars.DATABASE_HOST = socketHost;
+    envVars.DB_HOST = socketHost;
+    envVars.PGHOST = socketHost;
+  }
+  for (const [name, replica] of replicas) {
+    const replicaConnectionName = databaseRuntimeString(replica, 'connectionName');
+    const replicaUrl = replicaConnectionName
+      ? cloudSqlSocketDatabaseUrl({
+        username,
+        password,
+        database,
+        socketHost: `/cloudsql/${replicaConnectionName}`,
+      })
+      : databaseRuntimeString(replica, 'connectionUrl');
+    if (replicaUrl) {
+      envVars[databaseReplicaEnvKey(name)] = replicaUrl;
+      if (replicas.length === 1) envVars.DATABASE_READ_URL = replicaUrl;
+    }
+  }
+
+  return { envVars, connectionUrl: standard.connectionUrl };
 }
 
 export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, IDatabaseResilienceAdapter {
@@ -233,11 +322,19 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
       };
     }
 
+    let requestedInstanceName: string | undefined;
+    let requestedRegion: string | undefined;
+    let createAcknowledged = false;
+    let createMutationAttempted = false;
+    let createMayHaveCommitted = false;
     try {
       const token = await this.getAccessToken();
       const { projectId, region } = this.credentials;
+      const targetRegion = options?.region?.trim() || region;
 
       const instanceName = this.sanitizeName(options?.resourceName || `${environment.name}-${type}`);
+      requestedInstanceName = instanceName;
+      requestedRegion = targetRegion;
       const existing = await this.getInstance(instanceName);
       if (existing) {
         throw new Error(
@@ -256,6 +353,8 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
       const defaultPort = 5432;
 
       // Create Cloud SQL instance
+      createMutationAttempted = true;
+      createMayHaveCommitted = true;
       const response = await fetch(
         `https://sqladmin.googleapis.com/v1/projects/${projectId}/instances`,
         {
@@ -266,7 +365,7 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
           },
           body: JSON.stringify({
             name: instanceName,
-            region: options?.region || region,
+            region: targetRegion,
             databaseVersion,
             settings: {
               tier: options?.size || 'db-f1-micro',
@@ -285,8 +384,14 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
 
       if (!response.ok) {
         const text = await response.text();
-        throw new Error(`Cloud SQL API error: ${response.status} ${text}`);
+        const apiError = Object.assign(
+          new Error(`Cloud SQL API error: ${response.status} ${text}`),
+          { status: response.status }
+        );
+        createMayHaveCommitted = databaseCreateMayHaveCommitted(apiError);
+        throw apiError;
       }
+      createAcknowledged = true;
 
       // Wait for operation to start (instance creation is async)
       const operation = (await response.json()) as CloudSqlOperation;
@@ -294,9 +399,21 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
         await this.waitForOperation(token, operation.name, 'instance create');
       }
 
+      const instance = await this.getInstance(instanceName);
+      if (
+        !instance
+        || instance.region !== targetRegion
+        || instance.databaseVersion !== databaseVersion
+        || instance.state !== 'RUNNABLE'
+      ) {
+        throw new Error(
+          `Cloud SQL instance ${instanceName} did not converge to RUNNABLE ${databaseVersion} in ${targetRegion}.`
+        );
+      }
+
       // Get the instance details (may not have IP yet)
       // For now, construct connection string with placeholder
-      const host = `${instanceName}.${region}.${projectId}`;
+      const host = `${instanceName}.${targetRegion}.${projectId}`;
       const rootUser = 'postgres';
       await this.ensureDatabaseByName({
         token,
@@ -307,7 +424,13 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
       const connectionUrl = `postgresql://${encodeURIComponent(rootUser)}:${encodeURIComponent(rootPassword)}@${host}:${defaultPort}/${encodeURIComponent(dbName)}`;
 
       // Cloud SQL connection name format for Cloud SQL Auth Proxy
-      const connectionName = `${projectId}:${region}:${instanceName}`;
+      const expectedConnectionName = `${projectId}:${targetRegion}:${instanceName}`;
+      if (instance.connectionName && instance.connectionName !== expectedConnectionName) {
+        throw new Error(
+          `Cloud SQL instance ${instanceName} returned connection identity ${instance.connectionName}, not ${expectedConnectionName}.`
+        );
+      }
+      const connectionName = instance.connectionName ?? expectedConnectionName;
 
       const component: Component = {
         id: '',
@@ -323,7 +446,7 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
           provider: 'cloudsql',
           instanceId: instanceName,
           connectionName,
-          providerScope: { projectId, region: options?.region || region },
+          providerScope: { projectId, region: targetRegion },
         },
         externalId: instanceName,
         createdAt: new Date(),
@@ -345,12 +468,45 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
         envVars: buildDatabaseEnvVarsFromComponent(component).envVars,
       };
     } catch (error) {
+      let recovered: CloudSqlInstance | null | undefined;
+      let recoveryError: string | undefined;
+      if (
+        createMutationAttempted
+        && requestedInstanceName
+        && (createAcknowledged || createMayHaveCommitted)
+      ) {
+        try {
+          recovered = await this.recoverInstanceAfterCreateAttempt(requestedInstanceName);
+        } catch (recoveryFailure) {
+          recoveryError = recoveryFailure instanceof Error
+            ? recoveryFailure.message
+            : String(recoveryFailure);
+        }
+      }
+      const retainIdentity = Boolean(
+        requestedInstanceName
+        && requestedRegion
+        && (createAcknowledged || createMayHaveCommitted)
+      );
+      const retainedRegion = typeof recovered?.region === 'string' && recovered.region.trim()
+        ? recovered.region.trim()
+        : requestedRegion;
       const emptyComponent: Component = {
         id: '',
         environmentId: environment.id,
         type,
-        bindings: {},
-        externalId: null,
+        bindings: retainIdentity && requestedInstanceName && retainedRegion
+          ? {
+              provider: 'cloudsql',
+              instanceId: requestedInstanceName,
+              providerScope: {
+                projectId: this.credentials.projectId,
+                region: retainedRegion,
+              },
+              cleanupRequired: true,
+            }
+          : {},
+        externalId: retainIdentity ? requestedInstanceName ?? null : null,
         createdAt: new Date(),
         updatedAt: new Date(),
       };
@@ -360,7 +516,20 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
         receipt: {
           success: false,
           message: 'Failed to provision Cloud SQL instance',
-          error: String(error),
+          error: `${String(error)}${recoveryError
+            ? ` Exact-id recovery also failed: ${recoveryError}`
+            : ''}`,
+          ...(retainIdentity && requestedInstanceName ? {
+            data: {
+              instanceName: requestedInstanceName,
+              projectId: this.credentials.projectId,
+              region: retainedRegion,
+              resourceCreated: recovered ? true : 'unknown',
+              cleanupRequired: true,
+              mutationAttempted: createMutationAttempted,
+              ...(recoveryError ? { recoveryError } : {}),
+            },
+          } : {}),
         },
       };
     }
@@ -388,7 +557,13 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
     }
 
     try {
+      this.assertComponentScope(component);
       const token = await this.getAccessToken();
+      const instance = await this.getInstance(instanceName);
+      if (!instance) {
+        throw new Error(`Primary Cloud SQL instance ${instanceName} is absent.`);
+      }
+      this.assertComponentScope(component, instance);
       const created = await this.ensureDatabaseByName({
         token,
         instanceName,
@@ -418,6 +593,7 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
     if (!this.credentials) {
       return null;
     }
+    this.assertComponentScope(component);
 
     const bindings = component.bindings as {
       connectionUrl?: string;
@@ -431,11 +607,19 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
     // Prefer a live public IP lookup. Early Cloud SQL bindings stored a
     // provider-internal placeholder host that is useful inside Cloud Run but
     // not directly reachable by local Hypervibe db_query.
+    let liveInstance: CloudSqlInstance | null | undefined;
     if (component.externalId) {
       try {
-        const instance = await this.getInstance(component.externalId);
-        if (instance?.ipAddresses) {
-          const publicIp = instance.ipAddresses.find((ip) => ip.type === 'PRIMARY');
+        liveInstance = await this.getInstance(component.externalId);
+      } catch {
+        // A stored URL can remain usable while the control-plane read is
+        // temporarily unavailable. Scope checks still happen outside this
+        // fallback so another project/region can never be selected silently.
+      }
+      if (liveInstance) {
+        this.assertComponentScope(component, liveInstance);
+        if (liveInstance.ipAddresses) {
+          const publicIp = liveInstance.ipAddresses.find((ip) => ip.type === 'PRIMARY');
           if (publicIp) {
             const port = Number(bindings.port ?? (component.type === 'postgres' ? 5432 : 3306));
             const username = bindings.username;
@@ -446,8 +630,6 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
             }
           }
         }
-      } catch {
-        // Fall back to stored connection URL below.
       }
     }
 
@@ -465,16 +647,24 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
     if (applicationPort !== 5432) {
       throw new Error(`Cloud SQL PostgreSQL access requires application port 5432, received ${applicationPort}.`);
     }
+    this.assertComponentScope(component);
 
     const bindings = component.bindings as Record<string, unknown>;
     const instanceName = component.externalId
       ?? (typeof bindings.instanceId === 'string' ? bindings.instanceId : undefined);
+    const providerScope = bindings.providerScope && typeof bindings.providerScope === 'object' && !Array.isArray(bindings.providerScope)
+      ? bindings.providerScope as Record<string, unknown>
+      : undefined;
+    const connectionRegion = typeof providerScope?.region === 'string'
+      ? providerScope.region
+      : this.credentials.region;
     const connectionName = typeof bindings.connectionName === 'string'
       ? bindings.connectionName
-      : instanceName ? `${this.credentials.projectId}:${this.credentials.region}:${instanceName}` : undefined;
+      : instanceName ? `${this.credentials.projectId}:${connectionRegion}:${instanceName}` : undefined;
     if (!connectionName) {
       throw new Error('Cloud SQL component is missing its instance connection name.');
     }
+    this.assertConnectionNameScope(connectionName, instanceName, component);
 
     const storedUrl = typeof bindings.connectionUrl === 'string'
       ? bindings.connectionUrl
@@ -620,10 +810,12 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
     }
 
     try {
+      this.assertComponentScope(component);
       const instance = await this.getInstance(component.externalId);
       if (!instance) {
         return { status: 'unknown', message: 'Instance not found' };
       }
+      this.assertComponentScope(component, instance);
 
       const statusMap: Record<string, 'running' | 'stopped' | 'provisioning' | 'error'> = {
         RUNNABLE: 'running',
@@ -654,8 +846,10 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
     }
 
     if (component?.externalId) {
+      this.assertComponentScope(component);
       const instance = await this.getInstance(component.externalId);
       if (!instance) return null;
+      this.assertComponentScope(component, instance);
       return {
         provider: this.name,
         engine: 'postgres',
@@ -856,10 +1050,13 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
       return { success: false, message: 'Cannot configure Cloud SQL availability', error: 'Connection or primary instance identity is missing.' };
     }
     try {
+      this.assertComponentScope(component);
       const token = await this.getAccessToken();
       const desired = availability === 'regional' ? 'REGIONAL' : 'ZONAL';
+      const current = await this.getInstance(instanceName);
+      if (!current) throw new Error(`Primary Cloud SQL instance ${instanceName} is absent.`);
+      this.assertComponentScope(component, current);
       if (availability === 'regional') {
-        const current = await this.getInstance(instanceName);
         const backup = current?.settings?.backupConfiguration;
         if (!backup?.enabled || !backup.pointInTimeRecoveryEnabled) {
           throw new Error('Regional Cloud SQL availability requires backups and PITR. Declare database.resilience.backups and apply that action first.');
@@ -906,9 +1103,11 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
       };
     }
     try {
+      this.assertComponentScope(component);
       const token = await this.getAccessToken();
       const current = await this.getInstance(instanceName);
       if (!current) throw new Error(`Primary Cloud SQL instance ${instanceName} is absent.`);
+      this.assertComponentScope(component, current);
       await this.patchInstance({
         token,
         instanceName,
@@ -964,9 +1163,11 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
       };
     }
     try {
+      this.assertComponentScope(component);
       const token = await this.getAccessToken();
       const primary = await this.getInstance(primaryName);
       if (!primary) throw new Error(`Primary Cloud SQL instance ${primaryName} is absent.`);
+      this.assertComponentScope(component, primary);
       const instanceName = this.sanitizeName(`${primaryName}-rr-${name}`);
       let replica = await this.getInstance(instanceName);
       if (replica) {
@@ -1042,6 +1243,7 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
       return { success: false, message: 'Cannot delete Cloud SQL read replica', error: 'Connection or primary instance identity is missing.' };
     }
     try {
+      this.assertComponentScope(component);
       const token = await this.getAccessToken();
       const replica = await this.getInstance(replicaBinding.externalId);
       if (!replica) {
@@ -1049,6 +1251,9 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
       }
       if (!this.isReplicaOf(replica, primaryName) || replica.settings?.userLabels?.['hypervibe-replica'] !== name) {
         throw new Error(`Refusing to delete ${replicaBinding.externalId}: its primary or Hypervibe ownership label does not match the reviewed replica.`);
+      }
+      if (replicaBinding.region && replica.region !== replicaBinding.region) {
+        throw new Error(`Refusing to delete ${replicaBinding.externalId}: it is in region ${replica.region ?? 'unknown'}, not bound region ${replicaBinding.region}.`);
       }
       const response = await fetch(
         `https://sqladmin.googleapis.com/v1/projects/${this.credentials.projectId}/instances/${encodeURIComponent(replicaBinding.externalId)}`,
@@ -1125,14 +1330,47 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
     const scope = rawScope && typeof rawScope === 'object' && !Array.isArray(rawScope)
       ? rawScope as Record<string, unknown>
       : undefined;
-    if (component.bindings.retainedCleanup === true && typeof scope?.projectId !== 'string') {
-      throw new Error(`Retained Cloud SQL cleanup target ${component.externalId ?? component.id} is missing its durable GCP project scope.`);
+    const instanceName = this.componentInstanceName(component);
+    const projectId = typeof scope?.projectId === 'string' && scope.projectId.trim().length > 0
+      ? scope.projectId
+      : undefined;
+    if (instanceName && !projectId) {
+      throw new Error(
+        `Cloud SQL binding ${instanceName} is missing its durable GCP project scope; re-import or re-plan the database before using it.`
+      );
     }
-    if (typeof scope?.projectId === 'string' && scope.projectId !== this.credentials.projectId) {
-      throw new Error(`Cloud SQL binding belongs to project ${scope.projectId}, not connected project ${this.credentials.projectId}.`);
+    if (projectId && projectId !== this.credentials.projectId) {
+      throw new Error(`Cloud SQL binding belongs to project ${projectId}, not connected project ${this.credentials.projectId}.`);
     }
     if (instance && typeof scope?.region === 'string' && instance.region !== scope.region) {
-      throw new Error(`Cloud SQL instance ${instance.name} is in region ${instance.region ?? 'unknown'}, not retained region ${scope.region}.`);
+      throw new Error(`Cloud SQL instance ${instance.name} is in region ${instance.region ?? 'unknown'}, not bound region ${scope.region}.`);
+    }
+  }
+
+  private assertConnectionNameScope(
+    connectionName: string,
+    instanceName: string | undefined,
+    component: Component
+  ): void {
+    if (!this.credentials) throw new Error('Not connected. Call connect() first.');
+    const parts = connectionName.split(':');
+    if (
+      parts.length !== 3
+      || parts[0] !== this.credentials.projectId
+      || (instanceName !== undefined && parts[2] !== instanceName)
+    ) {
+      throw new Error(
+        `Cloud SQL connection name ${connectionName} does not match connected project ${this.credentials.projectId}${instanceName ? ` and bound instance ${instanceName}` : ''}.`
+      );
+    }
+    const rawScope = component.bindings.providerScope;
+    const scope = rawScope && typeof rawScope === 'object' && !Array.isArray(rawScope)
+      ? rawScope as Record<string, unknown>
+      : undefined;
+    if (typeof scope?.region === 'string' && parts[1] !== scope.region) {
+      throw new Error(
+        `Cloud SQL connection name ${connectionName} is in region ${parts[1]}, not bound region ${scope.region}.`
+      );
     }
   }
 
@@ -1347,7 +1585,7 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
     const { projectId } = this.credentials;
 
     const response = await fetch(
-      `https://sqladmin.googleapis.com/v1/projects/${projectId}/instances/${instanceName}`,
+      `https://sqladmin.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/instances/${encodeURIComponent(instanceName)}`,
       {
         headers: { Authorization: `Bearer ${token}` },
       }
@@ -1359,7 +1597,34 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
       throw new Error(`Cloud SQL API error: ${response.status} ${text}`);
     }
 
-    return (await response.json()) as CloudSqlInstance;
+    const instance = (await response.json()) as CloudSqlInstance;
+    if (!instance.name || instance.name !== instanceName) {
+      throw new Error(
+        `Cloud SQL exact lookup for ${instanceName} returned ${instance.name || 'an instance without an identity'}.`
+      );
+    }
+    return instance;
+  }
+
+  private async recoverInstanceAfterCreateAttempt(
+    instanceName: string
+  ): Promise<CloudSqlInstance | null> {
+    const attempts = Math.max(
+      1,
+      Number(process.env.HYPERVIBE_CLOUDSQL_CREATE_RECOVERY_ATTEMPTS ?? 3) || 3
+    );
+    const delayMs = Math.max(
+      0,
+      Number(process.env.HYPERVIBE_CLOUDSQL_CREATE_RECOVERY_DELAY_MS ?? 1000) || 0
+    );
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const instance = await this.getInstance(instanceName);
+      if (instance) return instance;
+      if (attempt < attempts && delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+    return null;
   }
 
   private isBackupResourceName(name: string): boolean {
@@ -1409,8 +1674,10 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
     return value.split('/').filter(Boolean).at(-1) ?? value;
   }
 
-  private normalizedInstanceStatus(state?: string): string {
-    const statusMap: Record<string, string> = {
+  private normalizedInstanceStatus(
+    state?: string
+  ): 'running' | 'stopped' | 'provisioning' | 'error' | 'unknown' {
+    const statusMap: Record<string, 'running' | 'stopped' | 'provisioning' | 'error' | 'unknown'> = {
       RUNNABLE: 'running',
       PENDING_CREATE: 'provisioning',
       MAINTENANCE: 'running',
@@ -1418,7 +1685,7 @@ export class CloudSqlAdapter implements IDatabaseAdapter, IObservableDatabase, I
       SUSPENDED: 'stopped',
       PENDING_DELETE: 'stopped',
     };
-    return statusMap[state ?? ''] ?? (state ? state.toLowerCase() : 'unknown');
+    return statusMap[state ?? ''] ?? 'unknown';
   }
 
   private async ensureDatabaseByName(params: {
@@ -1539,8 +1806,14 @@ providerRegistry.register({
     category: 'database',
     credentialsSchema: CloudSqlCredentialsSchema,
     setupHelpUrl: 'https://console.cloud.google.com/iam-admin/serviceaccounts',
+    maturity: {
+      lifecycle: {
+        database: { status: 'ready-for-live' },
+      },
+    },
     lifecycle: {
       databaseEngines: ['postgres'],
+      databaseConnectivity: { compatibleHostingProviders: ['cloudrun'] },
       databaseResilience: {
         availabilityModes: ['zonal', 'regional'],
         backups: { maxRetainedBackups: 365, maxPitrRetentionDays: 7 },
@@ -1582,9 +1855,12 @@ providerRegistry.register({
     resources: ['backup'],
     destroy: (adapter, target) => (adapter as CloudSqlAdapter).destroyRetainedBackup(target),
   },
-  factory: (credentials) => {
+  databaseRuntime: {
+    project: projectCloudSqlDatabaseRuntime,
+  },
+  factory: async (credentials) => {
     const adapter = new CloudSqlAdapter();
-    adapter.connect(credentials);
+    await adapter.connect(credentials);
     return adapter;
   },
 });

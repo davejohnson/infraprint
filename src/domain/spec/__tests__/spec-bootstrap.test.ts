@@ -29,6 +29,34 @@ describe('spec bootstrap env vars', () => {
     expect(params.hostingRegion).toBe('us-east-1');
   });
 
+  it('preserves an explicit deploy branch for an arbitrary environment name', () => {
+    const params = specToBootstrapParams('preview-app', 'qa-7', {
+      hosting: { provider: 'railway' },
+      services: { web: { workloadKind: 'web' } },
+      deploy: { strategy: 'branch', trigger: 'native', branch: 'release/qa-7' },
+      email: { enabled: false },
+      envVars: {},
+    });
+
+    expect(params.deploy).toEqual({
+      strategy: 'branch',
+      trigger: 'native',
+      branch: 'release/qa-7',
+    });
+  });
+
+  it('does not give service bootstrap authority to provision a declared database', () => {
+    const params = specToBootstrapParams('database-app', 'staging', {
+      hosting: { provider: 'railway' },
+      services: { web: { workloadKind: 'web' } },
+      database: { provider: 'railway', engine: 'postgres' },
+      email: { enabled: false },
+      envVars: {},
+    });
+
+    expect(params).not.toHaveProperty('databaseProvider');
+  });
+
   it('merges deploy env files below spec envVars and explicit overrides above both', () => {
     const params = specToBootstrapParams('env-app', 'production', {
       hosting: { provider: 'railway' },
@@ -65,7 +93,7 @@ describe('spec bootstrap env vars', () => {
 });
 
 describe('service action bootstrap authority', () => {
-  it('cannot provision databases, attach domains, or deploy sibling workloads', () => {
+  it('cannot attach domains or deploy sibling workloads', () => {
     const scoped = scopeBootstrapParamsToService({
       projectName: 'safe-app',
       environmentName: 'staging',
@@ -76,7 +104,6 @@ describe('service action bootstrap authority', () => {
         worker: { workloadKind: 'worker' },
         cleanup: { workloadKind: 'cron', cronSchedule: '0 * * * *' },
       },
-      databaseProvider: 'railway',
       domain: 'example.com',
       envVarsByService: {
         web: { BUCKET: 'web' },
@@ -90,7 +117,6 @@ describe('service action bootstrap authority', () => {
       serviceConfig: { worker: { workloadKind: 'worker' } },
       envVarsByService: { worker: { BUCKET: 'worker' } },
     });
-    expect(scoped.databaseProvider).toBeUndefined();
     expect(scoped.domain).toBeUndefined();
     expect(scoped.crons).toBeUndefined();
   });

@@ -217,7 +217,7 @@ export class StripeProjectsAdapter implements ISecretManagerAdapter {
 
   async getSecret(referencePath: string, key?: string, version?: string): Promise<ResolvedSecret> {
     this.requireConnected();
-    if (version) {
+    if (version !== undefined) {
       throw new Error('Stripe Projects credential references do not support versions.');
     }
 
@@ -231,7 +231,7 @@ export class StripeProjectsAdapter implements ISecretManagerAdapter {
     const values = parseEnvFile(requireSafeOutputFile(projectRoot, output));
     const selected: Record<string, string> = {};
     const missing: string[] = [];
-    for (const envKey of keys) {
+    for (const envKey of key ? [key] : keys) {
       if (typeof values[envKey] !== 'string' || values[envKey].length === 0) {
         missing.push(envKey);
       } else {

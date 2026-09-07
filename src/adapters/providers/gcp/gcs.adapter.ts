@@ -448,6 +448,17 @@ export class GcsStorageAdapter implements IStorageAdapter {
         }
       );
       if (!response.ok) throw await responseError(response);
+      const created = await this.getBucket(externalId);
+      if (!created) {
+        throw new Error(`Google Cloud Storage bucket ${externalId} did not become observable after creation.`);
+      }
+      if (
+        created.labels?.[ENVIRONMENT_LABEL] !== environment.id
+        || created.labels?.[STORAGE_NAME_LABEL] !== name
+        || created.location?.toLowerCase() !== region.toLowerCase()
+      ) {
+        throw new Error(`Google Cloud Storage bucket ${externalId} did not converge to the reviewed labels and location.`);
+      }
       return {
         receipt: { success: true, message: `Created private Google Cloud Storage bucket "${externalId}"`, data: { created: true } },
         externalId,
@@ -558,7 +569,14 @@ export class GcsStorageAdapter implements IStorageAdapter {
     const response = await this.authorized(`${STORAGE_API}/storage/v1/b/${encodeURIComponent(name)}`);
     if (response.status === 404) return null;
     if (!response.ok) throw await responseError(response);
-    return response.json() as Promise<GcsBucket>;
+    const bucket = await response.json() as GcsBucket;
+    if (!bucket.name) {
+      throw new Error(`Google Cloud Storage returned an invalid bucket response for ${name}; absence was not confirmed.`);
+    }
+    if (bucket.name !== name) {
+      throw new Error(`Google Cloud Storage returned bucket ${bucket.name} for exact bucket lookup ${name}.`);
+    }
+    return bucket;
   }
 
   private async usage(bucket: string): Promise<{ objectCount: number; sizeBytes: number }> {
@@ -586,10 +604,15 @@ providerRegistry.register({
       ],
     },
     connectionAliases: ['cloudrun'],
+    maturity: {
+      lifecycle: {
+        storage: { status: 'ready-for-live' },
+      },
+    },
   },
-  factory: (credentials) => {
+  factory: async (credentials) => {
     const adapter = new GcsStorageAdapter();
-    void adapter.connect(credentials);
+    await adapter.connect(credentials);
     return adapter;
   },
   inspection: {

@@ -15,7 +15,7 @@ import { AppStoreConnectAdapter } from '../../adapters/providers/appstoreconnect
 import { GitHubAdapter } from '../../adapters/providers/github/github.adapter.js';
 import { ProjectRepository } from '../../adapters/db/repositories/project.repository.js';
 import { SpecStore } from '../../domain/spec/spec.store.js';
-import { createToolContext } from '../context.js';
+import { createToolContext } from '../../application/context.js';
 import { registerHvAppstoreTools } from '../hv-appstore.tools.js';
 
 let tempDir: string;
@@ -176,6 +176,35 @@ describe('hv_appstore_status', () => {
     await t.close();
   });
 
+  it('hard-bounds build and tester sections when the adapter over-returns', async () => {
+    seedConnection();
+    vi.spyOn(AppStoreConnectAdapter.prototype, 'findAppByBundleId').mockResolvedValue(APP);
+    const listBuilds = vi.spyOn(AppStoreConnectAdapter.prototype, 'listBuilds')
+      .mockResolvedValue([
+        BUILD,
+        { ...BUILD, id: 'build-2', buildNumber: '43' },
+      ]);
+    const listBetaTesters = vi.spyOn(AppStoreConnectAdapter.prototype, 'listBetaTesters')
+      .mockResolvedValue([
+        { id: 'tester-1', email: 'one@example.com' },
+        { id: 'tester-2', email: 'two@example.com' },
+      ]);
+    const t = await makeClient();
+
+    const status = await t.call('hv_appstore_status', {
+      appIdentifier: 'com.example.app',
+      include: ['builds', 'testers'],
+      limit: 1,
+    });
+
+    expect(status.ok).toBe(true);
+    expect(status.data.builds).toHaveLength(1);
+    expect(status.data.testers).toHaveLength(1);
+    expect(listBuilds).toHaveBeenCalledWith({ appId: APP.id, limit: 1 });
+    expect(listBetaTesters).toHaveBeenCalledWith({ appId: APP.id, limit: 1 });
+    await t.close();
+  });
+
   it('warns when readiness and pagination options do not apply to selected sections', async () => {
     seedConnection();
     vi.spyOn(AppStoreConnectAdapter.prototype, 'findAppByBundleId').mockResolvedValue(APP);
@@ -194,6 +223,23 @@ describe('hv_appstore_status', () => {
     expect(status.warnings).toEqual([
       'Ignored options for hv_appstore_status include=["groups"]: locale, screenshotDisplayType, limit. The requested read still completed.',
     ]);
+    await t.close();
+  });
+
+  it('uses iOS as the default readiness platform', async () => {
+    seedConnection();
+    vi.spyOn(AppStoreConnectAdapter.prototype, 'findAppByBundleId').mockResolvedValue(APP);
+    const getEditableVersion = vi.spyOn(AppStoreConnectAdapter.prototype, 'getEditableAppStoreVersion')
+      .mockResolvedValue(null);
+    const t = await makeClient();
+
+    const status = await t.call('hv_appstore_status', {
+      appIdentifier: 'com.example.app',
+      include: ['readiness'],
+    });
+
+    expect(status.ok).toBe(true);
+    expect(getEditableVersion).toHaveBeenCalledWith('app-1', 'IOS');
     await t.close();
   });
 
@@ -221,8 +267,9 @@ const SUBMIT_INPUT = {
 describe('hv_appstore_submit', () => {
   function stubSubmittableVersion() {
     vi.spyOn(AppStoreConnectAdapter.prototype, 'findAppByBundleId').mockResolvedValue(APP);
-    vi.spyOn(AppStoreConnectAdapter.prototype, 'getEditableAppStoreVersion').mockResolvedValue(VERSION);
+    const getEditableVersion = vi.spyOn(AppStoreConnectAdapter.prototype, 'getEditableAppStoreVersion').mockResolvedValue(VERSION);
     vi.spyOn(AppStoreConnectAdapter.prototype, 'getAppStoreVersionBuild').mockResolvedValue({ id: 'build-1', version: '42' });
+    return getEditableVersion;
   }
 
   it('returns project-scoped GitHub setup when release evidence cannot be read', async () => {
@@ -261,7 +308,7 @@ describe('hv_appstore_submit', () => {
 
   it('creates a review submission, adds the version as an item, and submits it', async () => {
     seedConnection();
-    stubSubmittableVersion();
+    const getEditableVersion = stubSubmittableVersion();
     vi.spyOn(AppStoreConnectAdapter.prototype, 'listReviewSubmissions').mockResolvedValue([]);
     const create = vi.spyOn(AppStoreConnectAdapter.prototype, 'createReviewSubmission')
       .mockResolvedValue({ id: 'rs-1', state: 'READY_FOR_REVIEW', platform: 'IOS' });
@@ -272,6 +319,7 @@ describe('hv_appstore_submit', () => {
 
     const res = await t.call('hv_appstore_submit', SUBMIT_INPUT);
     expect(res.ok).toBe(true);
+    expect(getEditableVersion).toHaveBeenCalledWith('app-1', 'IOS');
     expect(create).toHaveBeenCalledWith('app-1', 'IOS');
     expect(addItem).toHaveBeenCalledWith('rs-1', 'ver-1');
     expect(submit).toHaveBeenCalledWith('rs-1');

@@ -645,6 +645,7 @@ export class AzureBlobStorageAdapter implements IStorageAdapter {
         plane.destroy();
       }
       await this.controlPlane().deleteAccount(account);
+      await this.waitForAccountAbsence(identity.account);
       return { success: true, message: `Deleted Azure Blob storage account "${account.name}" and all objects` };
     } catch (error) {
       return { success: false, message: `Failed to delete Azure Blob storage "${externalId}"`, error: errorMessage(error) };
@@ -687,6 +688,40 @@ export class AzureBlobStorageAdapter implements IStorageAdapter {
     if (!account) throw new Error(`Azure Storage account ${name} was not found.`);
     return account;
   }
+
+  private async waitForAccountAbsence(name: string): Promise<void> {
+    const attempts = this.positiveIntegerEnv(
+      'HYPERVIBE_AZURE_BLOB_DELETE_ATTEMPTS',
+      180
+    );
+    const interval = this.nonNegativeIntegerEnv(
+      'HYPERVIBE_AZURE_BLOB_POLL_INTERVAL_MS',
+      5000
+    );
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      if (!(await this.controlPlane().getAccount(name))) return;
+      if (attempt < attempts) await this.delay(interval);
+    }
+    throw new Error(
+      `Azure Storage account ${name} remained observable after ${attempts} deletion checks.`
+    );
+  }
+
+  private positiveIntegerEnv(name: string, fallback: number): number {
+    const value = Number(process.env[name] ?? fallback);
+    return Number.isInteger(value) && value > 0 ? value : fallback;
+  }
+
+  private nonNegativeIntegerEnv(name: string, fallback: number): number {
+    const value = Number(process.env[name] ?? fallback);
+    return Number.isInteger(value) && value >= 0 ? value : fallback;
+  }
+
+  private async delay(ms: number): Promise<void> {
+    if (ms > 0) {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+    }
+  }
 }
 
 providerRegistry.register({
@@ -706,10 +741,15 @@ providerRegistry.register({
       ],
     },
     connectionAliases: ['azure-container-apps'],
+    maturity: {
+      lifecycle: {
+        storage: { status: 'ready-for-live' },
+      },
+    },
   },
-  factory: (credentials) => {
+  factory: async (credentials) => {
     const adapter = new AzureBlobStorageAdapter();
-    void adapter.connect(credentials);
+    await adapter.connect(credentials);
     return adapter;
   },
   inspection: {

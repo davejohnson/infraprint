@@ -72,11 +72,11 @@ export function registerHvDevxTools(commands: CommandRegistrar, ctx: CommandCont
           throw new HvError('VALIDATION', 'Choose either auditAction or resourceType/resourceId for action="audit", not both.');
         }
         const max = limit ?? 50;
-        const events = resourceType && resourceId
+        const events = (resourceType && resourceId
           ? ctx.repos.audit.findByResource(resourceType, resourceId, max)
           : auditAction
             ? ctx.repos.audit.findByAction(auditAction, max)
-            : ctx.repos.audit.findRecent(max);
+            : ctx.repos.audit.findRecent(max)).slice(0, max);
         return commandSuccess({
           count: events.length,
           events: events.map((e) => ({
@@ -178,7 +178,9 @@ export function registerHvDevxTools(commands: CommandRegistrar, ctx: CommandCont
         runs = ctx.repos.runs.findRecent(max);
       }
 
-      const enriched = runs.map(describeRun);
+      // SQL LIMIT is the efficient path, but the shared command contract is
+      // still responsible for its own hard output bound.
+      const enriched = runs.slice(0, max).map(describeRun);
       const latest = enriched[0] ?? null;
       return commandSuccess(
         { count: enriched.length, latest, runs: enriched },

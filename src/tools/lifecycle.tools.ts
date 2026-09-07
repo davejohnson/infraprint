@@ -33,10 +33,10 @@ export function registerLifecycleTools(commands: CommandRegistrar, ctx: CommandC
 
   commands.register(
     'hv_import',
-    'Import provider identity into Hypervibe. mode="adopt" adopts an existing provider project through a provider-declared driver. Cleanup modes retain an exact inventoried hosting boundary, database, or provider-declared resource so isolated plan/apply can delete only that identity. Never creates provider infrastructure.',
+    'Import provider identity into Hypervibe. mode="adopt" adopts an existing provider project through a provider-declared driver. Cleanup modes retain an exact inventoried hosting boundary, database, cache, or provider-declared resource so isolated plan/apply can delete only that identity. Never creates provider infrastructure.',
     {
       provider: z.string().trim().min(1).describe('Registered source provider. Providers without a tested adoption driver return UNSUPPORTED.'),
-      mode: z.enum(['adopt', 'retained-cleanup', 'retained-database-cleanup', 'retained-resource-cleanup']).optional().describe('Default adopt. Cleanup modes retain an exact abandoned hosting, database, or provider-declared resource identity for later confirmation-gated plan/apply.'),
+      mode: z.enum(['adopt', 'retained-cleanup', 'retained-database-cleanup', 'retained-cache-cleanup', 'retained-resource-cleanup']).optional().describe('Default adopt. Cleanup modes retain an exact abandoned hosting, database, cache, or provider-declared resource identity for later confirmation-gated plan/apply.'),
       resource: z.string().trim().min(1).optional().describe('Exact provider-declared resource class for retained-resource-cleanup, as advertised by hv_inspect discovery.'),
       project: projectField.optional().describe('Current Hypervibe project; required for every retained cleanup mode.'),
       env: envField.optional().describe('Current Hypervibe environment; required for every retained cleanup mode.'),

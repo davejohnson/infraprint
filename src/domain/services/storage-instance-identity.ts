@@ -26,7 +26,10 @@ export function withStorageInstanceScopes(
   return Object.fromEntries(Object.entries(storage).map(([name, value]) => {
     const binding = asRecord(value);
     const provider = typeof binding?.provider === 'string' ? binding.provider : undefined;
-    const instanceScope = provider ? storageContext(providerContexts[provider]) : undefined;
+    // A stored scope is part of the resource identity. A later connection or
+    // provider-context change must not silently retarget the same externalId.
+    const instanceScope = storageContext(binding?.instanceScope)
+      ?? (provider ? storageContext(providerContexts[provider]) : undefined);
     return [name, binding && instanceScope ? { ...binding, instanceScope } : value];
   }));
 }

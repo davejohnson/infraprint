@@ -13,6 +13,7 @@ import { assessSendGridScopes } from '../../../adapters/providers/sendgrid/sendg
 import type { Environment } from '../../../domain/entities/environment.entity.js';
 import type { Service } from '../../../domain/entities/service.entity.js';
 import type { IHostingAdapter } from '../../../domain/ports/hosting.port.js';
+import type { IProviderEnvironmentVariablesAdapter } from '../../../domain/ports/provider-env-vars.port.js';
 import { getSendGridAdapter, sendGridSetupReady, sendGridPermissionPayload } from '../sendgrid-ops.service.js';
 import { getProjectScopeHints } from '../project-scope.js';
 import {
@@ -81,9 +82,7 @@ describe('hosting env var tools', () => {
   function stubCloudRunHostingAdapter(varsByService = new Map<string, Record<string, string>>()) {
     const setEnvCalls: Array<{ environment: Environment; service: Service; vars: Record<string, string> }> = [];
     const deleteEnvCalls: Array<{ environment: Environment; service: Service; keys: string[] }> = [];
-    const adapter: IHostingAdapter & {
-      getServiceVariables: (environment: Environment, serviceName: string) => Promise<Record<string, string>>;
-    } = {
+    const adapter: IHostingAdapter & IProviderEnvironmentVariablesAdapter = {
       name: 'cloudrun',
       capabilities: {
         supportedBuilders: ['dockerfile'],
@@ -133,8 +132,8 @@ describe('hosting env var tools', () => {
       async getDeployStatus() {
         return { status: 'deployed' };
       },
-      async getServiceVariables(_environment, serviceName) {
-        return varsByService.get(serviceName) ?? {};
+      async readProviderEnvironmentVariables({ service }) {
+        return { success: true, variables: varsByService.get(service.name) ?? {} };
       },
     };
 
@@ -143,7 +142,7 @@ describe('hosting env var tools', () => {
       adapter: adapter as never,
     });
 
-    return { setEnvCalls, deleteEnvCalls, varsByService };
+    return { adapter, setEnvCalls, deleteEnvCalls, varsByService };
   }
 
   function stubSendGridScopes(scopes: string[]) {
@@ -340,5 +339,22 @@ describe('hosting env var tools', () => {
         PUBLIC_VALUE: 'visible',
       });
     }
+  });
+
+  it('preserves a provider-owned binding failure as a value-free read result', async () => {
+    const { project, environment, service } = await setupCloudRunProject();
+    const { adapter } = stubCloudRunHostingAdapter();
+    vi.spyOn(adapter, 'readProviderEnvironmentVariables').mockResolvedValue({
+      success: false,
+      error: 'The exact service binding is incomplete',
+    });
+
+    const result = await readHostingEnvVars({ project, environment, service });
+
+    expect(result).toEqual({
+      success: false,
+      provider: 'cloudrun',
+      error: 'The exact service binding is incomplete',
+    });
   });
 });

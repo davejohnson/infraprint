@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { TwilioAdapter } from '../twilio.adapter.js';
+import { providerRegistry } from '../../../../domain/registry/provider.registry.js';
 
 const ACCOUNT_SID = `AC${'a'.repeat(32)}`;
 const API_KEY_SID = `SK${'b'.repeat(32)}`;
@@ -115,5 +116,23 @@ describe('TwilioAdapter', () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(response({ services: [{ sid: SERVICE_SID }] }));
 
     await expect(adapter().listMessagingServices()).rejects.toThrow();
+  });
+
+  it('reports an exact missing friendly name as absent with a validated empty collection', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(response({ services: [messagingService()] }));
+    const inspection = providerRegistry.get('twilio')!.inspection!;
+
+    await expect(inspection.inspect(adapter(), {
+      resource: 'messaging-service',
+      name: 'missing-service',
+      limit: 25,
+    })).resolves.toMatchObject({
+      observation: 'absent',
+      name: 'missing-service',
+      services: [],
+      truncated: false,
+      partial: false,
+    });
+    expect(inspection.selectors['messaging-service']?.collectionKey).toBe('services');
   });
 });

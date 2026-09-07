@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Component } from '../../../../domain/entities/component.entity.js';
 import type { Environment } from '../../../../domain/entities/environment.entity.js';
 import { runMockDatabaseLifecycleContract } from '../../__tests__/database-lifecycle.contract.js';
+import { FlyClient } from '../fly.client.js';
 import { FlyDatabaseAdapter } from '../fly-database.adapter.js';
 import type {
   FlyWireGuardConnectorConfig,
@@ -217,6 +218,16 @@ describe('FlyDatabaseAdapter', () => {
     );
   });
 
+  it('rejects credentials returned for a different PostgreSQL user identity', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => json({
+      data: { username: 'some_other_user', password: 'database-secret' },
+    })));
+    const client = new FlyClient('flyv1-test-token', 'hypervibe-test');
+
+    await expect(client.getPostgresUserCredentials('pg-cluster-1', 'hypervibe_app'))
+      .rejects.toThrow('exact PostgreSQL user hypervibe_app');
+  });
+
   it('provisions a ready cluster, logical database, and dedicated user without leaking credentials in receipts', async () => {
     vi.stubEnv('HYPERVIBE_FLY_DATABASE_READY_ATTEMPTS', '3');
     vi.stubEnv('HYPERVIBE_FLY_DATABASE_READY_DELAY_MS', '0');
@@ -312,6 +323,9 @@ describe('FlyDatabaseAdapter', () => {
     expect(clusterReads).toBeGreaterThan(0);
     expect(result.component.externalId).toBe('pg-cluster-1');
     expect(result.component.bindings.organizationSlug).toBe('hypervibe-test');
+    expect(result.component.bindings.providerScope).toEqual({
+      organizationSlug: 'hypervibe-test',
+    });
     expect(result.receipt.data).toMatchObject({
       clusterId: 'pg-cluster-1',
       organizationSlug: 'hypervibe-test',
@@ -361,6 +375,105 @@ describe('FlyDatabaseAdapter', () => {
       externalId: 'pg-cluster-1',
       providerScope: { organizationSlug: 'hypervibe-test' },
     });
+  });
+
+  it('retains but does not delete a provider-acknowledged ID with a mismatched name', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname === '/v1/postgres' && method === 'GET') {
+        return json({ data: [] });
+      }
+      if (url.pathname === '/v1/postgres' && method === 'POST') {
+        return json({
+          data: {
+            id: 'unrelated-cluster-id',
+            name: 'unrelated-cluster',
+            organization: { slug: 'hypervibe-test' },
+            region: 'iad',
+            plan: 'basic',
+            status: 'ready',
+          },
+        }, 201);
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connected();
+
+    const result = await adapter.provision('postgres', environment(), {
+      resourceName: 'production-postgres',
+    });
+
+    expect(result.receipt.success).toBe(false);
+    expect(result.receipt.error).toContain('different cluster identity');
+    expect(result.component).toMatchObject({
+      externalId: 'unrelated-cluster-id',
+      bindings: {
+        provider: 'fly',
+        instanceId: 'unrelated-cluster-id',
+        providerScope: { organizationSlug: 'hypervibe-test' },
+      },
+    });
+    expect(result.receipt.data).toMatchObject({
+      clusterId: 'unrelated-cluster-id',
+      cleanupRequired: true,
+    });
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
+  });
+
+  it('rolls back a created cluster whose observed region does not match the request', async () => {
+    vi.stubEnv('HYPERVIBE_FLY_DATABASE_DELETE_DELAY_MS', '0');
+    let deleted = false;
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname === '/v1/postgres' && method === 'GET') {
+        return json({ data: [] });
+      }
+      if (url.pathname === '/v1/postgres' && method === 'POST') {
+        return json({
+          data: {
+            id: 'pg-cluster-1',
+            name: 'production-postgres',
+            organization: { slug: 'hypervibe-test' },
+            region: 'yyz',
+            plan: 'basic',
+            status: 'creating',
+          },
+        }, 201);
+      }
+      if (url.pathname === '/v1/postgres/pg-cluster-1' && method === 'GET') {
+        if (deleted) return json({ error: 'not found' }, 404);
+        return json({
+          data: {
+            id: 'pg-cluster-1',
+            name: 'production-postgres',
+            organization: { slug: 'hypervibe-test' },
+            region: 'iad',
+            plan: 'basic',
+            status: 'ready',
+          },
+        });
+      }
+      if (url.pathname === '/v1/postgres/pg-cluster-1' && method === 'DELETE') {
+        deleted = true;
+        return new Response(null, { status: 202 });
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connected();
+
+    const result = await adapter.provision('postgres', environment(), {
+      resourceName: 'production-postgres',
+      region: 'yyz',
+    });
+
+    expect(result.receipt.success).toBe(false);
+    expect(result.receipt.error).toContain('did not converge');
+    expect(result.receipt.data).toMatchObject({ rolledBack: true, cleanupRequired: false });
+    expect(deleted).toBe(true);
   });
 
   it('accepts the documented capitalized Performance plan identifier', async () => {
@@ -454,6 +567,125 @@ describe('FlyDatabaseAdapter', () => {
     expect(result.component.externalId).toBeNull();
     expect(deleted).toBe(true);
     expect(clusterReads).toBeGreaterThanOrEqual(3);
+  });
+
+  it('recovers a unique created cluster after the create transport loses its response', async () => {
+    vi.stubEnv('HYPERVIBE_FLY_DATABASE_CREATE_RECOVERY_ATTEMPTS', '2');
+    vi.stubEnv('HYPERVIBE_FLY_DATABASE_CREATE_RECOVERY_DELAY_MS', '0');
+    let listReads = 0;
+    const recovered = {
+      id: 'pg-cluster-recovered',
+      name: 'production-postgres',
+      organization: { slug: 'hypervibe-test' },
+      region: 'iad',
+      plan: 'basic',
+      status: 'creating',
+    };
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname === '/v1/postgres' && method === 'GET') {
+        listReads += 1;
+        return json({ data: listReads < 3 ? [] : [recovered] });
+      }
+      if (url.pathname === '/v1/postgres' && method === 'POST') {
+        throw new Error('connection closed after request transmission');
+      }
+      if (url.pathname === '/v1/postgres/pg-cluster-recovered' && method === 'GET') {
+        return json({ data: recovered });
+      }
+      if (url.pathname === '/v1/postgres/pg-cluster-recovered' && method === 'DELETE') {
+        return json({ error: 'control plane unavailable' }, 503);
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connected();
+
+    const result = await adapter.provision('postgres', environment(), {
+      resourceName: 'production-postgres',
+    });
+
+    expect(result.receipt).toMatchObject({
+      success: false,
+      data: { clusterId: 'pg-cluster-recovered', cleanupRequired: true },
+    });
+    expect(result.component).toMatchObject({
+      externalId: 'pg-cluster-recovered',
+      bindings: {
+        provider: 'fly',
+        providerScope: { organizationSlug: 'hypervibe-test' },
+      },
+    });
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+  });
+
+  it.each([
+    ['transport loss', () => { throw new Error('connection closed after request transmission'); }],
+    ['HTTP 408', () => json({ error: 'request timeout' }, 408)],
+  ])('retains an unresolved exact-name blocker when %s stays invisible', async (_label, createResult) => {
+    vi.stubEnv('HYPERVIBE_FLY_DATABASE_CREATE_RECOVERY_ATTEMPTS', '1');
+    vi.stubEnv('HYPERVIBE_FLY_DATABASE_CREATE_RECOVERY_DELAY_MS', '0');
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname === '/v1/postgres' && method === 'GET') return json({ data: [] });
+      if (url.pathname === '/v1/postgres' && method === 'POST') return createResult();
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connected();
+
+    const result = await adapter.provision('postgres', environment(), {
+      resourceName: 'production-postgres',
+      region: 'iad',
+    });
+
+    expect(result.receipt).toMatchObject({
+      success: false,
+      data: {
+        mutationAttempted: true,
+        resourceCreated: 'unknown',
+        unresolvedCreateRetained: true,
+      },
+    });
+    expect(result.component).toMatchObject({
+      externalId: null,
+      bindings: {
+        provider: 'fly',
+        providerScope: { organizationSlug: 'hypervibe-test' },
+        unresolvedMutation: {
+          resourceKind: 'database',
+          operation: 'create',
+          resourceName: 'production-postgres',
+          providerScope: { organizationSlug: 'hypervibe-test' },
+        },
+      },
+    });
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+  });
+
+  it('does not retain an unresolved blocker after a definitive create rejection', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname === '/v1/postgres' && method === 'GET') return json({ data: [] });
+      if (url.pathname === '/v1/postgres' && method === 'POST') {
+        return json({ error: 'invalid plan' }, 422);
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connected();
+
+    const result = await adapter.provision('postgres', environment(), {
+      resourceName: 'production-postgres',
+    });
+
+    expect(result.receipt.success).toBe(false);
+    expect(result.component.externalId).toBeNull();
+    expect(result.component.bindings).not.toHaveProperty('unresolvedMutation');
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'GET')).toHaveLength(1);
   });
 
   it('waits for provider-confirmed terminal absence before reporting deletion success', async () => {

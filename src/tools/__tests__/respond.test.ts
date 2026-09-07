@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { toolSuccess, toolError, wrapHandler, HvError, type ToolEnvelope } from '../respond.js';
+import {
+  toolSuccess,
+  toolError,
+  wrapHandler,
+  HvError,
+  type ToolEnvelope,
+} from '../../application/results.js';
 import { toMcpToolResponse } from '../../interfaces/mcp/adapter.js';
 
 function parse(response: ToolEnvelope): ToolEnvelope {
@@ -40,6 +46,32 @@ describe('toolSuccess', () => {
       nested: {
         connectionUrl: '[redacted]',
         message: 'failed for postgresql://[redacted]@db.example.com:5432/app using [redacted]',
+      },
+    });
+  });
+
+  it('does not let an existing mask disable redaction of another secret', () => {
+    const githubToken = 'ghp_abcdefghijklmnopqrstuvwxyz123456';
+    const body = parse(toolSuccess({
+      message: `GitHub masked one value as *** but exposed ${githubToken}`,
+      providerAuthentication: {
+        secretAccessKey: 'aws-secret-access-key',
+        sessionToken: 'aws-session-token',
+        apiKeySecret: 'twilio-api-key-secret',
+      },
+    }));
+
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain(githubToken);
+    expect(serialized).not.toContain('aws-secret-access-key');
+    expect(serialized).not.toContain('aws-session-token');
+    expect(serialized).not.toContain('twilio-api-key-secret');
+    expect(body.data).toMatchObject({
+      message: 'GitHub masked one value as *** but exposed [redacted]',
+      providerAuthentication: {
+        secretAccessKey: '[redacted]',
+        sessionToken: '[redacted]',
+        apiKeySecret: '[redacted]',
       },
     });
   });

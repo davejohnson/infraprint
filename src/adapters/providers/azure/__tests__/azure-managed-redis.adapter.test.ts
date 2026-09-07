@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { Component } from '../../../../domain/entities/component.entity.js';
 import type { Environment } from '../../../../domain/entities/environment.entity.js';
 import { AzureManagedRedisAdapter } from '../azure-managed-redis.adapter.js';
 
@@ -44,6 +45,7 @@ function cluster(
       resourceState: 'Running',
       hostName: `${CLUSTER_NAME}.canadacentral.redis.azure.net`,
       minimumTlsVersion: '1.2',
+      publicNetworkAccess: 'Enabled',
     },
     ...overrides,
   };
@@ -57,6 +59,7 @@ function database(): Record<string, unknown> {
       provisioningState: 'Succeeded',
       resourceState: 'Running',
       clientProtocol: 'Encrypted',
+      accessKeysAuthentication: 'Enabled',
       port: 10000,
       redisVersion: '7.4',
     },
@@ -68,7 +71,36 @@ function environment(): Environment {
     id: 'env-local',
     projectId: 'project-local',
     name: 'production',
-    platformBindings: {},
+    platformBindings: {
+      provider: 'azure-container-apps',
+      projectId: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+      environmentId: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/managedEnvironments/hv-production`,
+      services: {},
+    },
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+}
+
+function cacheComponent(
+  bindings: Record<string, unknown> = {}
+): Component {
+  return {
+    id: 'component',
+    environmentId: 'env-local',
+    type: 'redis',
+    bindings: {
+      provider: 'azure-managed-redis',
+      instanceId: CLUSTER_ID,
+      providerScope: {
+        subscriptionId: SUBSCRIPTION_ID,
+        resourceGroup: RESOURCE_GROUP,
+      },
+      connectionString: `rediss://:${PRIMARY_KEY}@${CLUSTER_NAME}.canadacentral.redis.azure.net:10000`,
+      password: PRIMARY_KEY,
+      ...bindings,
+    },
+    externalId: CLUSTER_ID,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
@@ -111,15 +143,57 @@ afterEach(() => {
 });
 
 describe('AzureManagedRedisAdapter', () => {
+  it('inspects an exact ARM id without a credential resource-group scope', async () => {
+    const paths: string[] = [];
+    installAzureFetch((url, method) => {
+      paths.push(`${method} ${url.pathname}`);
+      if (method === 'GET' && url.pathname.endsWith(`/redisEnterprise/${CLUSTER_NAME}`)) {
+        return jsonResponse(cluster());
+      }
+      throw new Error(`unexpected request: ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+
+    await expect(adapter.inspectCacheResources({
+      resource: 'cache',
+      id: CLUSTER_ID,
+      limit: 1,
+    })).resolves.toMatchObject({
+      observation: 'present',
+      caches: [{ id: CLUSTER_ID }],
+    });
+    expect(paths).toEqual([`GET ${CLUSTER_ID}`]);
+  });
+
+  it('rejects a malformed successful exact database observation', async () => {
+    installAzureFetch((url, method) => {
+      if (method === 'GET' && url.pathname.endsWith('/databases/default')) {
+        return jsonResponse({});
+      }
+      throw new Error(`unexpected request: ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+
+    await expect((adapter as any).client.getDatabase(CLUSTER_ID))
+      .rejects.toThrow('without an ID');
+  });
+
   it('inventories bounded caches with their full Azure scope', async () => {
     installAzureFetch((url, method) => {
       expect(method).toBe('GET');
+      if (url.pathname.endsWith(`/resourceGroups/${RESOURCE_GROUP}`)) {
+        return jsonResponse({ id: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}` });
+      }
       expect(url.pathname).toContain('/providers/Microsoft.Cache/redisEnterprise');
       return jsonResponse({ value: [cluster()] });
     });
     const adapter = await connected();
 
-    await expect(adapter.inspectCacheResources({ resource: 'cache', limit: 1 }))
+    await expect(adapter.inspectCacheResources({
+      resource: 'cache',
+      scope: RESOURCE_GROUP,
+      limit: 1,
+    }))
       .resolves.toMatchObject({
         observation: 'present',
         resource: 'cache',
@@ -135,6 +209,83 @@ describe('AzureManagedRedisAdapter', () => {
       });
   });
 
+  it('derives list scope from an exact Azure Container Apps binding', async () => {
+    const paths: string[] = [];
+    installAzureFetch((url, method) => {
+      paths.push(`${method} ${url.pathname}`);
+      if (method === 'GET' && url.pathname.endsWith(`/resourceGroups/${RESOURCE_GROUP}`)) {
+        return jsonResponse({ id: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}` });
+      }
+      if (method === 'GET' && url.pathname.endsWith('/redisEnterprise')) {
+        return jsonResponse({ value: [cluster()] });
+      }
+      throw new Error(`unexpected request: ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+
+    await expect(adapter.inspectCacheResources({
+      resource: 'cache',
+      name: CLUSTER_NAME,
+      binding: {
+        provider: 'azure-container-apps',
+        projectId: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+        environmentId: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/managedEnvironments/hv-production`,
+      },
+      limit: 1,
+    })).resolves.toMatchObject({
+      observation: 'present',
+      caches: [{ id: CLUSTER_ID }],
+    });
+    expect(paths).toEqual([
+      `GET /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+      `GET /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Cache/redisEnterprise`,
+    ]);
+  });
+
+  it('does not derive list scope from an undeclared hosting binding', async () => {
+    const fetchMock = installAzureFetch((url, method) => {
+      throw new Error(`unexpected request: ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+
+    await expect(adapter.inspectCacheResources({
+      resource: 'cache',
+      binding: {
+        provider: 'cloudrun',
+        projectId: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+      },
+      limit: 1,
+    })).rejects.toThrow(/explicit Azure resource-group scope or compatible Azure Container Apps/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('proves initial absence only through the deterministic ACA resource group', async () => {
+    const paths: string[] = [];
+    installAzureFetch((url, method) => {
+      paths.push(`${method} ${url.pathname}`);
+      return jsonResponse({ error: 'absent' }, 404);
+    });
+    const adapter = await connected();
+    adapter.configureTarget({ projectName: 'invoice-perfect' });
+    const unbound = environment();
+    unbound.platformBindings = {};
+
+    await expect(adapter.observeCache(unbound, null, {
+      projectName: 'invoice-perfect',
+      resourceName: CLUSTER_NAME,
+    })).resolves.toBeNull();
+    expect(paths).toHaveLength(1);
+    expect(paths[0]).toMatch(/^GET \/subscriptions\/.*\/resourceGroups\/hv-invoice-perfect-production-[0-9a-f]{8}$/);
+  });
+
+  it('rejects unsupported network placement instead of ignoring it', async () => {
+    const adapter = await connected();
+    expect(() => adapter.configureTarget({ network: 'default' }))
+      .toThrow(/does not support desired network/);
+    expect(() => adapter.configureTarget({ subnetwork: 'apps', tier: 'premium' }))
+      .toThrow(/subnetwork, tier/);
+  });
+
   it('creates an encrypted Redis database and keeps access keys out of receipts', async () => {
     const requests: Array<{
       method: string;
@@ -143,6 +294,12 @@ describe('AzureManagedRedisAdapter', () => {
     }> = [];
     installAzureFetch((url, method, body) => {
       requests.push({ method, pathname: url.pathname, body });
+      if (method === 'GET' && url.pathname.endsWith(`/resourceGroups/${RESOURCE_GROUP}`)) {
+        return jsonResponse({
+          id: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+          tags: { 'managed-by': 'hypervibe', 'hypervibe-environment-id': 'env-local' },
+        });
+      }
       if (method === 'GET' && url.pathname.endsWith('/redisEnterprise')) {
         return jsonResponse({ value: [] });
       }
@@ -189,13 +346,135 @@ describe('AzureManagedRedisAdapter', () => {
         port: 10000,
       },
     });
+    const createCluster = requests.find((request) =>
+      request.method === 'PUT'
+      && request.pathname.endsWith(`/redisEnterprise/${CLUSTER_NAME}`)
+    );
+    expect(createCluster?.body).toMatchObject({
+      location: 'canadacentral',
+      sku: { name: 'Balanced_B0' },
+      properties: {
+        minimumTlsVersion: '1.2',
+        publicNetworkAccess: 'Enabled',
+      },
+    });
     expect(JSON.stringify(result.receipt)).not.toContain(PRIMARY_KEY);
     expect(JSON.stringify(result.receipt)).not.toContain(CLIENT_SECRET);
     expect(JSON.stringify(result.receipt)).not.toContain('rediss://');
   });
 
+  it('updates only the exact bound cluster SKU and verifies the runtime contract', async () => {
+    const requests: Array<{ method: string; pathname: string; body: any }> = [];
+    let updated = false;
+    installAzureFetch((url, method, body) => {
+      requests.push({ method, pathname: url.pathname, body });
+      if (method === 'GET' && url.pathname.endsWith(`/resourceGroups/${RESOURCE_GROUP}`)) {
+        return jsonResponse({
+          id: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+          tags: { 'managed-by': 'hypervibe', 'hypervibe-environment-id': 'env-local' },
+        });
+      }
+      if (method === 'GET' && url.pathname.endsWith(`/redisEnterprise/${CLUSTER_NAME}`)) {
+        return jsonResponse(cluster({ sku: { name: updated ? 'Balanced_B1' : 'Balanced_B0' } }));
+      }
+      if (method === 'PATCH' && url.pathname.endsWith(`/redisEnterprise/${CLUSTER_NAME}`)) {
+        updated = true;
+        return accepted();
+      }
+      if (method === 'GET' && url.pathname.endsWith('/databases/default')) {
+        return jsonResponse(database());
+      }
+      throw new Error(`Unexpected ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+
+    const result = await adapter.provision('redis', environment(), {
+      resourceName: CLUSTER_NAME,
+      component: cacheComponent({ size: 'Balanced_B0', region: 'canadacentral' }),
+      region: 'canadacentral',
+      size: 'Balanced_B1',
+    });
+
+    expect(result.receipt).toMatchObject({ success: true, data: { sizeChanged: true } });
+    expect(result.component.bindings.size).toBe('Balanced_B1');
+    expect(requests.filter(({ method }) => method === 'PATCH')).toEqual([
+      expect.objectContaining({ body: { sku: { name: 'Balanced_B1' } } }),
+    ]);
+    expect(requests.some(({ method }) => method === 'PUT' || method === 'DELETE')).toBe(false);
+    expect(requests.some(({ pathname }) => pathname.endsWith('/redisEnterprise'))).toBe(false);
+    expect(JSON.stringify(result.receipt)).not.toContain(PRIMARY_KEY);
+  });
+
+  it('verifies an unchanged bound cluster without provider mutations', async () => {
+    const requests: Array<{ method: string; pathname: string }> = [];
+    installAzureFetch((url, method) => {
+      requests.push({ method, pathname: url.pathname });
+      if (method === 'GET' && url.pathname.endsWith(`/resourceGroups/${RESOURCE_GROUP}`)) {
+        return jsonResponse({
+          id: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+          tags: { 'managed-by': 'hypervibe', 'hypervibe-environment-id': 'env-local' },
+        });
+      }
+      if (method === 'GET' && url.pathname.endsWith(`/redisEnterprise/${CLUSTER_NAME}`)) {
+        return jsonResponse(cluster());
+      }
+      if (method === 'GET' && url.pathname.endsWith('/databases/default')) {
+        return jsonResponse(database());
+      }
+      throw new Error(`Unexpected ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+
+    const result = await adapter.provision('redis', environment(), {
+      resourceName: CLUSTER_NAME,
+      component: cacheComponent({ size: 'Balanced_B0', region: 'canadacentral' }),
+      region: 'canadacentral',
+      size: 'Balanced_B0',
+    });
+
+    expect(result.receipt).toMatchObject({ success: true, data: { sizeChanged: false } });
+    expect(requests.filter(({ method }) => ['PUT', 'PATCH', 'DELETE'].includes(method))).toEqual([]);
+    expect(requests.some(({ pathname }) => pathname.endsWith('/databases/default/listKeys'))).toBe(false);
+  });
+
+  it('blocks immutable region drift without creating or updating a cluster', async () => {
+    const requests: Array<{ method: string; pathname: string }> = [];
+    installAzureFetch((url, method) => {
+      requests.push({ method, pathname: url.pathname });
+      if (method === 'GET' && url.pathname.endsWith(`/resourceGroups/${RESOURCE_GROUP}`)) {
+        return jsonResponse({
+          id: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+          tags: { 'managed-by': 'hypervibe', 'hypervibe-environment-id': 'env-local' },
+        });
+      }
+      if (method === 'GET' && url.pathname.endsWith(`/redisEnterprise/${CLUSTER_NAME}`)) {
+        return jsonResponse(cluster());
+      }
+      throw new Error(`Unexpected ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+
+    const result = await adapter.provision('redis', environment(), {
+      component: cacheComponent(),
+      region: 'eastus',
+      size: 'Balanced_B0',
+    });
+
+    expect(result.receipt).toMatchObject({
+      success: false,
+      error: expect.stringContaining('Region is immutable'),
+    });
+    expect(requests.filter(({ method }) => ['PUT', 'PATCH', 'DELETE'].includes(method))).toEqual([]);
+  });
+
   it('blocks duplicate-name adoption without a mutation', async () => {
     const fetchMock = installAzureFetch((url, method) => {
+      if (method === 'GET' && url.pathname.endsWith(`/resourceGroups/${RESOURCE_GROUP}`)) {
+        return jsonResponse({
+          id: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+          tags: { 'managed-by': 'hypervibe', 'hypervibe-environment-id': 'env-local' },
+        });
+      }
       if (method === 'GET' && url.pathname.endsWith('/redisEnterprise')) {
         return jsonResponse({ value: [cluster()] });
       }
@@ -215,6 +494,12 @@ describe('AzureManagedRedisAdapter', () => {
 
   it('preserves cluster identity after an unknown create result', async () => {
     installAzureFetch((url, method) => {
+      if (method === 'GET' && url.pathname.endsWith(`/resourceGroups/${RESOURCE_GROUP}`)) {
+        return jsonResponse({
+          id: `/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}`,
+          tags: { 'managed-by': 'hypervibe', 'hypervibe-environment-id': 'env-local' },
+        });
+      }
       if (method === 'GET' && url.pathname.endsWith('/redisEnterprise')) {
         return jsonResponse({ value: [] });
       }
@@ -243,19 +528,14 @@ describe('AzureManagedRedisAdapter', () => {
       if (method === 'GET' && url.pathname.endsWith(`/redisEnterprise/${CLUSTER_NAME}`)) {
         return jsonResponse(cluster());
       }
+      if (method === 'GET' && url.pathname.endsWith('/databases/default')) {
+        return jsonResponse(database());
+      }
       if (url.pathname.endsWith('/redisEnterprise')) listCalled = true;
       throw new Error(`Unexpected ${method} ${url.pathname}`);
     });
     const adapter = await connected();
-    const component = {
-      id: 'component',
-      environmentId: 'env-local',
-      type: 'redis' as const,
-      bindings: { provider: 'azure-managed-redis' },
-      externalId: CLUSTER_ID,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
+    const component = cacheComponent();
 
     await expect(adapter.observeCache(
       environment(),
@@ -272,6 +552,78 @@ describe('AzureManagedRedisAdapter', () => {
       environment(),
       component
     )).rejects.toMatchObject({ status: 403 });
+  });
+
+  it('reports configurable placement drift so plan/apply can reconcile it', async () => {
+    installAzureFetch((url, method) => {
+      if (method === 'GET' && url.pathname.endsWith(`/redisEnterprise/${CLUSTER_NAME}`)) {
+        return jsonResponse(cluster({ location: 'eastus', sku: { name: 'Balanced_B1' } }));
+      }
+      if (method === 'GET' && url.pathname.endsWith('/databases/default')) {
+        return jsonResponse(database());
+      }
+      throw new Error(`Unexpected ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+    adapter.configureTarget({
+      projectName: 'invoice-perfect',
+      region: 'canadacentral',
+      size: 'Balanced_B0',
+    });
+
+    await expect(adapter.observeCache(
+      environment(),
+      cacheComponent()
+    )).resolves.toMatchObject({
+      externalId: CLUSTER_ID,
+      config: { region: 'eastus', size: 'Balanced_B1' },
+    });
+  });
+
+  it('rejects legacy exact-id bindings without durable provider scope', async () => {
+    const fetchMock = installAzureFetch((url, method) => {
+      throw new Error(`Unexpected ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+    const legacy = cacheComponent({ providerScope: undefined });
+
+    await expect(adapter.observeCache(environment(), legacy))
+      .rejects.toThrow(/missing its durable subscription\/resource-group provider scope/);
+    await expect(adapter.destroy(legacy)).resolves.toMatchObject({
+      success: false,
+      error: expect.stringMatching(/missing its durable subscription\/resource-group provider scope/),
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('blocks observation when TLS or public ACA connectivity drifts', async () => {
+    installAzureFetch((url, method) => {
+      if (method === 'GET' && url.pathname.endsWith(`/redisEnterprise/${CLUSTER_NAME}`)) {
+        return jsonResponse(cluster({
+          properties: {
+            ...(cluster().properties as Record<string, unknown>),
+            publicNetworkAccess: 'Disabled',
+          },
+        }));
+      }
+      throw new Error(`Unexpected ${method} ${url.pathname}`);
+    });
+    const adapter = await connected();
+    adapter.configureTarget({ projectName: 'invoice-perfect' });
+
+    await expect(adapter.observeCache(environment(), {
+      id: 'component',
+      environmentId: 'env-local',
+      type: 'redis',
+      bindings: {
+        provider: 'azure-managed-redis',
+        instanceId: CLUSTER_ID,
+        providerScope: { subscriptionId: SUBSCRIPTION_ID, resourceGroup: RESOURCE_GROUP },
+      },
+      externalId: CLUSTER_ID,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })).rejects.toThrow(/publicNetworkAccess Enabled/);
   });
 
   it('makes deletion idempotent and verifies terminal absence', async () => {
@@ -291,18 +643,7 @@ describe('AzureManagedRedisAdapter', () => {
       throw new Error(`Unexpected ${method} ${url.pathname}`);
     });
     const adapter = await connected();
-    const component = {
-      id: 'component',
-      environmentId: 'env-local',
-      type: 'redis' as const,
-      bindings: {
-        provider: 'azure-managed-redis',
-        instanceId: CLUSTER_ID,
-      },
-      externalId: CLUSTER_ID,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
+    const component = cacheComponent();
 
     await expect(adapter.destroy(component)).resolves.toMatchObject({
       success: true,

@@ -23,7 +23,7 @@ import { hashEnvValue, type ObservedState } from '../../domain/ports/observe.por
 import { buildBranchDeployWorkflow, resolveBranchDeployTargets } from '../../domain/services/github-ops.service.js';
 import { bootstrapActionResultFromSummary } from '../core.tools.js';
 import { applyDatabaseSeed } from '../../application/apply-plan.js';
-import { createToolContext } from '../context.js';
+import { createToolContext } from '../../application/context.js';
 import { SpecStore } from '../../domain/spec/spec.store.js';
 import { projectSpecSchema } from '../../domain/spec/spec.schema.js';
 import type { PlanAction } from '../../domain/plan/plan.types.js';
@@ -548,6 +548,97 @@ describe('hv_spec', () => {
     await t.close();
   });
 
+  it('rejects unsupported hosting workload kinds before creating project state', async () => {
+    const t = await makeClient();
+    const bad = await t.call('hv_spec', {
+      spec: {
+        project: 'unsupported-workload-app',
+        environments: {
+          staging: {
+            hosting: { provider: 'ecs' },
+            services: {
+              processor: { workloadKind: 'worker', startCommand: 'npm run worker' },
+            },
+          },
+        },
+      },
+    });
+
+    expect(bad).toMatchObject({
+      ok: false,
+      error: {
+        code: 'VALIDATION',
+        details: {
+          path: 'environments.staging.services.processor.workloadKind',
+          workloadKind: 'worker',
+        },
+      },
+    });
+    expect(bad.error.message).toContain('ecs hosting does not support workload kind "worker"');
+    expect(bad.hint).toContain('Supported workload kinds for ecs: web');
+    expect(new ProjectRepository().findByName('unsupported-workload-app')).toBeNull();
+    await t.close();
+  });
+
+  it('rejects application-managed queue constraints before project or provider mutation', async () => {
+    const t = await makeClient();
+    const adapterSpy = vi.spyOn(adapterFactory, 'getProviderAdapter');
+    const missingDatabase = await t.call('hv_spec', {
+      spec: {
+        project: 'postgres-queue-database-app',
+        environments: {
+          staging: {
+            hosting: { provider: 'railway' },
+            services: { jobs: { workloadKind: 'worker' } },
+            queues: { jobs: {} },
+          },
+        },
+      },
+    });
+    expect(missingDatabase).toMatchObject({
+      ok: false,
+      error: {
+        code: 'VALIDATION',
+        details: {
+          path: 'environments.staging.queues',
+          capability: 'queue',
+        },
+      },
+    });
+    expect(missingDatabase.error.message).toContain('require a declared PostgreSQL database');
+    expect(new ProjectRepository().findByName('postgres-queue-database-app')).toBeNull();
+
+    const bad = await t.call('hv_spec', {
+      spec: {
+        project: 'postgres-queue-option-app',
+        environments: {
+          staging: {
+            hosting: { provider: 'railway' },
+            database: { provider: 'railway' },
+            services: { jobs: { workloadKind: 'worker' } },
+            queues: { jobs: { ackDeadlineSeconds: 120 } },
+          },
+        },
+      },
+    });
+
+    expect(bad).toMatchObject({
+      ok: false,
+      error: {
+        code: 'VALIDATION',
+        details: {
+          path: 'environments.staging.queues.jobs.ackDeadlineSeconds',
+          capability: 'queue',
+        },
+      },
+    });
+    expect(bad.error.message).toContain('do not support ackDeadlineSeconds');
+    expect(bad.hint).toContain('provider-managed Pub/Sub queues');
+    expect(new ProjectRepository().findByName('postgres-queue-option-app')).toBeNull();
+    expect(adapterSpy).not.toHaveBeenCalled();
+    await t.close();
+  });
+
   it('requires confirmation before switching branch deploys to provider-native integrations', async () => {
     const t = await makeClient();
     await t.call('hv_spec', {
@@ -917,6 +1008,47 @@ describe('hv_plan / hv_status / hv_apply', () => {
     );
   }
 
+  it('rejects a stored unsupported workload spec before provider observation or planning', async () => {
+    const project = new ProjectRepository().create({ name: 'stored-unsupported-workload-app' });
+    new SpecStore().replace(project, projectSpecSchema.parse({
+      version: 1,
+      project: project.name,
+      environments: {
+        staging: {
+          hosting: { provider: 'vercel' },
+          services: {
+            scheduled: {
+              workloadKind: 'cron',
+              startCommand: 'npm run scheduled',
+              cronSchedule: '0 * * * *',
+            },
+          },
+        },
+      },
+    }));
+    const adapterSpy = vi.spyOn(adapterFactory, 'getProviderAdapter');
+    const t = await makeClient();
+
+    const plan = await t.call('hv_plan', {
+      project: project.name,
+      env: 'staging',
+    });
+
+    expect(plan).toMatchObject({
+      ok: false,
+      error: {
+        code: 'VALIDATION',
+        details: {
+          path: 'environments.staging.services.scheduled.workloadKind',
+          workloadKind: 'cron',
+        },
+      },
+    });
+    expect(adapterSpy).not.toHaveBeenCalled();
+    expect(new RunRepository().findByProjectId(project.id)).toEqual([]);
+    await t.close();
+  });
+
   it('plans creates for a fresh environment and blocks without connections', async () => {
     const t = await makeClient();
     await t.call('hv_spec', { spec: SPEC });
@@ -1119,6 +1251,46 @@ describe('hv_plan / hv_status / hv_apply', () => {
     await t.close();
   });
 
+  it('does not use a different Registrar search result to authorize a domain purchase', async () => {
+    const t = await makeClient();
+    await t.call('hv_spec', {
+      spec: {
+        project: 'domain-exact-candidate-app',
+        environments: {
+          production: {
+            hosting: { provider: 'railway' },
+            services: { web: { startCommand: 'npm start' } },
+            domain: 'requested-example.com',
+            domainRegistration: { provider: 'cloudflare', years: 1 },
+          },
+        },
+      },
+    });
+    verifyRailwayConnection();
+    verifyConnection('cloudflare', { apiToken: 'cfat_dns', accountId: 'acct-1', registrarApiToken: 'cfut_registrar' });
+    mockObserved(null);
+    vi.spyOn(CloudflareAdapter.prototype, 'findZoneByName').mockResolvedValue(null);
+    vi.spyOn(CloudflareAdapter.prototype, 'checkRegistrarDomains').mockResolvedValue([
+      {
+        name: 'different-example.com',
+        registrable: true,
+        tier: 'standard',
+        pricing: { currency: 'USD', registration_cost: '10.00', renewal_cost: '10.00' },
+      },
+    ]);
+
+    const plan = await t.call('hv_plan', { project: 'domain-exact-candidate-app', env: 'production' });
+
+    expect(plan.ok).toBe(true);
+    expect(plan.data.actions).not.toContainEqual(expect.objectContaining({
+      id: 'domain:requested-example.com:register',
+    }));
+    expect(plan.warnings).toContainEqual(expect.stringContaining(
+      'did not return an availability result for requested-example.com'
+    ));
+    await t.close();
+  });
+
   it('blocks Cloudflare domain registration early when only an account API token is connected', async () => {
     const t = await makeClient();
     await t.call('hv_spec', {
@@ -1199,7 +1371,10 @@ describe('hv_plan / hv_status / hv_apply', () => {
       warnings: [],
     });
     vi.spyOn(CloudflareAdapter.prototype, 'findZoneByName').mockResolvedValue(null);
-    vi.spyOn(CloudflareAdapter.prototype, 'checkRegistrarDomains').mockResolvedValue([
+    const checkRegistrarDomains = vi.spyOn(
+      CloudflareAdapter.prototype,
+      'checkRegistrarDomains'
+    ).mockResolvedValue([
       {
         name: 'apreskeys.com',
         registrable: true,
@@ -1226,9 +1401,32 @@ describe('hv_plan / hv_status / hv_apply', () => {
     expect(create).not.toHaveBeenCalled();
 
     const plan2 = await t.call('hv_plan', { project: 'domain-apply-app', env: 'production' });
-    const confirmed = await t.call('hv_apply', {
+    checkRegistrarDomains.mockResolvedValue([
+      {
+        name: 'apreskeys.com',
+        registrable: true,
+        tier: 'standard',
+        pricing: { currency: 'USD', registration_cost: '11.00', renewal_cost: '10.00' },
+      },
+    ]);
+    const staleTerms = await t.call('hv_apply', {
       project: 'domain-apply-app',
       planId: plan2.data.planId,
+      confirmActions: ['domain:apreskeys.com:register'],
+    });
+    expect(staleTerms.ok).toBe(true);
+    expect(staleTerms.data.applied).toBe(false);
+    expect(staleTerms.data.receipts).toContainEqual(expect.objectContaining({
+      actionId: 'domain:apreskeys.com:register',
+      status: 'blocked',
+      message: expect.stringContaining('terms'),
+    }));
+    expect(create).not.toHaveBeenCalled();
+
+    const plan3 = await t.call('hv_plan', { project: 'domain-apply-app', env: 'production' });
+    const confirmed = await t.call('hv_apply', {
+      project: 'domain-apply-app',
+      planId: plan3.data.planId,
       confirmActions: ['domain:apreskeys.com:register'],
     });
     expect(confirmed.ok).toBe(true);
@@ -2595,6 +2793,8 @@ describe('hv_plan / hv_status / hv_apply', () => {
       type: 'destroy',
       requiresConfirm: true,
     }));
+    expect(storedPlanAction(plan.data.planId, 'service:daily:destroy')?.metadata)
+      .toEqual({ externalId: 's-daily' });
     expect(plan.data.unmanaged).not.toContainEqual(expect.objectContaining({ kind: 'service', name: 'daily' }));
 
     const apply = await t.call('hv_apply', {
@@ -3280,6 +3480,22 @@ describe('hv_plan / hv_status / hv_apply', () => {
         },
       },
     });
+    const unresolved = new ComponentRepository().create({
+      environmentId: environment.id,
+      type: 'postgres',
+      externalId: null,
+      bindings: {
+        provider: 'cloudsql',
+        providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+        provisioningIncomplete: true,
+        unresolvedMutation: {
+          resourceKind: 'database',
+          operation: 'create',
+          resourceName: 'legacy-production-db',
+          providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+        },
+      },
+    });
     new ServiceRepository().create({ projectId: project.id, name: 'web', buildConfig: {}, envVarSpec: {} });
     const hostingObserved: ObservedState = {
       provider: 'railway',
@@ -3374,6 +3590,154 @@ describe('hv_plan / hv_status / hv_apply', () => {
     }));
     expect(destroy).toHaveBeenCalledOnce();
     expect(new EnvironmentRepository().findById(environment.id)!.platformBindings.previousDatabase).toBeUndefined();
+    expect(new ComponentRepository().findById(unresolved.id)).toBeNull();
+    await t.close();
+  });
+
+  it('deletes an exact retained cache only through isolated confirmed plan/apply and clears the matching unresolved marker', async () => {
+    const t = await makeClient();
+    await t.call('hv_spec', { spec: {
+      project: 'retained-cache-apply-app',
+      environments: { production: {
+        hosting: { provider: 'railway' },
+        services: { web: { startCommand: 'npm start' } },
+      } },
+    } });
+    verifyRailwayConnection();
+    verifyConnection('memorystore', { projectId: 'gcp-project', credentials: '{}' });
+    const project = new ProjectRepository().findByName('retained-cache-apply-app')!;
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'production',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'railway-project',
+        environmentId: 'railway-environment',
+        services: { web: { serviceId: 'railway-web' } },
+        previousCache: {
+          provider: 'memorystore',
+          externalId: 'projects/gcp-project/locations/us-west1/instances/legacy-cache',
+          engine: 'redis',
+          providerEngine: 'redis',
+          name: 'legacy-production-cache',
+          providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+        },
+      },
+    });
+    const unresolved = new ComponentRepository().create({
+      environmentId: environment.id,
+      type: 'redis',
+      externalId: null,
+      bindings: {
+        provider: 'memorystore',
+        providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+        provisioningIncomplete: true,
+        unresolvedMutation: {
+          resourceKind: 'cache',
+          operation: 'create',
+          resourceName: 'legacy-production-cache',
+          providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+        },
+      },
+    });
+    new ServiceRepository().create({ projectId: project.id, name: 'web', buildConfig: {}, envVarSpec: {} });
+    const hostingObserved: ObservedState = {
+      provider: 'railway',
+      observedAt: new Date().toISOString(),
+      projectExists: true,
+      projectId: 'railway-project',
+      environmentId: 'railway-environment',
+      services: [{
+        name: 'web', externalId: 'railway-web', workloadKind: 'web', customDomains: [],
+        config: { startCommand: 'npm start' }, sourceState: 'disconnected',
+        envVarKeys: [], envVarHashes: {}, status: 'running',
+      }],
+      databases: [],
+      caches: [],
+      partial: false,
+      warnings: [],
+    };
+    vi.spyOn(adapterFactory, 'getProviderAdapter').mockResolvedValue({
+      success: true,
+      adapter: {
+        name: 'railway',
+        capabilities: {
+          supportedBuilders: ['nixpacks'], supportedComponents: [], supportsAutoWiring: true,
+          supportsHealthChecks: true, supportsCronSchedule: true, supportsReleaseCommand: false,
+          supportsMultiEnvironment: true, managedTls: true, supportsObserve: true,
+        },
+        configureTarget: async () => {},
+        observe: async () => hostingObserved,
+      },
+    } as any);
+    let cachePresent = true;
+    const destroy = vi.fn(async (component: { externalId: string | null; bindings: Record<string, unknown> }) => {
+      expect(component.externalId).toBe('projects/gcp-project/locations/us-west1/instances/legacy-cache');
+      expect(component.bindings).toMatchObject({
+        retainedCleanup: true,
+        providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+      });
+      cachePresent = false;
+      return { success: true, message: 'deleted' };
+    });
+    vi.spyOn(adapterFactory, 'getCacheAdapter').mockResolvedValue({
+      success: true,
+      adapter: {
+        name: 'memorystore',
+        capabilities: {
+          supportedCaches: ['redis'], supportsTls: true, supportsHighAvailability: true,
+          supportsPersistence: true, serverlessOptimized: false,
+        },
+        connect: async () => {}, verify: async () => ({ success: true }), disconnect: async () => {},
+        provision: async () => { throw new Error('unused'); }, getConnectionUrl: async () => null,
+        observeCache: async () => cachePresent ? ({
+          provider: 'memorystore', engine: 'redis',
+          externalId: 'projects/gcp-project/locations/us-west1/instances/legacy-cache',
+          name: 'legacy-production-cache', status: 'running',
+          providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+        }) : null,
+        destroy,
+      },
+    });
+
+    const plan = await t.call('hv_plan', {
+      project: project.name,
+      env: environment.name,
+      scope: 'retained-cleanup',
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.data.actions).toEqual([expect.objectContaining({
+      id: 'cache:memorystore:retained-destroy',
+      dataBearing: true,
+      requiresConfirm: true,
+    })]);
+
+    const unconfirmed = await t.call('hv_apply', { project: project.name, planId: plan.data.planId });
+    expect(unconfirmed.ok).toBe(true);
+    expect(unconfirmed.data.receipts).toContainEqual(expect.objectContaining({
+      actionId: 'cache:memorystore:retained-destroy',
+      status: 'skipped_requires_confirm',
+    }));
+    expect(destroy).not.toHaveBeenCalled();
+
+    const confirmedPlan = await t.call('hv_plan', {
+      project: project.name,
+      env: environment.name,
+      scope: 'retained-cleanup',
+    });
+    const confirmed = await t.call('hv_apply', {
+      project: project.name,
+      planId: confirmedPlan.data.planId,
+      confirmActions: ['cache:memorystore:retained-destroy'],
+    });
+    expect(confirmed.ok).toBe(true);
+    expect(confirmed.data.receipts).toContainEqual(expect.objectContaining({
+      actionId: 'cache:memorystore:retained-destroy',
+      status: 'succeeded',
+    }));
+    expect(destroy).toHaveBeenCalledOnce();
+    expect(new EnvironmentRepository().findById(environment.id)!.platformBindings.previousCache).toBeUndefined();
+    expect(new ComponentRepository().findById(unresolved.id)).toBeNull();
     await t.close();
   });
 

@@ -4,7 +4,7 @@ import {
   providerRegistry,
   type ProviderInspectionRequest,
 } from '../../../domain/registry/provider.registry.js';
-import type { IDnsProvider, DnsZone, DnsRecord } from '../../../domain/ports/dns.port.js';
+import type { IDnsProvider, DnsRecord } from '../../../domain/ports/dns.port.js';
 import type {
   IEdgeMaintenanceAdapter,
   MaintenanceEdgeBinding,
@@ -14,6 +14,7 @@ import type {
   ILoadBalancerAdapter,
   LoadBalancerEnsureResult,
   LoadBalancerMonitor,
+  LoadBalancerOrigin,
   LoadBalancerPool,
   LoadBalancerScope,
   ManagedLoadBalancer,
@@ -26,6 +27,7 @@ const CLOUDFLARE_USER_TOKEN_URL = CLOUDFLARE_TOKEN_URLS.user;
 const CLOUDFLARE_ACCOUNT_TOKEN_URL = CLOUDFLARE_TOKEN_URLS.account;
 const CLOUDFLARE_DNS_PERMISSIONS = 'Zone > Zone > Read, Zone > Zone Settings > Read or Edit, and Zone > DNS > Edit/Write';
 const CLOUDFLARE_REGISTRAR_PERMISSIONS = 'Registrar write permissions on the target account';
+const CLOUDFLARE_PAGE_CAP = 1000;
 
 export interface CloudflareZone {
   id: string;
@@ -391,8 +393,10 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
     const response = await fetch(`${CLOUDFLARE_API_URL}${endpoint}`, options);
     const data = (await response.json()) as CloudflareResponse<T>;
 
-    if (!data.success) {
-      const errorMsg = data.errors.map((e) => e.message).join(', ');
+    if (!response.ok || data.success !== true) {
+      const errorMsg = Array.isArray(data.errors)
+        ? data.errors.map((error) => error.message).join(', ')
+        : '';
       throw new CloudflareApiError(
         `Cloudflare API error: ${errorMsg || `HTTP ${response.status}`}`,
         response.status
@@ -400,6 +404,108 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
     }
 
     return data;
+  }
+
+  /**
+   * A successful Cloudflare write response is only an acknowledgement. Keep
+   * the acknowledged id available to the caller, but do not mark the write
+   * verified until an exact read observes the requested configuration.
+   */
+  private async verifyLoadBalancerWrite<T>(params: {
+    label: string;
+    acknowledged: T;
+    get: () => Promise<T | null>;
+    matches: (observed: T) => boolean;
+  }): Promise<{ resource: T; verified: boolean; verificationError?: string }> {
+    const configuredAttempts = Number(
+      process.env.HYPERVIBE_CLOUDFLARE_LB_VERIFY_ATTEMPTS ?? 8
+    );
+    const attempts = Number.isInteger(configuredAttempts) && configuredAttempts > 0
+      ? configuredAttempts
+      : 8;
+    const configuredInterval = Number(
+      process.env.HYPERVIBE_CLOUDFLARE_LB_VERIFY_INTERVAL_MS ?? 500
+    );
+    const interval = Number.isInteger(configuredInterval) && configuredInterval >= 0
+      ? configuredInterval
+      : 500;
+    let lastError = `${params.label} was not observable after Cloudflare acknowledged the write.`;
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        const observed = await params.get();
+        if (observed && params.matches(observed)) {
+          return { resource: observed, verified: true };
+        }
+        lastError = observed
+          ? `${params.label} was observable, but its configuration had not converged.`
+          : `${params.label} was not yet observable after Cloudflare acknowledged the write.`;
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+      }
+      if (attempt < attempts && interval > 0) {
+        await new Promise((resolve) => setTimeout(resolve, interval));
+      }
+    }
+
+    return {
+      resource: params.acknowledged,
+      verified: false,
+      verificationError: lastError,
+    };
+  }
+
+  private loadBalancerCreateOutcomeMayBeUnknown(error: unknown): boolean {
+    // A concrete client-error response is provider acknowledgement that the
+    // request was rejected. Transport/parser failures and 5xx responses can
+    // occur after commit, so they require bounded identity recovery.
+    return !(error instanceof CloudflareApiError
+      && error.status !== undefined
+      && error.status >= 400
+      && error.status < 500);
+  }
+
+  private async recoverLoadBalancerCreateIdentity<T extends { id: string }>(params: {
+    label: string;
+    find: () => Promise<T[]>;
+  }): Promise<T | undefined> {
+    const configuredAttempts = Number(
+      process.env.HYPERVIBE_CLOUDFLARE_LB_VERIFY_ATTEMPTS ?? 8
+    );
+    const attempts = Number.isInteger(configuredAttempts) && configuredAttempts > 0
+      ? Math.min(configuredAttempts, 20)
+      : 8;
+    const configuredInterval = Number(
+      process.env.HYPERVIBE_CLOUDFLARE_LB_VERIFY_INTERVAL_MS ?? 500
+    );
+    const interval = Number.isInteger(configuredInterval) && configuredInterval >= 0
+      ? configuredInterval
+      : 500;
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const matches = await params.find();
+        if (matches.length > 1) {
+          throw new Error(
+            `Multiple ${params.label} resources appeared after create: ${matches.map((resource) => resource.id).join(', ')}.`
+          );
+        }
+        if (matches.length === 1) return matches[0];
+      } catch (error) {
+        lastError = error;
+      }
+      if (attempt < attempts - 1 && interval > 0) {
+        await new Promise((resolve) => setTimeout(resolve, interval));
+      }
+    }
+
+    if (lastError) {
+      throw new Error(
+        `Could not recover ${params.label} identity after an uncertain create: ${lastError instanceof Error ? lastError.message : String(lastError)}`
+      );
+    }
+    return undefined;
   }
 
   private async rawRequest(
@@ -589,18 +695,59 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
     return this.maintenanceScript(hostname).contentHash;
   }
 
-  private async listPaginated<T>(endpoint: string): Promise<T[]> {
+  private async listPaginated<T>(
+    endpoint: string,
+    description = 'Cloudflare resource'
+  ): Promise<T[]> {
     const items: T[] = [];
     let page = 1;
     let hasMore = true;
     while (hasMore) {
+      if (page > CLOUDFLARE_PAGE_CAP) {
+        throw new Error(`${description} pagination exceeded ${CLOUDFLARE_PAGE_CAP} pages.`);
+      }
       const separator = endpoint.includes('?') ? '&' : '?';
       const response = await this.request<T[]>('GET', `${endpoint}${separator}page=${page}&per_page=100`);
+      if (!Array.isArray(response.result)) {
+        throw new Error(`${description} observation returned an invalid list.`);
+      }
       items.push(...response.result);
-      hasMore = Boolean(response.result_info && page < response.result_info.total_pages);
+      hasMore = this.hasNextPage(response, page, 100, description);
       page += 1;
     }
     return items;
+  }
+
+  private hasNextPage<T>(
+    response: CloudflareResponse<T[]>,
+    expectedPage: number,
+    requestedPageSize: number,
+    description: string
+  ): boolean {
+    const info = response.result_info;
+    if (!info) {
+      if (response.result.length >= requestedPageSize) {
+        throw new Error(
+          `${description} observation returned a full page without pagination metadata.`
+        );
+      }
+      return false;
+    }
+    if (
+      !Number.isInteger(info.page)
+      || info.page !== expectedPage
+      || !Number.isInteger(info.per_page)
+      || info.per_page <= 0
+      || !Number.isInteger(info.total_count)
+      || info.total_count < 0
+      || !Number.isInteger(info.total_pages)
+      || info.total_pages < 0
+      || (info.total_pages < expectedPage
+        && !(expectedPage === 1 && info.total_pages === 0 && response.result.length === 0))
+    ) {
+      throw new Error(`${description} observation returned invalid pagination metadata.`);
+    }
+    return expectedPage < info.total_pages;
   }
 
   private registrarToken(domain?: string): string {
@@ -752,15 +899,16 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
     let hasMore = true;
 
     while (hasMore) {
-      const response = await this.request<CloudflareZone[]>('GET', `/zones?page=${page}&per_page=50`);
-      zones.push(...response.result);
-
-      if (response.result_info) {
-        hasMore = page < response.result_info.total_pages;
-        page++;
-      } else {
-        hasMore = false;
+      if (page > CLOUDFLARE_PAGE_CAP) {
+        throw new Error(`Cloudflare zone pagination exceeded ${CLOUDFLARE_PAGE_CAP} pages.`);
       }
+      const response = await this.request<CloudflareZone[]>('GET', `/zones?page=${page}&per_page=50`);
+      if (!Array.isArray(response.result)) {
+        throw new Error('Cloudflare zone observation returned an invalid list.');
+      }
+      zones.push(...response.result);
+      hasMore = this.hasNextPage(response, page, 50, 'Cloudflare zone');
+      page += 1;
     }
 
     return zones;
@@ -772,15 +920,16 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
     let hasMore = true;
 
     while (hasMore) {
-      const response = await this.request<CloudflareAccount[]>('GET', `/accounts?page=${page}&per_page=50`);
-      accounts.push(...response.result);
-
-      if (response.result_info) {
-        hasMore = page < response.result_info.total_pages;
-        page++;
-      } else {
-        hasMore = false;
+      if (page > CLOUDFLARE_PAGE_CAP) {
+        throw new Error(`Cloudflare account pagination exceeded ${CLOUDFLARE_PAGE_CAP} pages.`);
       }
+      const response = await this.request<CloudflareAccount[]>('GET', `/accounts?page=${page}&per_page=50`);
+      if (!Array.isArray(response.result)) {
+        throw new Error('Cloudflare account observation returned an invalid list.');
+      }
+      accounts.push(...response.result);
+      hasMore = this.hasNextPage(response, page, 50, 'Cloudflare account');
+      page += 1;
     }
 
     return accounts;
@@ -803,11 +952,14 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
   }
 
   async findZoneByName(domain: string): Promise<CloudflareZone | null> {
-    const response = await this.request<CloudflareZone[]>('GET', `/zones?name=${encodeURIComponent(domain)}`);
-    if (response.result.length > 1) {
+    const zones = await this.listPaginated<CloudflareZone>(
+      `/zones?name=${encodeURIComponent(domain)}`,
+      'Cloudflare zone'
+    );
+    if (zones.length > 1) {
       throw new Error(`Multiple Cloudflare zones match ${domain}; use a zone-scoped connection so Hypervibe can resolve one durable zone identity.`);
     }
-    return response.result[0] ?? null;
+    return zones[0] ?? null;
   }
 
   async resolveLoadBalancerScope(hostname: string): Promise<LoadBalancerScope> {
@@ -834,6 +986,19 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
       expectedCodes: resource.expected_codes ?? '200-399',
       followRedirects: resource.follow_redirects ?? false,
     };
+  }
+
+  private loadBalancerMonitorMatches(
+    observed: LoadBalancerMonitor,
+    desired: Omit<LoadBalancerMonitor, 'id'>
+  ): boolean {
+    return observed.name === desired.name
+      && observed.type === desired.type
+      && observed.path === desired.path
+      && observed.intervalSeconds === desired.intervalSeconds
+      && observed.timeoutSeconds === desired.timeoutSeconds
+      && observed.expectedCodes === desired.expectedCodes
+      && observed.followRedirects === desired.followRedirects;
   }
 
   async findMonitorsByName(accountId: string, name: string): Promise<LoadBalancerMonitor[]> {
@@ -874,8 +1039,31 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
       follow_redirects: desired.followRedirects,
     };
     const endpoint = `/accounts/${encodeURIComponent(accountId)}/load_balancers/monitors${id ? `/${encodeURIComponent(id)}` : ''}`;
-    const response = await this.request<CloudflareLoadBalancerMonitor>(id ? 'PUT' : 'POST', endpoint, body);
-    return { resource: this.mapLoadBalancerMonitor(response.result), created: !id };
+    let acknowledged: LoadBalancerMonitor;
+    try {
+      const response = await this.request<CloudflareLoadBalancerMonitor>(id ? 'PUT' : 'POST', endpoint, body);
+      acknowledged = this.mapLoadBalancerMonitor(response.result);
+      if (!acknowledged.id || (id && acknowledged.id !== id)) {
+        throw new Error('Cloudflare returned an invalid monitor identity after the write.');
+      }
+    } catch (error) {
+      if (id || !this.loadBalancerCreateOutcomeMayBeUnknown(error)) throw error;
+      const recovered = await this.recoverLoadBalancerCreateIdentity({
+        label: `Cloudflare load-balancer monitor "${desired.name}"`,
+        find: () => this.findMonitorsByName(accountId, desired.name),
+      });
+      if (!recovered) throw error;
+      acknowledged = recovered;
+    }
+    return {
+      ...(await this.verifyLoadBalancerWrite({
+        label: `Cloudflare load-balancer monitor ${acknowledged.id}`,
+        acknowledged,
+        get: () => this.getMonitor(accountId, acknowledged.id),
+        matches: (observed) => this.loadBalancerMonitorMatches(observed, desired),
+      })),
+      created: !id,
+    };
   }
 
   async deleteMonitor(accountId: string, id: string): Promise<void> {
@@ -904,6 +1092,21 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
       enabled: resource.enabled !== false,
       steering: resource.origin_steering?.policy ?? 'random',
     };
+  }
+
+  private loadBalancerPoolMatches(
+    observed: LoadBalancerPool,
+    desired: Omit<LoadBalancerPool, 'id'>
+  ): boolean {
+    const byName = (left: LoadBalancerOrigin, right: LoadBalancerOrigin) => (
+      left.name.localeCompare(right.name)
+    );
+    return observed.name === desired.name
+      && observed.monitorId === desired.monitorId
+      && observed.enabled === desired.enabled
+      && observed.steering === desired.steering
+      && JSON.stringify([...observed.origins].sort(byName))
+        === JSON.stringify([...desired.origins].sort(byName));
   }
 
   async findPoolsByName(accountId: string, name: string): Promise<LoadBalancerPool[]> {
@@ -946,8 +1149,31 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
       })),
     };
     const endpoint = `/accounts/${encodeURIComponent(accountId)}/load_balancers/pools${id ? `/${encodeURIComponent(id)}` : ''}`;
-    const response = await this.request<CloudflareLoadBalancerPool>(id ? 'PUT' : 'POST', endpoint, body);
-    return { resource: this.mapLoadBalancerPool(response.result), created: !id };
+    let acknowledged: LoadBalancerPool;
+    try {
+      const response = await this.request<CloudflareLoadBalancerPool>(id ? 'PUT' : 'POST', endpoint, body);
+      acknowledged = this.mapLoadBalancerPool(response.result);
+      if (!acknowledged.id || (id && acknowledged.id !== id)) {
+        throw new Error('Cloudflare returned an invalid load-balancer pool identity after the write.');
+      }
+    } catch (error) {
+      if (id || !this.loadBalancerCreateOutcomeMayBeUnknown(error)) throw error;
+      const recovered = await this.recoverLoadBalancerCreateIdentity({
+        label: `Cloudflare load-balancer pool "${desired.name}"`,
+        find: () => this.findPoolsByName(accountId, desired.name),
+      });
+      if (!recovered) throw error;
+      acknowledged = recovered;
+    }
+    return {
+      ...(await this.verifyLoadBalancerWrite({
+        label: `Cloudflare load-balancer pool ${acknowledged.id}`,
+        acknowledged,
+        get: () => this.getPool(accountId, acknowledged.id),
+        matches: (observed) => this.loadBalancerPoolMatches(observed, desired),
+      })),
+      created: !id,
+    };
   }
 
   async deletePool(accountId: string, id: string): Promise<void> {
@@ -972,6 +1198,18 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
       proxied: resource.proxied !== false,
       steering: resource.steering_policy ?? 'off',
     };
+  }
+
+  private managedLoadBalancerMatches(
+    observed: ManagedLoadBalancer,
+    desired: Omit<ManagedLoadBalancer, 'id'>
+  ): boolean {
+    return normalizeDnsName(observed.hostname) === normalizeDnsName(desired.hostname)
+      && observed.poolId === desired.poolId
+      && observed.fallbackPoolId === desired.fallbackPoolId
+      && observed.enabled === desired.enabled
+      && observed.proxied === desired.proxied
+      && observed.steering === desired.steering;
   }
 
   async findLoadBalancersByHostname(zoneId: string, hostname: string): Promise<ManagedLoadBalancer[]> {
@@ -1011,8 +1249,31 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
       steering_policy: desired.steering,
     };
     const endpoint = `/zones/${encodeURIComponent(zoneId)}/load_balancers${id ? `/${encodeURIComponent(id)}` : ''}`;
-    const response = await this.request<CloudflareManagedLoadBalancer>(id ? 'PUT' : 'POST', endpoint, body);
-    return { resource: this.mapManagedLoadBalancer(response.result), created: !id };
+    let acknowledged: ManagedLoadBalancer;
+    try {
+      const response = await this.request<CloudflareManagedLoadBalancer>(id ? 'PUT' : 'POST', endpoint, body);
+      acknowledged = this.mapManagedLoadBalancer(response.result);
+      if (!acknowledged.id || (id && acknowledged.id !== id)) {
+        throw new Error('Cloudflare returned an invalid public load-balancer identity after the write.');
+      }
+    } catch (error) {
+      if (id || !this.loadBalancerCreateOutcomeMayBeUnknown(error)) throw error;
+      const recovered = await this.recoverLoadBalancerCreateIdentity({
+        label: `Cloudflare public load balancer "${desired.hostname}"`,
+        find: () => this.findLoadBalancersByHostname(zoneId, desired.hostname),
+      });
+      if (!recovered) throw error;
+      acknowledged = recovered;
+    }
+    return {
+      ...(await this.verifyLoadBalancerWrite({
+        label: `Cloudflare load balancer ${acknowledged.id}`,
+        acknowledged,
+        get: () => this.getLoadBalancer(zoneId, acknowledged.id),
+        matches: (observed) => this.managedLoadBalancerMatches(observed, desired),
+      })),
+      created: !id,
+    };
   }
 
   async deleteLoadBalancer(zoneId: string, id: string): Promise<void> {
@@ -1122,18 +1383,24 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
     let hasMore = true;
 
     while (hasMore) {
+      if (page > CLOUDFLARE_PAGE_CAP) {
+        throw new Error(`Cloudflare email-address pagination exceeded ${CLOUDFLARE_PAGE_CAP} pages.`);
+      }
       const response = await this.request<CloudflareEmailRoutingAddress[]>(
         'GET',
         `/accounts/${accountId}/email/routing/addresses?page=${page}&per_page=100`
       );
-      addresses.push(...response.result);
-
-      if (response.result_info) {
-        hasMore = page < response.result_info.total_pages;
-        page++;
-      } else {
-        hasMore = false;
+      if (!Array.isArray(response.result)) {
+        throw new Error('Cloudflare email-address observation returned an invalid list.');
       }
+      addresses.push(...response.result);
+      hasMore = this.hasNextPage(
+        response,
+        page,
+        100,
+        'Cloudflare email-address'
+      );
+      page += 1;
     }
 
     return addresses;
@@ -1162,18 +1429,19 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
     let hasMore = true;
 
     while (hasMore) {
+      if (page > CLOUDFLARE_PAGE_CAP) {
+        throw new Error(`Cloudflare email-rule pagination exceeded ${CLOUDFLARE_PAGE_CAP} pages.`);
+      }
       const response = await this.request<CloudflareEmailRoutingRule[]>(
         'GET',
         `/zones/${zoneId}/email/routing/rules?page=${page}&per_page=100`
       );
-      rules.push(...response.result);
-
-      if (response.result_info) {
-        hasMore = page < response.result_info.total_pages;
-        page++;
-      } else {
-        hasMore = false;
+      if (!Array.isArray(response.result)) {
+        throw new Error('Cloudflare email-rule observation returned an invalid list.');
       }
+      rules.push(...response.result);
+      hasMore = this.hasNextPage(response, page, 100, 'Cloudflare email-rule');
+      page += 1;
     }
 
     return rules;
@@ -1255,19 +1523,20 @@ export class CloudflareAdapter implements IDnsProvider, ILoadBalancerAdapter, IE
     let hasMore = true;
 
     while (hasMore) {
+      if (page > CLOUDFLARE_PAGE_CAP) {
+        throw new Error(`Cloudflare DNS-record pagination exceeded ${CLOUDFLARE_PAGE_CAP} pages.`);
+      }
       const typeParam = type ? `&type=${encodeURIComponent(type)}` : '';
       const response = await this.request<CloudflareDnsRecord[]>(
         'GET',
         `/zones/${zoneId}/dns_records?page=${page}&per_page=100${typeParam}`
       );
-      records.push(...response.result);
-
-      if (response.result_info) {
-        hasMore = page < response.result_info.total_pages;
-        page++;
-      } else {
-        hasMore = false;
+      if (!Array.isArray(response.result)) {
+        throw new Error('Cloudflare DNS-record observation returned an invalid list.');
       }
+      records.push(...response.result);
+      hasMore = this.hasNextPage(response, page, 100, 'Cloudflare DNS-record');
+      page += 1;
     }
 
     return records;
@@ -1586,19 +1855,26 @@ async function inspectCloudflareResources(
 ): Promise<Record<string, unknown>> {
   const resource = request.resource ?? 'zone';
   if (resource === 'account') {
+    const accounts = await adapter.listAccounts();
+    const truncated = accounts.length > request.limit;
     return {
-      observation: 'present',
+      observation: accounts.length > 0 ? 'present' : 'absent',
       resource,
-      accounts: (await adapter.listAccounts()).slice(0, request.limit),
+      accounts: accounts.slice(0, request.limit),
+      truncated,
+      partial: truncated,
     };
   }
 
   const zoneName = request.scope?.trim() || (resource === 'zone' ? request.name?.trim() : undefined);
   if (resource === 'zone' && !request.id && !zoneName) {
+    const zones = await adapter.listZones();
     return {
-      observation: 'present',
+      observation: zones.length > 0 ? 'present' : 'absent',
       resource,
-      zones: (await adapter.listZones()).slice(0, request.limit),
+      zones: zones.slice(0, request.limit),
+      truncated: zones.length > request.limit,
+      partial: zones.length > request.limit,
     };
   }
   const zone = resource === 'zone' && request.id
@@ -1610,11 +1886,14 @@ async function inspectCloudflareResources(
     return {
       observation: 'absent',
       resource: 'zone',
+      zones: [],
       ...(request.id ? { id: request.id } : { name: zoneName }),
+      truncated: false,
+      partial: false,
     };
   }
   if (resource === 'zone') {
-    return { observation: 'present', resource, zone };
+    return { observation: 'present', resource, zone, zones: [zone], truncated: false, partial: false };
   }
   if (resource === 'dns') {
     const records = await adapter.listDnsRecords(zone.id);
@@ -1624,10 +1903,15 @@ async function inspectCloudflareResources(
         ? records.filter((record) => record.name.toLowerCase() === request.name!.toLowerCase())
         : records;
     return {
-      observation: request.id && filtered.length === 0 ? 'absent' : 'present',
+      observation: filtered.length > 0 ? 'present' : 'absent',
       resource,
       zone: { id: zone.id, name: zone.name },
       records: filtered.slice(0, request.limit),
+      ...(filtered.length === 0 && (request.id || request.name)
+        ? { [request.id ? 'id' : 'name']: request.id ?? request.name }
+        : {}),
+      truncated: filtered.length > request.limit,
+      partial: filtered.length > request.limit,
     };
   }
   if (resource === 'email-routing') {
@@ -1636,6 +1920,7 @@ async function inspectCloudflareResources(
       adapter.getEmailRoutingDnsSettings(zone.id),
       adapter.listEmailRoutingRules(zone.id),
     ]);
+    const truncated = rules.length > request.limit;
     return {
       observation: 'present',
       resource,
@@ -1643,6 +1928,8 @@ async function inspectCloudflareResources(
       settings,
       dns,
       rules: rules.slice(0, request.limit),
+      truncated,
+      partial: truncated,
     };
   }
   throw new Error(`Unsupported Cloudflare inspection resource "${resource}".`);
@@ -1659,6 +1946,20 @@ providerRegistry.register({
     credentials: {
       defaultScalarKey: 'apiToken',
     },
+    maturity: {
+      lifecycle: {
+        'load-balancer': {
+          status: 'ready-for-live',
+          reason: 'Mocked monitor/pool/load-balancer lifecycle is complete; the opt-in live contract has no recorded evidence.',
+        },
+      },
+    },
+    lifecycle: {
+      loadBalancer: {
+        topology: 'monitor-pool-balancer',
+        minimumOrigins: 2,
+      },
+    },
   },
   factory: (credentials) => {
     const adapter = new CloudflareAdapter();
@@ -1669,9 +1970,9 @@ providerRegistry.register({
     resources: ['zone', 'dns', 'account', 'email-routing'],
     defaultResource: 'zone',
     selectors: {
-      zone: { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true },
-      dns: { mode: 'provider-resource', required: ['scope'], optional: ['project', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true },
-      account: { mode: 'provider-resource', optional: ['project', 'scope', 'limit'], list: true },
+      zone: { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, collectionKey: 'zones' },
+      dns: { mode: 'provider-resource', required: ['scope'], optional: ['project', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, collectionKey: 'records' },
+      account: { mode: 'provider-resource', optional: ['project', 'scope', 'limit'], list: true, collectionKey: 'accounts' },
       'email-routing': { mode: 'provider-resource', required: ['scope'], optional: ['project', 'limit'], list: true },
     },
     inspect: (adapter, request) => inspectCloudflareResources(adapter as CloudflareAdapter, request),

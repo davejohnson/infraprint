@@ -7,10 +7,16 @@ import type {
   ProvisionableType,
   ProvisionResult,
 } from '../../../domain/ports/database.port.js';
+import {
+  createUnresolvedDatabaseMutation,
+  databaseCreateMayHaveCommitted,
+  parseUnresolvedDatabaseMutation,
+} from '../../../domain/ports/database.port.js';
 import type { ObservedDatabase } from '../../../domain/ports/observe.port.js';
 import type { Receipt, VerifyResult } from '../../../domain/ports/provider.port.js';
 import {
   providerRegistry,
+  standardDatabaseRuntimeProjection,
   type ProviderInspectionRequest,
 } from '../../../domain/registry/provider.registry.js';
 
@@ -91,14 +97,24 @@ interface OperationWaitResult {
   attempts: number;
 }
 
+class NeonApiError extends Error {
+  constructor(
+    readonly status: number,
+    detail?: string
+  ) {
+    super(`Neon API error: ${status}${detail ? ` ${detail}` : ''}`);
+    this.name = 'NeonApiError';
+  }
+}
+
 export class NeonAdapter implements IDatabaseAdapter {
   readonly name = 'neon';
 
   readonly capabilities: DatabaseCapabilities = {
     supportedDatabases: ['postgres'],
     supportsPooling: true,
-    supportsReadReplicas: true,
-    supportsPointInTimeRecovery: true,
+    supportsReadReplicas: false,
+    supportsPointInTimeRecovery: false,
     serverlessOptimized: true,
   };
 
@@ -159,7 +175,20 @@ export class NeonAdapter implements IDatabaseAdapter {
 
     const resourceName = options?.resourceName ?? `${environment.name}-db`;
     const databaseName = options?.databaseName ?? 'app';
+    const organizationId = this.credentials.organizationId?.trim();
+    if (!organizationId) {
+      return {
+        component: this.emptyComponent(environment, type),
+        receipt: {
+          success: false,
+          message: 'Failed to provision Neon project',
+          error: 'Neon organizationId is required for a durably scoped database create. Add it to the Neon connection before running hv_plan/hv_apply.',
+        },
+      };
+    }
     let created: NeonCreateProjectResponse | undefined;
+    let createMutationAttempted = false;
+    let unresolvedCreateOutcome = false;
 
     try {
       let matches: NeonProject[];
@@ -181,21 +210,56 @@ export class NeonAdapter implements IDatabaseAdapter {
       }
 
       const regionId = options?.region ?? this.credentials.regionId;
-      created = await this.request<NeonCreateProjectResponse>('POST', '/projects', {
-        query: {
-          org_id: this.credentials.organizationId,
-        },
-        body: {
-          project: {
-            name: resourceName,
-            ...(regionId ? { region_id: regionId } : {}),
-            branch: {
-              name: 'main',
-              database_name: databaseName,
+      createMutationAttempted = true;
+      let acknowledged: NeonCreateProjectResponse;
+      try {
+        acknowledged = await this.request<NeonCreateProjectResponse>('POST', '/projects', {
+          query: {
+            org_id: organizationId,
+          },
+          body: {
+            project: {
+              name: resourceName,
+              ...(regionId ? { region_id: regionId } : {}),
+              branch: {
+                name: 'main',
+                database_name: databaseName,
+              },
             },
           },
-        },
-      });
+        });
+        unresolvedCreateOutcome = true;
+      } catch (error) {
+        unresolvedCreateOutcome = databaseCreateMayHaveCommitted(error);
+        throw error;
+      }
+      if (
+        acknowledged?.project
+        && typeof acknowledged.project.id === 'string'
+        && acknowledged.project.id.trim()
+        && acknowledged.project.id === acknowledged.project.id.trim()
+      ) {
+        created = acknowledged;
+        unresolvedCreateOutcome = false;
+      }
+      if (
+        !created
+        || acknowledged.project.name !== resourceName
+        || Boolean(
+          acknowledged.project.org_id
+          && this.credentials.organizationId
+          && acknowledged.project.org_id !== this.credentials.organizationId
+        )
+        || Boolean(
+          acknowledged.project.region_id
+          && regionId
+          && acknowledged.project.region_id !== regionId
+        )
+      ) {
+        throw new Error(
+          `Neon acknowledged project creation without the exact expected ${resourceName} identity.`
+        );
+      }
 
       const projectId = created.project.id;
       const operationResult = await this.waitForOperations(
@@ -268,6 +332,7 @@ export class NeonAdapter implements IDatabaseAdapter {
         bindings: {
           provider: 'neon',
           instanceId: projectId,
+          providerScope: this.projectScope(created.project),
           connectionString: directUrl,
           pooledUrl,
           host: parsed.host,
@@ -307,20 +372,39 @@ export class NeonAdapter implements IDatabaseAdapter {
         },
       };
     } catch (error) {
+      let recoveryError: string | undefined;
+      if (!created && unresolvedCreateOutcome) {
+        try {
+          created = await this.recoverCreatedProject(resourceName) ?? undefined;
+        } catch (recoveryFailure) {
+          recoveryError = this.formatError(recoveryFailure);
+        }
+      }
+      const unresolvedComponent = !created && unresolvedCreateOutcome
+        ? this.unresolvedCreateComponent(environment, resourceName, organizationId, databaseName)
+        : undefined;
       return {
         component: created
           ? this.createdComponent(environment, created, databaseName)
-          : this.emptyComponent(environment, type),
+          : unresolvedComponent ?? this.emptyComponent(environment, type),
         receipt: {
           success: false,
           message: created
             ? 'Neon created the project, but provisioning did not complete'
             : 'Failed to provision Neon project',
-          error: this.formatError(error),
+          error: `${this.formatError(error)}${recoveryError
+            ? ` Exact-name recovery also failed: ${recoveryError}`
+            : ''}`,
           ...(created ? {
             data: {
               projectId: created.project.id,
               regionId: created.project.region_id,
+            },
+          } : unresolvedComponent ? {
+            data: {
+              mutationAttempted: createMutationAttempted,
+              resourceCreated: 'unknown',
+              unresolvedCreateRetained: true,
             },
           } : {}),
         },
@@ -332,6 +416,7 @@ export class NeonAdapter implements IDatabaseAdapter {
     if (!this.credentials) {
       return null;
     }
+    if (component.externalId) this.assertComponentScope(component);
     const bindings = component.bindings as {
       connectionString?: string;
       database?: string;
@@ -365,6 +450,7 @@ export class NeonAdapter implements IDatabaseAdapter {
 
     const projectId = component.externalId;
     try {
+      this.assertComponentScope(component);
       const existing = await this.getProject(projectId);
       if (!existing) {
         return {
@@ -421,6 +507,7 @@ export class NeonAdapter implements IDatabaseAdapter {
       return { status: 'unknown' };
     }
     try {
+      this.assertComponentScope(component);
       const project = await this.getProject(component.externalId);
       return project
         ? { status: 'running', message: `Neon project ${project.id} is present` }
@@ -441,12 +528,22 @@ export class NeonAdapter implements IDatabaseAdapter {
     if (!this.credentials) {
       throw new Error('Not connected. Call connect() first.');
     }
+    const unresolved = parseUnresolvedDatabaseMutation(component?.bindings);
+    if (component?.externalId) this.assertComponentScope(component);
+    if (unresolved
+      && unresolved.providerScope.organizationId !== this.credentials.organizationId) {
+      throw new Error(
+        `Neon unresolved database create belongs to organization ${unresolved.providerScope.organizationId}, not connected organization ${this.credentials.organizationId ?? 'unspecified'}.`
+      );
+    }
 
     let project: NeonProject | null;
     if (component?.externalId) {
       project = await this.getProject(component.externalId);
     } else {
-      const expectedName = options?.resourceName ?? `${environment.name}-db`;
+      const expectedName = unresolved?.resourceName
+        ?? options?.resourceName
+        ?? `${environment.name}-db`;
       const matches = await this.findProjectsByName(expectedName);
       if (matches.length > 1) {
         throw new Error(
@@ -467,7 +564,7 @@ export class NeonAdapter implements IDatabaseAdapter {
       externalId: project.id,
       providerScope: this.projectScope(project),
       name: project.name,
-      status: 'ready',
+      status: 'running',
     };
   }
 
@@ -512,6 +609,29 @@ export class NeonAdapter implements IDatabaseAdapter {
       environmentId: environment.id,
       type,
       bindings: {},
+      externalId: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+  }
+
+  private unresolvedCreateComponent(
+    environment: Environment,
+    resourceName: string,
+    organizationId: string,
+    database: string
+  ): Component {
+    const providerScope = { organizationId };
+    return {
+      id: '',
+      environmentId: environment.id,
+      type: 'postgres',
+      bindings: {
+        provider: this.name,
+        providerScope,
+        unresolvedMutation: createUnresolvedDatabaseMutation(resourceName, providerScope),
+        database,
+      },
       externalId: null,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -575,8 +695,12 @@ export class NeonAdapter implements IDatabaseAdapter {
   }
 
   private projectScope(project: NeonProject): Record<string, string> {
-    const organizationId = project.org_id ?? this.credentials?.organizationId;
-    const regionId = project.region_id ?? this.credentials?.regionId;
+    const organizationId = typeof project.org_id === 'string' && project.org_id.trim()
+      ? project.org_id.trim()
+      : this.credentials?.organizationId;
+    const regionId = typeof project.region_id === 'string' && project.region_id.trim()
+      ? project.region_id.trim()
+      : this.credentials?.regionId;
     return {
       projectId: project.id,
       ...(organizationId ? { organizationId } : {}),
@@ -598,6 +722,26 @@ export class NeonAdapter implements IDatabaseAdapter {
     if (!Array.isArray(response.projects)) {
       throw new Error('Neon project observation returned an invalid projects list.');
     }
+    const ids = new Set<string>();
+    for (const project of response.projects) {
+      if (
+        !project
+        || typeof project.id !== 'string'
+        || !project.id.trim()
+        || typeof project.name !== 'string'
+        || !project.name.trim()
+      ) {
+        throw new Error(
+          'Neon project observation returned a project without a durable ID and name.'
+        );
+      }
+      if (ids.has(project.id)) {
+        throw new Error(
+          `Neon project observation returned duplicate project identity ${project.id}.`
+        );
+      }
+      ids.add(project.id);
+    }
   }
 
   private async findProjectsByName(name: string): Promise<NeonProject[]> {
@@ -607,13 +751,56 @@ export class NeonAdapter implements IDatabaseAdapter {
     );
   }
 
+  private async recoverCreatedProject(
+    resourceName: string
+  ): Promise<NeonCreateProjectResponse | null> {
+    const attempts = Math.max(
+      1,
+      Number(process.env.HYPERVIBE_NEON_CREATE_RECOVERY_ATTEMPTS ?? 3) || 3
+    );
+    const delayMs = Math.max(
+      0,
+      Number(process.env.HYPERVIBE_NEON_CREATE_RECOVERY_DELAY_MS ?? 1000) || 0
+    );
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const matches = await this.findProjectsByName(resourceName);
+      if (matches.length > 1) {
+        throw new Error(
+          `Neon returned multiple projects named ${resourceName} after an uncertain create; no identity was selected.`
+        );
+      }
+      if (matches.length === 1) return { project: matches[0]! };
+      if (attempt < attempts && delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+    return null;
+  }
+
   private async getProject(projectId: string): Promise<NeonProject | null> {
     try {
       const response = await this.request<NeonProjectResponse>(
         'GET',
         `/projects/${encodeURIComponent(projectId)}`
       );
-      return response.project;
+      const project = response.project;
+      if (
+        !project
+        || typeof project.id !== 'string'
+        || !project.id.trim()
+        || typeof project.name !== 'string'
+        || !project.name.trim()
+      ) {
+        throw new Error(
+          `Neon returned an invalid project response for ${projectId}; absence was not confirmed.`
+        );
+      }
+      if (project.id !== projectId) {
+        throw new Error(
+          `Neon returned project ${project.id} for exact project lookup ${projectId}.`
+        );
+      }
+      return project;
     } catch (error) {
       if (this.isNotFound(error)) {
         return null;
@@ -756,8 +943,9 @@ export class NeonAdapter implements IDatabaseAdapter {
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(
-        `Neon API error: ${response.status}${text ? ` ${this.safeApiError(text)}` : ''}`
+      throw new NeonApiError(
+        response.status,
+        text ? this.safeApiError(text) : undefined
       );
     }
     if (response.status === 204) {
@@ -774,7 +962,38 @@ export class NeonAdapter implements IDatabaseAdapter {
   }
 
   private isNotFound(error: unknown): boolean {
-    return error instanceof Error && /Neon API error: 404\b/.test(error.message);
+    return error instanceof NeonApiError && error.status === 404;
+  }
+
+  private assertComponentScope(component: Component): void {
+    if (!this.credentials) throw new Error('Neon adapter is not connected.');
+    const rawScope = component.bindings.providerScope;
+    const scope = rawScope && typeof rawScope === 'object' && !Array.isArray(rawScope)
+      ? rawScope as Record<string, unknown>
+      : null;
+    const projectId = typeof scope?.projectId === 'string'
+      ? scope.projectId
+      : undefined;
+    if (!projectId || projectId !== component.externalId) {
+      throw new Error(
+        `Neon binding ${component.externalId ?? component.id} is missing or conflicts with its durable projectId provider scope; re-import or re-plan the database before using it.`
+      );
+    }
+    const connectedOrganizationId = this.credentials.organizationId;
+    if (!connectedOrganizationId) return;
+    const organizationId = typeof scope?.organizationId === 'string'
+      ? scope.organizationId
+      : undefined;
+    if (!organizationId) {
+      throw new Error(
+        `Neon binding ${component.externalId ?? component.id} is missing its durable organizationId provider scope; re-import or re-plan the database before using it.`
+      );
+    }
+    if (organizationId !== connectedOrganizationId) {
+      throw new Error(
+        `Neon binding scope organization ${organizationId} does not match connected organization ${connectedOrganizationId}.`
+      );
+    }
   }
 
   private formatError(error: unknown): string {
@@ -813,6 +1032,11 @@ providerRegistry.register({
         ['NEON_REGION_ID', 'HYPERVIBE_NEON_REGION_ID'],
       ],
     },
+    maturity: {
+      lifecycle: {
+        database: { status: 'ready-for-live' },
+      },
+    },
     lifecycle: {
       databaseEngines: ['postgres'],
     },
@@ -833,10 +1057,11 @@ providerRegistry.register({
       adapter as NeonAdapter
     ).inspectDatabaseResources(request),
   },
-  factory: (credentials) => {
+  databaseRuntime: standardDatabaseRuntimeProjection,
+  factory: async (credentials) => {
     const validated = NeonCredentialsSchema.parse(credentials);
     const adapter = new NeonAdapter();
-    void adapter.connect(validated);
+    await adapter.connect(validated);
     return adapter;
   },
 });

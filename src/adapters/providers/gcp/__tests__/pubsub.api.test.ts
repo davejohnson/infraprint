@@ -4,6 +4,7 @@ import {
   deleteTopic,
   ensureSubscription,
   ensureTopic,
+  getTopic,
   getSubscription,
   listTopics,
   patchSubscriptionAckDeadline,
@@ -37,6 +38,27 @@ describe('pubsub.api', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(String(fetchMock.mock.calls[0][0])).not.toContain('pageToken');
     expect(String(fetchMock.mock.calls[1][0])).toContain('pageToken=page-2');
+  });
+
+  it('fails closed on malformed topic pages and repeated continuation tokens', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ topics: {} })));
+    await expect(listTopics(TOKEN, PROJECT)).rejects.toThrow(/invalid topic list/);
+
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      topics: [],
+      nextPageToken: 'same-page',
+    })));
+    await expect(listTopics(TOKEN, PROJECT)).rejects.toThrow(/repeated continuation token/);
+  });
+
+  it('getTopic returns null only on 404 and validates the exact returned identity', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('missing', { status: 404 })));
+    await expect(getTopic(TOKEN, PROJECT, 'topic-1')).resolves.toBeNull();
+
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({
+      name: `projects/${PROJECT}/topics/different`,
+    })));
+    await expect(getTopic(TOKEN, PROJECT, 'topic-1')).rejects.toThrow(/exact topic lookup/);
   });
 
   it('ensureTopic PUTs labels and reports created on 200', async () => {
@@ -74,6 +96,14 @@ describe('pubsub.api', () => {
     };
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(subscription)));
     await expect(getSubscription(TOKEN, PROJECT, 'sub-1')).resolves.toEqual(subscription);
+  });
+
+  it('getSubscription rejects a mismatched successful identity', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({
+      name: `projects/${PROJECT}/subscriptions/different`,
+      topic: `projects/${PROJECT}/topics/t`,
+    })));
+    await expect(getSubscription(TOKEN, PROJECT, 'sub-1')).rejects.toThrow(/exact subscription lookup/);
   });
 
   it('ensureSubscription sends the fully-qualified topic path and ackDeadlineSeconds', async () => {

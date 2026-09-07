@@ -31,6 +31,9 @@ export interface DesiredState {
   deploy?: {
     strategy?: 'branch' | 'manual';
     trigger?: 'ci' | 'native';
+    /** Explicit branch for the current environment. */
+    branch?: string;
+    /** Legacy staging/production branch mapping. */
     branches?: {
       staging?: string;
       production?: string;

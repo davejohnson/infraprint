@@ -15,7 +15,7 @@ import {
 } from '../../../adapters/providers/github/github.adapter.js';
 import { getSecretStore } from '../../../adapters/secrets/secret-store.js';
 import { executePlanApply } from '../../../application/apply-plan.js';
-import { createToolContext } from '../../../tools/context.js';
+import { createToolContext } from '../../../application/context.js';
 import { PlanService } from '../../plan/plan.service.js';
 import { SpecStore } from '../../spec/spec.store.js';
 import { projectSpecSchema, type ProjectSpec } from '../../spec/spec.schema.js';

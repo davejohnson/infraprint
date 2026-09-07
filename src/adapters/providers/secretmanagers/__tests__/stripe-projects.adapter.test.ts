@@ -107,6 +107,17 @@ describe('StripeProjectsAdapter', () => {
     }]);
   });
 
+  it('does not require unrelated service fields when one field is selected', async () => {
+    fs.writeFileSync(path.join(tempDirectory, '.env.production'), 'CLOUDFLARE_API_TOKEN=cfat_local_secret\n');
+    fs.chmodSync(path.join(tempDirectory, '.env.production'), 0o600);
+    const adapter = await connectedAdapter(standardRunner());
+
+    await expect(adapter.getSecret(
+      'production/cloudflare/workers',
+      'CLOUDFLARE_API_TOKEN'
+    )).resolves.toEqual({ value: 'cfat_local_secret' });
+  });
+
   it('blocks a reference to an environment that is not active', async () => {
     const adapter = await connectedAdapter(standardRunner());
 

@@ -28,7 +28,115 @@ const planActionSchema: z.ZodType<PlanAction> = z.object({
   requiresConfirm: z.boolean().optional(),
   dependsOn: z.array(z.string().min(1)).optional(),
   metadata: z.record(z.unknown()).optional(),
-}).passthrough();
+}).passthrough().superRefine((action, ctx) => {
+  const billableDataResource = ['database', 'cache', 'storage'].includes(action.resource.kind);
+  const destructiveDataResource = ['database', 'cache', 'storage'].includes(action.resource.kind)
+    || (
+      action.resource.kind === 'queue'
+      && action.metadata?.operation === 'queueDestroy'
+      && action.metadata?.backend === 'pubsub'
+    );
+  if (billableDataResource && action.type === 'create' && action.billable !== true) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['billable'],
+      message: `${action.resource.kind} creation must be marked billable`,
+    });
+  }
+  if (
+    destructiveDataResource
+    && action.type === 'destroy'
+    && (action.dataBearing !== true || action.requiresConfirm !== true)
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['requiresConfirm'],
+      message: `${action.resource.kind} destruction must be marked data-bearing and confirmation-gated`,
+    });
+  }
+  if (
+    action.resource.kind === 'domain'
+    && action.type === 'create'
+    && action.metadata?.operation === 'cloudflareRegistrarRegistration'
+    && (action.billable !== true || action.requiresConfirm !== true)
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['requiresConfirm'],
+      message: 'domain registration must be marked billable and confirmation-gated',
+    });
+  }
+  if (
+    action.resource.kind === 'maintenance'
+    && action.type === 'update'
+    && action.metadata?.operation === 'maintenanceEdgeEnable'
+    && (action.billable !== true || action.requiresConfirm !== true)
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['requiresConfirm'],
+      message: 'maintenance edge enablement must be marked billable and confirmation-gated',
+    });
+  }
+  if (
+    action.resource.kind === 'load-balancer'
+    && action.metadata?.operation === 'loadBalancerPoolEnsure'
+    && !action.metadata?.blockedReason
+    && ['create', 'update'].includes(action.type)
+    && action.billable !== true
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['billable'],
+      message: 'load-balancer pool mutation must be marked billable',
+    });
+  }
+  if (
+    action.resource.kind === 'load-balancer'
+    && action.metadata?.operation === 'loadBalancerEnsure'
+    && action.type === 'create'
+    && action.billable !== true
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['billable'],
+      message: 'load-balancer creation must be marked billable',
+    });
+  }
+  if (
+    action.resource.kind === 'repo'
+    && action.type === 'update'
+    && action.metadata?.operation === 'githubCodeScanning'
+    && action.metadata?.privateRepository !== false
+    && (action.billable !== true || action.requiresConfirm !== true)
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['requiresConfirm'],
+      message: 'private-repository code scanning must be marked billable and confirmation-gated',
+    });
+  }
+  if (
+    action.resource.kind === 'repo'
+    && action.type === 'update'
+    && action.metadata?.operation === 'githubInfrastructurePullRequest'
+    && Array.isArray(action.metadata?.desiredFiles)
+    && action.metadata.desiredFiles.some((file) => (
+      file
+      && typeof file === 'object'
+      && !Array.isArray(file)
+      && typeof (file as Record<string, unknown>).path === 'string'
+      && ((file as Record<string, unknown>).path as string).includes('restore-drill')
+    ))
+    && action.billable !== true
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['billable'],
+      message: 'restore-drill infrastructure mutation must be marked billable',
+    });
+  }
+});
 
 /** Runtime-validated document stored in runs.plan for type 'plan' runs. */
 export const planRunDocumentSchema = z.object({
@@ -59,7 +167,7 @@ export const planRunDocumentSchema = z.object({
 
   const invalidAction = document.actions.find((action) =>
     action.type !== 'destroy'
-    || !['previousHostingDestroy', 'retainedDatabaseDestroy', 'retainedResourceDestroy'].includes(String(action.metadata?.operation ?? ''))
+    || !['previousHostingDestroy', 'retainedDatabaseDestroy', 'retainedCacheDestroy', 'retainedResourceDestroy'].includes(String(action.metadata?.operation ?? ''))
   );
   if (invalidAction) {
     ctx.addIssue({
@@ -157,6 +265,8 @@ export function fingerprintObservedState(observed: ObservedState): string {
       .map((s) => ({
         name: s.name,
         externalId: s.externalId,
+        status: s.status,
+        url: s.url ?? null,
         workloadKind: s.workloadKind,
         customDomains: [...s.customDomains].sort(),
         customDomainStatus: Object.fromEntries(
@@ -184,6 +294,7 @@ export function fingerprintObservedState(observed: ObservedState): string {
         provider: d.provider,
         engine: d.engine,
         externalId: d.externalId,
+        status: d.status,
         providerScope: d.providerScope
           ? Object.fromEntries(Object.entries(d.providerScope).sort(([a], [b]) => a.localeCompare(b)))
           : null,
@@ -194,6 +305,13 @@ export function fingerprintObservedState(observed: ObservedState): string {
         provider: cache.provider,
         engine: cache.engine,
         externalId: cache.externalId,
+        status: cache.status,
+        providerScope: cache.providerScope
+          ? Object.fromEntries(Object.entries(cache.providerScope).sort(([a], [b]) => a.localeCompare(b)))
+          : null,
+        config: cache.config
+          ? Object.fromEntries(Object.entries(cache.config).sort(([a], [b]) => a.localeCompare(b)))
+          : null,
       })),
     storage: [...(observed.storage ?? [])]
       .sort((a, b) => a.externalId.localeCompare(b.externalId))
@@ -201,14 +319,28 @@ export function fingerprintObservedState(observed: ObservedState): string {
         provider: item.provider,
         kind: item.kind,
         externalId: item.externalId,
-        instanceScope: item.instanceScope ?? null,
+        instanceScope: item.instanceScope
+          ? Object.fromEntries(Object.entries(item.instanceScope).sort(([a], [b]) => a.localeCompare(b)))
+          : null,
         name: item.name,
         region: item.region ?? null,
         status: item.status,
         objectCount: item.objectCount ?? null,
         sizeBytes: item.sizeBytes ?? null,
       })),
-    completeness: observed.completeness ?? null,
+    completeness: observed.completeness
+      ? {
+          ...observed.completeness,
+          ...(observed.completeness.storageByProvider
+            ? {
+                storageByProvider: Object.fromEntries(
+                  Object.entries(observed.completeness.storageByProvider)
+                    .sort(([left], [right]) => left.localeCompare(right))
+                ),
+              }
+            : {}),
+        }
+      : null,
     maintenance: observed.maintenance ?? null,
   };
   return createHash('sha256').update(JSON.stringify(essence), 'utf8').digest('hex');

@@ -11,25 +11,59 @@ Machines, certificates, and Managed Postgres are now in scope as
 
 ## Contract families
 
-Hosting, databases, and caches have separate contracts:
+Hosting, databases, caches, storage, queues, and edge load balancing have
+separate contracts:
 
 - Hosting: project/environment identity, service identity, configuration,
   environment-variable drift, deploy/source state, observation, deletion, and
-  terminal absence. Environment custom-domain support is a separate explicit
-  provider capability; unsupported hosts must block before DNS mutation.
+  terminal absence. Every hosting registration declares its exact complete
+  workload kinds; an unsupported kind blocks at spec validation before project
+  or environment mutation. Environment custom-domain support is a separate
+  explicit provider capability; unsupported hosts must block before DNS mutation.
 - PostgreSQL: provision, observe, wire runtime variables, connect with a
   bounded operation, noop, replace/migrate, destroy, retry, and terminal
   absence.
 - Redis: provision, observe, wire `REDIS_URL`, verify a bounded `SET`/`GET`,
   noop, destroy, retry, and terminal absence. SQL migrations and database reset
   do not apply.
+- Object storage: private creation, durable scoped identity, ownership-safe
+  observation, provider-native runtime wiring, streaming list/get/put, and
+  confirmed data-bearing teardown.
+- Queues: a provider-declared backend and either explicit topic/subscription
+  resources or application-managed PostgreSQL wiring. Hypervibe never invents
+  provider queue mutations for the latter.
+- Edge load balancing: independently observed monitor, pool, and hostname
+  resources with explicit dependency edges and reverse-order teardown.
 
-The requested matrix lives in
+The complete lifecycle matrix lives in
 `test/provider-conformance/provider-matrix.ts`. A provider moves from `planned`
 to `ready-for-live` after its registry, schema, adapter, connection guidance,
 and mocked contract are green. The opt-in live runner accepts
 `ready-for-live`, but the roadmap remains red and Hypervibe does not advertise
 support. Only a green live contract promotes it to `supported`.
+
+### Hosting workload kinds
+
+These are implemented adapter lifecycles, not a claim about every feature the
+vendor offers:
+
+| Hosting provider | Web | Worker | Cron |
+| --- | --- | --- | --- |
+| Railway | yes | yes | yes |
+| GCP Cloud Run | yes | yes | yes |
+| DigitalOcean App Platform | yes | yes | yes |
+| Fly.io Machines | yes | yes | no |
+| AWS ECS Express Mode | yes | no | no |
+| Azure Container Apps | yes | no | no |
+| Vercel | yes | no | no |
+
+`hv_spec`, `hv_plan`, and `hv_apply` read this contract from provider registry
+metadata. Unsupported services fail with their exact spec path before any
+hosting project, environment, or service mutation. Fly.io's adapter implements
+always-on Machines for web and worker workloads but not provider-native cron
+schedules. ECS Express, Azure Container Apps, and Vercel currently implement
+only their public web lifecycle; Hypervibe does not reinterpret those adapters
+as background-worker or scheduled-job implementations.
 
 The ordinary `npm test` suite stays green for supported behavior. Run
 `npm run test:providers:roadmap` separately to execute one intentionally red
@@ -212,7 +246,9 @@ isolated hosting/database lifecycle using the packaged connector.
 
 Cloudflare provides the first provider-managed edge load-balancer lifecycle.
 An environment may declare one load balancer at its existing `domain`, with at
-least two public web services as HTTPS origins. Hypervibe owns and observes one
+least two public web services as distinct public HTTPS DNS origins. Local,
+private, IP-literal, credential-bearing, path-qualified, nonstandard-port, and
+duplicate origin URLs block before provider mutation. Hypervibe owns and observes one
 account-scoped health monitor, one account-scoped equal-weight origin pool, and
 one zone-scoped proxied hostname load balancer. Each resource has a separate
 plan/apply action and durable provider id. Same-name unbound resources block
@@ -222,19 +258,24 @@ each provider deletion. Its infrastructure live profile creates two disposable
 Railway HTTPS origins, verifies public Cloudflare health and in-place monitor
 updates, then proves load-balancer-first cleanup before origin deletion. V1
 does not create AWS ALBs, private origins, weighted
-steering, geo steering, session affinity, or cross-environment origins.
+steering, geo steering, session affinity, or cross-environment origins. ECS
+Express already manages its ALB as provider-internal hosting ingress; it is not
+a second implementation of this cross-origin edge-balancer contract.
 
 Azure Container Apps is now an authentication-only, `ready-for-live` hosting
 slice. Its reviewed project action creates the tagged resource group, Basic
 ACR registry, role assignments, and managed environment; service actions create
 system-identity Container Apps, and CI only pushes an exact digest and updates
 already-bound app IDs. Azure Database for PostgreSQL Flexible Server and Azure
-Managed Redis remain implemented under independent `azure-postgres` and
-`azure-managed-redis` provider ids and stay `planned` pending their own full
-stack live contracts. Datastore credentials and lifecycle remain separate from
-hosting, and generated passwords, keys, and connection URLs stay out of
-receipts. The hosting adapter defaults to `canadacentral`; another location is
-declared in `hosting.region`, never in the service-principal credential.
+Managed Redis are implemented under independent `azure-postgres` and
+`azure-managed-redis` provider ids and reuse that verified authentication-only
+connection. They derive the exact Container Apps resource group and location,
+declare their public-network/TLS contracts explicitly, carry scoped partial
+create identities through failure, and are `ready-for-live` pending complete
+Azure full-stack live contracts. Generated passwords, keys, and connection URLs
+stay out of receipts. The hosting adapter defaults to `canadacentral`; another
+location is declared in `hosting.region`, never in the service-principal
+credential.
 
 The extended matrix also includes:
 
@@ -271,20 +312,40 @@ The extended matrix also includes:
   adapter uses the public Neon API directly and does not depend on a provider
   CLI.
 - [Amazon ElastiCache Serverless](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/wwe-getting-started.html)
-  under the `elasticache` cache provider. Hypervibe creates TLS serverless
-  Valkey plus a dedicated security group that permits port 6379 only from the
-  declared workload security groups. It observes by ARN and deletes the cache
-  before retrying managed security-group cleanup. The entry remains `planned`
-  until Hypervibe owns a declarative AWS workload-network profile.
+  under the `elasticache` cache provider. It reuses the verified auth-only
+  `ecs` connection; region and size are desired cache fields, never credential
+  placement. The ECS project action owns a deterministic tagged workload
+  security group in the exact regional default VPC, and every Express create,
+  update, environment-variable removal, and managed-CI release preserves that
+  group and the verified default subnets. ElastiCache re-observes this binding
+  without mutation, then creates TLS serverless Valkey plus a dedicated group
+  whose only ingress is TCP 6379 from the workload group. Teardown proves cache
+  absence before deleting and proving absence of its group. The mocked contract
+  is `ready-for-live`; it is not `supported` without a successful recent opt-in
+  live create/noop/update/destroy run.
+- [Amazon RDS for PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_PostgreSQL.html)
+  under the `rds` database provider. RDS is implemented only with ECS Express:
+  it reuses the verified `ecs` connection, requires the exact persisted
+  account/region/default-VPC workload-network binding, and never creates or
+  guesses hosting scaffolding from a database action. Each instance gets one
+  tagged database security group whose durable PostgreSQL ingress is limited to
+  the exact ECS workload security group. Hypervibe re-observes the database,
+  attachment, and ingress before reporting success or database convergence;
+  teardown proves database absence before deleting the exact managed group.
+  Bounded local diagnostics may still add and remove their separately labelled
+  caller `/32` rule. The mocked contract is `ready-for-live`; promotion requires
+  a successful complete ECS plus RDS live lifecycle.
 - [Google Cloud Memorystore for Redis](https://cloud.google.com/memorystore/docs/redis/reference/rest)
   under the `memorystore` cache provider. Its private-IP, Redis AUTH, durable
-  resource observation, uncertain-create preservation, and terminal deletion
-  lifecycle pass mocked tests. It remains `planned` for live conformance
-  because Cloud Run must first gain declarative VPC egress to the selected
-  `authorizedNetwork`; Hypervibe will not present the private endpoint as
-  publicly reachable or hide that networking mutation in diagnostics.
+  resource observation, uncertain-create preservation, terminal deletion,
+  desired placement drift, existing-network verification, and Cloud Run Direct
+  VPC egress lifecycle pass mocked tests. It is `ready-for-live`, not
+  `supported`: promotion still requires a successful recent opt-in live
+  create/noop/update/destroy run against an isolated Google Cloud project whose
+  selected VPC and regional subnet already exist. Hypervibe never creates that
+  networking implicitly.
 
-These entries are test-first targets, not current support promises. An entry
+These entries are live-conformance candidates, not current support promises. An entry
 stays `planned` until its provider adapter and mocked lifecycle contract pass,
 then remains `ready-for-live` until its complete live lifecycle contract passes.
 
@@ -328,12 +389,15 @@ HYPERVIBE_LIVE_HOSTING=fly npm run test:providers:live
 HYPERVIBE_LIVE_DATABASE=cloudsql npm run test:providers:live
 HYPERVIBE_LIVE_DATABASE=neon npm run test:providers:live
 HYPERVIBE_LIVE_DATABASE=fly npm run test:providers:live
+HYPERVIBE_LIVE_DATABASE=azure-postgres npm run test:providers:live
 HYPERVIBE_LIVE_CACHE=railway npm run test:providers:live
+HYPERVIBE_LIVE_CACHE=memorystore npm run test:providers:live
+HYPERVIBE_LIVE_CACHE=elasticache npm run test:providers:live
+HYPERVIBE_LIVE_CACHE=azure-managed-redis npm run test:providers:live
 ```
 
-`HYPERVIBE_LIVE_CACHE=<provider>` becomes available when a cache entry reaches
-`ready-for-live`. The runner refuses `planned` entries before reading
-credentials or creating billable resources.
+The runner accepts only `ready-for-live` or live-proven entries and refuses any
+`planned` entry before reading credentials or creating billable resources.
 
 The Neon contract requires `HYPERVIBE_TEST_NEON_API_KEY` plus the Railway
 fixture-host credentials. Set `HYPERVIBE_TEST_NEON_ORGANIZATION_ID` when a

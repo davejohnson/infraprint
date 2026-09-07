@@ -5,6 +5,7 @@ import {
   connectRailwayForImport,
   importRailwayProject,
   inspectRailwayProject,
+  validateRailwayStorageCreateRecoveryResolution,
 } from '../../domain/services/import.service.js';
 import { connectionSetupOptions } from '../../domain/services/connection-guidance.js';
 
@@ -62,6 +63,23 @@ export const importRailwayProvider: ProviderImportDriver = async (ctx, input) =>
     }
 
     const { details, environments, services, components } = inspection;
+    if (components.length > 0) {
+      return commandError(
+        'UNSUPPORTED',
+        'Railway legacy plugin databases/caches cannot be adopted safely because their provider resource kind has no verified lifecycle teardown contract.',
+        {
+          details: {
+            components: components.map((component) => ({
+              id: component.railwayId,
+              name: component.name,
+              type: component.type,
+            })),
+          },
+          hint: 'Migrate the datastore to a Railway service-backed Postgres/Redis resource, then map that exact service id with databaseMappings or cacheMappings. Hypervibe leaves legacy plugins unmanaged.',
+          next: ['hv_inspect', 'hv_import'],
+        }
+      );
+    }
     const providerEnvironmentNames = new Set(environments.map((environment) => environment.name));
     const unknownEnvironmentMappings = Object.keys(environmentMappings)
       .filter((environmentName) => !providerEnvironmentNames.has(environmentName));
@@ -168,6 +186,12 @@ export const importRailwayProvider: ProviderImportDriver = async (ctx, input) =>
       });
     }
     try {
+      validateRailwayStorageCreateRecoveryResolution(details, environmentMappings, {
+        force,
+        storageMappings,
+        databaseMappings,
+        cacheMappings,
+      });
       buildImportedRailwaySpec(details, environmentMappings, services, components, {
         force,
         storageMappings,

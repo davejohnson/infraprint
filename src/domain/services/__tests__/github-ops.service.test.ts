@@ -1,8 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { parseToolEnvelope } from '../../../tools/__tests__/tool-result.js';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -11,13 +7,9 @@ import '../../../adapters/providers/railway/railway.adapter.js';
 import '../../../adapters/providers/gcp/cloudrun.adapter.js';
 import { ProjectRepository } from '../../../adapters/db/repositories/project.repository.js';
 import { EnvironmentRepository } from '../../../adapters/db/repositories/environment.repository.js';
-import { ConnectionRepository } from '../../../adapters/db/repositories/connection.repository.js';
-import { getSecretStore } from '../../../adapters/secrets/secret-store.js';
-import { GitHubAdapter } from '../../../adapters/providers/github/github.adapter.js';
 import { resolveBranchDeployTargets, buildBranchDeployWorkflow } from '../github-ops.service.js';
 import { SpecStore } from '../../spec/spec.store.js';
 
-type JsonObj = Record<string, unknown>;
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
   ...args: string[]
 ) => (...args: unknown[]) => Promise<unknown>;
@@ -37,20 +29,6 @@ function extractGitHubScript(workflow: string, stepName: string): string {
     .map((line) => line.startsWith('            ') ? line.slice(12) : line)
     .join('\n')
     .trimEnd();
-}
-
-async function callTool(client: Client, name: string, args: Record<string, unknown> = {}): Promise<JsonObj> {
-  const result = await client.request(
-    {
-      method: 'tools/call',
-      params: {
-        name,
-        arguments: args,
-      },
-    },
-    CallToolResultSchema
-  );
-  return parseToolEnvelope(result) as unknown as JsonObj;
 }
 
 describe('github tools', () => {

@@ -4,7 +4,6 @@ import { ServiceRepository } from '../adapters/db/repositories/service.repositor
 import { ComponentRepository } from '../adapters/db/repositories/component.repository.js';
 import { ConnectionRepository } from '../adapters/db/repositories/connection.repository.js';
 import { RunRepository } from '../adapters/db/repositories/run.repository.js';
-import { IntegrationRepository } from '../adapters/db/repositories/integration.repository.js';
 import { AuditRepository } from '../adapters/db/repositories/audit.repository.js';
 import { getSecretStore } from '../adapters/secrets/secret-store.js';
 import { adapterFactory } from '../domain/services/adapter.factory.js';
@@ -25,7 +24,6 @@ export interface Repos {
   components: ComponentRepository;
   connections: ConnectionRepository;
   runs: RunRepository;
-  integrations: IntegrationRepository;
   audit: AuditRepository;
 }
 
@@ -57,7 +55,6 @@ export function createCommandContext(): CommandContext {
     components: new ComponentRepository(),
     connections: new ConnectionRepository(),
     runs: new RunRepository(),
-    integrations: new IntegrationRepository(),
     audit: new AuditRepository(),
   };
 
@@ -67,13 +64,27 @@ export function createCommandContext(): CommandContext {
 
   const workspaceDirectories = (): readonly string[] => currentWorkspaceDirectories() ?? [process.cwd()];
 
-  const hydrateRepoBindings = (project: Project, startDir?: string): void => {
+  const readRepoBindingsOrThrow = (
+    projectName: string,
+    startDir?: string
+  ): ReturnType<typeof readRepoBindingsFile> => {
     let bindings;
     try {
-      bindings = readRepoBindingsFile(project.name, startDir);
-    } catch {
-      return;
+      bindings = readRepoBindingsFile(projectName, startDir);
+    } catch (error) {
+      throw new HvError(
+        'VALIDATION',
+        error instanceof Error ? error.message : 'Repository bindings could not be read safely.',
+        { hint: 'Repair the existing .hypervibe/bindings.json file before retrying. Hypervibe will not use stale local identities as a fallback.' }
+      );
     }
+    return bindings;
+  };
+
+  const hydrateRepoBindings = (
+    project: Project,
+    bindings: NonNullable<ReturnType<typeof readRepoBindingsFile>> | null
+  ): void => {
     if (!bindings) return;
 
     for (const [envName, entry] of Object.entries(bindings.document.environments)) {
@@ -95,11 +106,19 @@ export function createCommandContext(): CommandContext {
     let repoSpec;
     try {
       repoSpec = readRepoSpecFile(startDir);
-    } catch {
-      return null;
+    } catch (error) {
+      throw new HvError(
+        'VALIDATION',
+        error instanceof Error ? error.message : 'Repository desired state could not be read safely.',
+        { hint: 'Repair the existing .hypervibe/spec.json file before retrying. Hypervibe will not treat unreadable desired state as an uninitialized repository.' }
+      );
     }
     if (!repoSpec) return null;
     if (ref && ref !== repoSpec.spec.project) return null;
+    // Validate repository identity state before creating or updating local
+    // project records. Corrupt bindings must not leave a partial resolution
+    // side effect behind when the command ultimately fails closed.
+    const repoBindings = readRepoBindingsOrThrow(repoSpec.spec.project, startDir);
 
     const existing = repos.projects.findByName(repoSpec.spec.project);
     const gitRemoteUrl = repoSpec.spec.gitRemoteUrl ?? detectGitRemoteUrl(startDir) ?? undefined;
@@ -107,7 +126,7 @@ export function createCommandContext(): CommandContext {
       const project = gitRemoteUrl && existing.gitRemoteUrl !== gitRemoteUrl
         ? repos.projects.update(existing.id, { gitRemoteUrl }) ?? existing
         : existing;
-      hydrateRepoBindings(project, startDir);
+      hydrateRepoBindings(project, repoBindings);
       return project;
     }
 
@@ -116,14 +135,14 @@ export function createCommandContext(): CommandContext {
       defaultPlatform: firstHostingProvider(repoSpec.spec),
       ...(gitRemoteUrl ? { gitRemoteUrl } : {}),
     });
-    hydrateRepoBindings(project, startDir);
+    hydrateRepoBindings(project, repoBindings);
     return project;
   };
 
   const hydrateAndReturn = (project: Project | null, startDir?: string): Project | null => {
     if (project) {
       if (startDir) selectWorkspaceDirectory(startDir);
-      hydrateRepoBindings(project, startDir);
+      hydrateRepoBindings(project, readRepoBindingsOrThrow(project.name, startDir));
     }
     return project;
   };
@@ -131,8 +150,12 @@ export function createCommandContext(): CommandContext {
   const workspaceMatchesProject = (project: Project, startDir: string): boolean => {
     try {
       if (readRepoSpecFile(startDir)?.spec.project === project.name) return true;
-    } catch {
-      return false;
+    } catch (error) {
+      throw new HvError(
+        'VALIDATION',
+        error instanceof Error ? error.message : 'Repository desired state could not be read safely.',
+        { hint: 'Repair the existing .hypervibe/spec.json file before retrying. Hypervibe will not treat unreadable desired state as an uninitialized repository.' }
+      );
     }
     const remoteUrl = detectGitRemoteUrl(startDir);
     return Boolean(remoteUrl && repos.projects.findByGitRemoteUrl(remoteUrl)?.id === project.id);
@@ -179,7 +202,10 @@ export function createCommandContext(): CommandContext {
     }
     for (const startDir of workspaceDirectories()) {
       const repoBacked = resolveRepoBackedProject(ref, startDir);
-      if (repoBacked) return repoBacked;
+      if (repoBacked) {
+        selectWorkspaceDirectory(startDir);
+        return repoBacked;
+      }
     }
     return null;
   };

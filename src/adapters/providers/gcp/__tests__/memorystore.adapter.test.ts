@@ -4,7 +4,7 @@ import type { Environment } from '../../../../domain/entities/environment.entity
 import {
   runMockCacheLifecycleContract,
 } from '../../__tests__/cache-lifecycle.contract.js';
-import { MemorystoreAdapter } from '../memorystore.adapter.js';
+import { MemorystoreAdapter, MemorystoreCredentialsSchema } from '../memorystore.adapter.js';
 
 const PROJECT_ID = 'gcp-project';
 const REGION = 'us-central1';
@@ -13,6 +13,8 @@ const RESOURCE_NAME =
   `projects/${PROJECT_ID}/locations/${REGION}/instances/${INSTANCE_ID}`;
 const SERVICE_ACCOUNT_SECRET = 'service-account-private-key-never-output';
 const REDIS_AUTH = 'memorystore-auth-string-never-output';
+const NETWORK = `projects/${PROJECT_ID}/global/networks/default`;
+const SUBNETWORK = `projects/${PROJECT_ID}/regions/${REGION}/subnetworks/default`;
 
 function environment(): Environment {
   return {
@@ -34,6 +36,10 @@ function component(externalId = RESOURCE_NAME): Component {
     bindings: {
       provider: 'memorystore',
       instanceId: externalId,
+      providerScope: { projectId: PROJECT_ID, region: REGION },
+      network: NETWORK,
+      authorizedNetwork: NETWORK,
+      subnetwork: SUBNETWORK,
       privateNetworkOnly: true,
     },
     createdAt: new Date(),
@@ -58,7 +64,7 @@ function instance(overrides: Record<string, unknown> = {}): Record<string, unkno
     tier: 'BASIC',
     memorySizeGb: 1,
     redisVersion: 'REDIS_7_2',
-    authorizedNetwork: `projects/${PROJECT_ID}/global/networks/default`,
+    authorizedNetwork: NETWORK,
     connectMode: 'DIRECT_PEERING',
     authEnabled: true,
     transitEncryptionMode: 'DISABLED',
@@ -120,6 +126,19 @@ describe('MemorystoreAdapter', () => {
     vi.unstubAllEnvs();
   });
 
+  it('accepts legacy stored placement keys but exposes an auth-only credential schema', () => {
+    const credentials = JSON.stringify({ client_email: 'deploy@example.test', private_key: 'secret' });
+    expect(MemorystoreCredentialsSchema.parse({
+      projectId: PROJECT_ID,
+      credentials,
+      region: 'europe-west1',
+      authorizedNetwork: 'legacy-network',
+      connectMode: 'PRIVATE_SERVICE_ACCESS',
+      tier: 'STANDARD_HA',
+      memorySizeGb: 9,
+    })).toEqual({ projectId: PROJECT_ID, credentials });
+  });
+
   it('inventories differently named caches across the connected project', async () => {
     const adapter = await connected();
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
@@ -159,6 +178,15 @@ describe('MemorystoreAdapter', () => {
           name: `projects/${PROJECT_ID}/locations/${REGION}/operations/create-1`,
         });
       }
+      if (url.hostname === 'compute.googleapis.com' && url.pathname.endsWith('/global/networks/default')) {
+        return response({ selfLink: `https://www.googleapis.com/compute/v1/${NETWORK}` });
+      }
+      if (url.hostname === 'compute.googleapis.com' && url.pathname.endsWith(`/regions/${REGION}/subnetworks/default`)) {
+        return response({
+          selfLink: `https://www.googleapis.com/compute/v1/${SUBNETWORK}`,
+          network: `https://www.googleapis.com/compute/v1/${NETWORK}`,
+        });
+      }
       if (url.pathname.endsWith('/operations/create-1') && method === 'GET') {
         return response({ name: 'create-1', done: true });
       }
@@ -189,7 +217,7 @@ describe('MemorystoreAdapter', () => {
       tier: 'BASIC',
       memorySizeGb: 1,
       redisVersion: 'REDIS_7_2',
-      authorizedNetwork: `projects/${PROJECT_ID}/global/networks/default`,
+      authorizedNetwork: NETWORK,
       connectMode: 'DIRECT_PEERING',
       authEnabled: true,
       transitEncryptionMode: 'DISABLED',
@@ -208,6 +236,12 @@ describe('MemorystoreAdapter', () => {
       }
       if (url.pathname.endsWith('/instances') && method === 'POST') {
         throw new Error('connection closed after request transmission');
+      }
+      if (url.hostname === 'compute.googleapis.com' && url.pathname.endsWith('/global/networks/default')) {
+        return response({ selfLink: `https://www.googleapis.com/compute/v1/${NETWORK}` });
+      }
+      if (url.hostname === 'compute.googleapis.com' && url.pathname.endsWith(`/regions/${REGION}/subnetworks/default`)) {
+        return response({ network: `https://www.googleapis.com/compute/v1/${NETWORK}` });
       }
       if (url.pathname === `/v1/${RESOURCE_NAME}` && method === 'GET') {
         return response({ error: 'temporarily unavailable' }, 503);
@@ -228,6 +262,82 @@ describe('MemorystoreAdapter', () => {
       mutationAttempted: true,
       resourceCreated: 'unknown',
     });
+  });
+
+  it('does not let a mismatched recovery response replace the deterministic create identity', async () => {
+    const mismatchedName =
+      `projects/${PROJECT_ID}/locations/europe-west1/instances/other-cache`;
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.pathname.endsWith('/instances') && method === 'GET') {
+        return response({ instances: [] });
+      }
+      if (url.pathname.endsWith('/instances') && method === 'POST') {
+        throw new Error('connection closed after request transmission');
+      }
+      if (url.hostname === 'compute.googleapis.com' && url.pathname.endsWith('/global/networks/default')) {
+        return response({ selfLink: `https://www.googleapis.com/compute/v1/${NETWORK}` });
+      }
+      if (url.hostname === 'compute.googleapis.com' && url.pathname.endsWith(`/regions/${REGION}/subnetworks/default`)) {
+        return response({ network: `https://www.googleapis.com/compute/v1/${NETWORK}` });
+      }
+      if (url.pathname === `/v1/${RESOURCE_NAME}` && method === 'GET') {
+        return response(instance({ name: mismatchedName }));
+      }
+      throw new Error(`Unexpected ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connected();
+
+    const result = await adapter.provision('redis', environment(), {
+      resourceName: 'Invoice Perfect Production Redis',
+    });
+
+    expect(result.receipt).toMatchObject({
+      success: false,
+      data: {
+        instanceId: RESOURCE_NAME,
+        mutationAttempted: true,
+        resourceCreated: 'unknown',
+        observationError: expect.stringContaining('returned mismatched identity'),
+      },
+    });
+    expect(result.component).toMatchObject({
+      externalId: RESOURCE_NAME,
+      bindings: {
+        instanceId: RESOURCE_NAME,
+        providerScope: { projectId: PROJECT_ID, region: REGION },
+      },
+    });
+    expect(result.component.externalId).not.toBe(mismatchedName);
+  });
+
+  it.each([
+    ['project', `projects/other-project/locations/${REGION}/instances/${INSTANCE_ID}`],
+    ['region', `projects/${PROJECT_ID}/locations/europe-west1/instances/${INSTANCE_ID}`],
+    ['instance', `projects/${PROJECT_ID}/locations/${REGION}/instances/other-cache`],
+    ['malformed', undefined],
+  ])('rejects an exact GET whose returned %s identity does not match the request', async (
+    _case,
+    returnedName
+  ) => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname === `/v1/${RESOURCE_NAME}`) {
+        return response(instance({ name: returnedName }));
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connected();
+
+    await expect(
+      adapter.observeCache(environment(), component())
+    ).rejects.toThrow(
+      `Memorystore exact GET for ${RESOURCE_NAME} returned mismatched identity`
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('waits for terminal absence after deletion', async () => {
@@ -271,6 +381,12 @@ describe('MemorystoreAdapter', () => {
       if (url.pathname === `/v1/${RESOURCE_NAME}`) {
         return response(instance({ displayName: 'Renamed outside Hypervibe' }));
       }
+      if (url.hostname === 'compute.googleapis.com' && url.pathname.endsWith('/global/networks/default')) {
+        return response({ selfLink: `https://www.googleapis.com/compute/v1/${NETWORK}` });
+      }
+      if (url.hostname === 'compute.googleapis.com' && url.pathname.endsWith(`/regions/${REGION}/subnetworks/default`)) {
+        return response({ network: `https://www.googleapis.com/compute/v1/${NETWORK}` });
+      }
       throw new Error(`Unexpected GET ${url}`);
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -282,6 +398,95 @@ describe('MemorystoreAdapter', () => {
       externalId: RESOURCE_NAME,
       name: 'Renamed outside Hypervibe',
       status: 'running',
+      config: {
+        region: REGION,
+        network: NETWORK,
+        subnetwork: SUBNETWORK,
+        tier: 'BASIC',
+        size: '1gb',
+      },
     });
+  });
+
+  it('blocks a create when the selected existing default VPC cannot be verified', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.hostname === 'redis.googleapis.com' && url.pathname.endsWith('/instances') && method === 'GET') {
+        return response({ instances: [] });
+      }
+      if (url.hostname === 'compute.googleapis.com' && url.pathname.endsWith('/global/networks/default')) {
+        return response({ error: 'not found' }, 404);
+      }
+      if (url.hostname === 'compute.googleapis.com' && url.pathname.endsWith(`/subnetworks/default`)) {
+        return response({ network: `https://www.googleapis.com/compute/v1/${NETWORK}` });
+      }
+      throw new Error(`Unexpected ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connected();
+
+    const result = await adapter.provision('redis', environment(), {
+      resourceName: 'Invoice Perfect Production Redis',
+    });
+
+    expect(result.receipt).toMatchObject({
+      success: false,
+      data: { mutationAttempted: false, resourceCreated: false },
+    });
+    expect(result.receipt.error).toContain('will not create a VPC or subnet implicitly');
+    expect(fetchMock.mock.calls.some(([, init]) => (init?.method ?? 'GET') === 'POST')).toBe(false);
+  });
+
+  it('updates only the exact bound instance and records its runtime Direct VPC placement', async () => {
+    vi.stubEnv('HYPERVIBE_MEMORYSTORE_READY_DELAY_MS', '0');
+    vi.stubEnv('HYPERVIBE_MEMORYSTORE_READY_ATTEMPTS', '3');
+    let updated = false;
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      if (url.hostname === 'compute.googleapis.com' && url.pathname.endsWith('/global/networks/default')) {
+        return response({ selfLink: `https://www.googleapis.com/compute/v1/${NETWORK}` });
+      }
+      if (url.hostname === 'compute.googleapis.com' && url.pathname.endsWith(`/subnetworks/default`)) {
+        return response({ network: `https://www.googleapis.com/compute/v1/${NETWORK}` });
+      }
+      if (url.pathname === `/v1/${RESOURCE_NAME}` && method === 'GET') {
+        return response(instance(updated ? { tier: 'STANDARD_HA', memorySizeGb: 5 } : {}));
+      }
+      if (url.pathname === `/v1/${RESOURCE_NAME}` && method === 'PATCH') {
+        expect(url.searchParams.get('updateMask')).toBe('tier,memorySizeGb');
+        expect(JSON.parse(String(init?.body))).toEqual({ tier: 'STANDARD_HA', memorySizeGb: 5 });
+        updated = true;
+        return response({ name: `projects/${PROJECT_ID}/locations/${REGION}/operations/update-1` });
+      }
+      if (url.pathname.endsWith('/operations/update-1')) return response({ done: true });
+      if (url.pathname === `/v1/${RESOURCE_NAME}/authString`) return response({ authString: REDIS_AUTH });
+      throw new Error(`Unexpected ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = await connected();
+    adapter.configureTarget({ region: REGION, network: 'default', subnetwork: 'default', tier: 'STANDARD_HA', size: '5gb' });
+
+    const result = await adapter.provision('redis', environment(), {
+      resourceName: 'Invoice Perfect Production Redis',
+      component: component(),
+      region: REGION,
+      network: 'default',
+      subnetwork: 'default',
+      tier: 'STANDARD_HA',
+      size: '5gb',
+    });
+
+    expect(result.receipt.success).toBe(true);
+    expect(result.component.bindings.runtimeNetwork).toEqual({
+      provider: 'cloudrun',
+      projectId: PROJECT_ID,
+      region: REGION,
+      network: NETWORK,
+      subnetwork: SUBNETWORK,
+      egress: 'PRIVATE_RANGES_ONLY',
+    });
+    expect(fetchMock.mock.calls.some(([, init]) => (init?.method ?? 'GET') === 'POST')).toBe(false);
   });
 });

@@ -36,11 +36,105 @@ describe('parseHostingBindings', () => {
     expect((bindings.services?.web as Record<string, unknown>).railwayRebind).toEqual({ previousServiceId: 'svc-0' });
   });
 
-  it('never throws on malformed or missing bindings', () => {
+  it('treats only missing legacy bindings as empty', () => {
     expect(parseHostingBindings(null)).toEqual({});
     expect(parseHostingBindings(undefined)).toEqual({});
     expect(parseHostingBindings({ platformBindings: {} })).toEqual({});
-    // Wrong types return {} instead of throwing.
-    expect(parseHostingBindings({ platformBindings: { provider: 42, services: 'nope' } as unknown as Record<string, unknown> })).toEqual({});
+  });
+
+  it.each([
+    ['provider', { provider: 42 }],
+    ['project ID', { projectId: {} }],
+    ['environment ID', { environmentId: '' }],
+    ['services map', { services: 'nope' }],
+    ['service ID', { services: { web: { serviceId: '' } } }],
+    ['service recovery map', { serviceCreateRecovery: [] }],
+    ['service recovery marker', {
+      serviceCreateRecovery: {
+        web: {
+          provider: 'railway',
+          operation: 'create',
+          resourceName: 'web-production',
+          providerScope: { projectId: 'project-1', environmentId: 'environment-1' },
+          state: 'identified',
+        },
+      },
+    }],
+    ['retained database', {
+      previousDatabase: {
+        provider: 'cloudsql', externalId: '', engine: 'postgres', name: 'database',
+        providerScope: { projectId: 'gcp-project' },
+      },
+    }],
+    ['retained cache engine', {
+      previousCache: {
+        provider: 'memorystore', externalId: 'cache-1', engine: 'memcached',
+        providerEngine: 'redis', name: 'cache', providerScope: { projectId: 'gcp-project' },
+      },
+    }],
+    ['retained cache scope', {
+      previousCache: {
+        provider: 'memorystore', externalId: 'cache-1', engine: 'redis',
+        providerEngine: 'redis', name: 'cache', providerScope: { projectId: '   ' },
+      },
+    }],
+  ])('fails closed on a malformed known %s binding', (_label, platformBindings) => {
+    expect(() => parseHostingBindings({
+      platformBindings: platformBindings as unknown as Record<string, unknown>,
+    })).toThrow();
+  });
+
+  it('validates service-create recovery while preserving provider-specific passthrough fields', () => {
+    const parsed = parseHostingBindings({
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'project-1',
+        railwayEnvironmentName: 'production',
+        serviceCreateRecovery: {
+          web: {
+            provider: 'railway',
+            operation: 'create',
+            resourceName: 'web-production',
+            providerScope: { projectId: 'project-1', environmentId: 'environment-1' },
+            state: 'unresolved',
+          },
+        },
+      },
+    });
+
+    expect(parsed.serviceCreateRecovery?.web).toMatchObject({
+      provider: 'railway',
+      resourceName: 'web-production',
+      state: 'unresolved',
+    });
+    expect((parsed as Record<string, unknown>).railwayEnvironmentName).toBe('production');
+  });
+
+  it('validates retained datastore identities while preserving provider-specific passthrough fields', () => {
+    const parsed = parseHostingBindings({
+      platformBindings: {
+        previousDatabase: {
+          provider: 'cloudsql',
+          externalId: 'database-1',
+          engine: 'postgres',
+          name: 'database',
+          providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+          providerReceipt: { operation: 'insert' },
+        },
+        previousCache: {
+          provider: 'memorystore',
+          externalId: 'cache-1',
+          engine: 'redis',
+          providerEngine: 'redis',
+          name: 'cache',
+          providerScope: { projectId: 'gcp-project', region: 'us-west1' },
+          providerReceipt: { operation: 'create' },
+        },
+      },
+    });
+
+    expect(parsed.previousDatabase?.externalId).toBe('database-1');
+    expect(parsed.previousCache?.externalId).toBe('cache-1');
+    expect((parsed.previousCache as Record<string, unknown>).providerReceipt).toEqual({ operation: 'create' });
   });
 });

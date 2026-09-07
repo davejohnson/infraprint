@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
-import { spawnSync } from 'child_process';
 import { SqliteAdapter } from '../../../db/sqlite.adapter.js';
 import { ProjectRepository } from '../../../db/repositories/project.repository.js';
 import { EnvironmentRepository } from '../../../db/repositories/environment.repository.js';
@@ -13,7 +12,6 @@ import { projectSpecSchema } from '../../../../domain/spec/spec.schema.js';
 import { gitLabCiLifecycle } from '../gitlab-ci.lifecycle.js';
 import '../../railway/railway.adapter.js';
 import {
-  buildRailwayGitLabImageRuntime,
   gitLabShellLiteral,
 } from '../../railway/railway-ci.recipe.js';
 
@@ -151,17 +149,6 @@ function seed() {
 describe('GitLab CI reviewed configuration lifecycle', () => {
   it('quotes generated shell literals without allowing apostrophes to break the command', () => {
     expect(gitLabShellLiteral("acme's storefront")).toBe("'acme'\\''s storefront'");
-  });
-
-  it('renders a syntactically valid hardened image-build wrapper', () => {
-    const script = buildRailwayGitLabImageRuntime(
-      { kind: 'node', version: '22', installCommand: 'npm ci' },
-      'node server.mjs'
-    );
-    const checked = spawnSync('sh', ['-n'], { input: script, encoding: 'utf8' });
-    expect(checked.status, checked.stderr).toBe(0);
-    expect(script).toContain('cp "$docker_path" .hypervibe-docker');
-    expect(script).toContain('chmod 700 .hypervibe-docker');
   });
 
   it('publishes one atomic reviewed change, then performs zero mutations at exact convergence', async () => {

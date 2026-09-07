@@ -128,7 +128,11 @@ export class CommandRegistry implements CommandRegistrar {
       throw new Error(`Duplicate Hypervibe command: ${name}`);
     }
 
-    const inputSchema = z.object(inputShape);
+    // Command inputs are contracts, not bags of best-effort options. Zod
+    // objects strip unknown keys by default, which made misspelled JSON/MCP
+    // arguments disappear before a handler could report them. Keep the
+    // canonical application boundary strict so every adapter rejects typos.
+    const inputSchema = z.object(inputShape).strict();
     this.definitions.set(name, {
       id: name,
       cliPath: cliPathForCommand(name),

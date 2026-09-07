@@ -23,6 +23,7 @@ interface LegacyDesiredState {
   deploy?: {
     strategy?: 'branch' | 'manual';
     trigger?: 'ci' | 'native';
+    branch?: string;
     branches?: { staging?: string; production?: string };
   };
   migrations?: { mode?: 'none' | 'releaseCommand' | 'tool'; runInDeploy?: boolean; command?: string };
@@ -72,10 +73,11 @@ export function desiredStateToSpec(project: Project): ProjectSpec | null {
   }
 
   const branchKind = classifyEnvironmentName(envName);
-  const branch = desired.deploy?.strategy === 'branch' && branchKind
-    ? (branchKind === 'production'
-      ? desired.deploy?.branches?.production ?? 'main'
-      : desired.deploy?.branches?.staging ?? 'main')
+  const branch = desired.deploy?.strategy === 'branch'
+    ? desired.deploy.branch
+      ?? (branchKind === 'production' ? desired.deploy.branches?.production : undefined)
+      ?? (branchKind === 'staging' ? desired.deploy.branches?.staging : undefined)
+      ?? 'main'
     : undefined;
 
   const environment: EnvironmentSpec = {
@@ -182,6 +184,20 @@ function repoSpecMatchesProject(spec: ProjectSpec, project: Project): boolean {
   return spec.project === project.name;
 }
 
+function parseStoredSpec(document: unknown, projectId: string, revision: number): ProjectSpec {
+  const parsed = projectSpecSchema.safeParse(document);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const path = issue?.path.join('.') || '(root)';
+    throw new Error(
+      `Cannot read stored desired state for project ${projectId} at revision ${revision}: `
+      + `persisted JSON has an invalid shape (${path}: ${issue?.message ?? 'unknown'}). `
+      + 'Hypervibe refuses to treat unreadable desired state as empty.'
+    );
+  }
+  return parsed.data;
+}
+
 function writeMatchingRepoSpec(project: Project, spec: ProjectSpec) {
   const existing = readRepoSpecFile();
   if (existing && !repoSpecMatchesProject(existing.spec, project)) {
@@ -216,8 +232,8 @@ export class SpecStore {
     if (repoSpec && repoSpecMatchesProject(repoSpec.spec, project)) {
       const latest = this.repo.findLatest(project.id);
       if (latest) {
-        const parsed = projectSpecSchema.safeParse(latest.document);
-        if (parsed.success && sameSpec(parsed.data, repoSpec.spec)) {
+        const parsed = parseStoredSpec(latest.document, project.id, latest.revision);
+        if (sameSpec(parsed, repoSpec.spec)) {
           return { spec: repoSpec.spec, revision: latest.revision, source: { kind: 'repo', path: repoSpec.path } };
         }
       }
@@ -228,12 +244,11 @@ export class SpecStore {
 
     const latest = this.repo.findLatest(project.id);
     if (latest) {
-      const parsed = projectSpecSchema.safeParse(latest.document);
-      if (parsed.success) {
-        return { spec: parsed.data, revision: latest.revision, source: { kind: 'local' } };
-      }
-      console.warn(`[hypervibe] Invalid spec document for project ${project.id} (revision ${latest.revision})`);
-      return null;
+      return {
+        spec: parseStoredSpec(latest.document, project.id, latest.revision),
+        revision: latest.revision,
+        source: { kind: 'local' },
+      };
     }
 
     const converted = desiredStateToSpec(project);
@@ -251,8 +266,7 @@ export class SpecStore {
   getRevision(projectId: string, revision: number): ProjectSpec | null {
     const row = this.repo.findByRevision(projectId, revision);
     if (!row) return null;
-    const parsed = projectSpecSchema.safeParse(row.document);
-    return parsed.success ? parsed.data : null;
+    return parseStoredSpec(row.document, projectId, revision);
   }
 
   /** Replace the spec wholesale. Returns the new revision. */
@@ -261,9 +275,14 @@ export class SpecStore {
     if (parsed.project !== project.name) {
       throw new Error(`Spec project "${parsed.project}" does not match target project "${project.name}".`);
     }
+    // Validate any repository source of truth before appending a local
+    // revision. Otherwise a corrupt repo file could make the write fail only
+    // after the journal had already accepted a divergent desired state.
+    const repoSpec = readRepoSpecFile();
+    const shouldWriteRepoSpec = !repoSpec || repoSpecMatchesProject(repoSpec.spec, project);
     const latest = this.repo.findLatest(project.id);
     const row = this.repo.insert(project.id, (latest?.revision ?? 0) + 1, parsed);
-    const written = writeMatchingRepoSpec(project, parsed);
+    const written = shouldWriteRepoSpec ? writeRepoSpecFile(parsed) : null;
     return {
       spec: parsed,
       revision: row.revision,

@@ -39,6 +39,12 @@ export interface ObservedService {
     healthCheckPath?: string;
     cronSchedule?: string;
     public?: boolean;
+    /** Provider-observed runtime VPC attachment for a private cache. */
+    cacheNetwork?: {
+      network: string;
+      subnetwork: string;
+      egress: string;
+    };
   };
   /** Repo-linked deploy source, when the provider links services to a git repo. */
   source?: { repo?: string; branch?: string };
@@ -121,7 +127,7 @@ export interface ObservedDatabase {
   /** Opaque, non-secret provider scope that disambiguates a provider-native id. */
   providerScope?: Record<string, string>;
   name?: string;
-  status: string;
+  status: 'running' | 'stopped' | 'provisioning' | 'error' | 'unknown';
   resilience?: {
     availability?: 'zonal' | 'regional' | 'unknown';
     backupPolicy?: {
@@ -149,7 +155,15 @@ export interface ObservedCache {
   /** Opaque, non-secret provider scope that makes this resource id an instance identity. */
   providerScope?: Record<string, string>;
   name?: string;
-  status: string;
+  status: 'running' | 'stopped' | 'provisioning' | 'error' | 'unknown';
+  /** Provider-observed, non-secret declarative placement/capacity. */
+  config?: {
+    region?: string;
+    network?: string;
+    subnetwork?: string;
+    tier?: string;
+    size?: string;
+  };
 }
 
 export interface ObservedStorage {
@@ -183,6 +197,13 @@ export interface ObservedState {
     databases?: 'complete' | 'unknown';
     caches?: 'complete' | 'unknown';
     storage?: 'complete' | 'unknown';
+    /**
+     * Storage can be reconciled through several provider connections in one
+     * environment. A provider is absent only when its own inventory completed;
+     * the aggregate `storage` field remains for compatibility and is unknown
+     * whenever any required provider is unknown.
+     */
+    storageByProvider?: Record<string, 'complete' | 'unknown'>;
   };
   /** True when one or more sub-queries failed; see warnings. */
   partial: boolean;

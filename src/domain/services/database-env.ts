@@ -1,4 +1,8 @@
 import type { Component } from '../entities/component.entity.js';
+import {
+  providerRegistry,
+  type DatabaseRuntimeProjection,
+} from '../registry/provider.registry.js';
 import type { DatabaseSpec, ServiceSpec } from '../spec/spec.schema.js';
 
 /** Runtime keys owned by a declared database component. */
@@ -65,106 +69,28 @@ function portBinding(bindings: Record<string, unknown>, fallback: number): strin
   return typeof value === 'number' || typeof value === 'string' ? String(value) : String(fallback);
 }
 
-function socketDatabaseUrl(params: {
-  username?: string;
-  password?: string;
-  database?: string;
-  socketHost: string;
-}): string | undefined {
-  if (!params.username || !params.password || !params.database) {
-    return undefined;
-  }
-
-  return `postgresql://${encodeURIComponent(params.username)}:${encodeURIComponent(params.password)}@/${encodeURIComponent(params.database)}?host=${encodeURIComponent(params.socketHost)}`;
-}
-
 export function databaseReplicaEnvKey(name: string): string {
   return `DATABASE_READ_URL_${name.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
 }
 
-function replicaBindings(bindings: Record<string, unknown>): Record<string, Record<string, unknown>> {
-  const resilience = bindings.resilience;
-  if (!resilience || typeof resilience !== 'object' || Array.isArray(resilience)) return {};
-  const replicas = (resilience as Record<string, unknown>).replicas;
-  if (!replicas || typeof replicas !== 'object' || Array.isArray(replicas)) return {};
-  return replicas as Record<string, Record<string, unknown>>;
-}
-
-export function buildDatabaseEnvVarsFromComponent(component: Component): { envVars: Record<string, string>; connectionUrl?: string } {
+function buildStandardDatabaseRuntimeProjection(component: Component): DatabaseRuntimeProjection {
   const bindings = component.bindings as Record<string, unknown>;
   const envVars: Record<string, string> = {};
-  const provider = stringBinding(bindings, 'provider');
   const connectionUrl = stringBinding(bindings, 'connectionUrl') ?? stringBinding(bindings, 'connectionString');
-
-  if (provider === 'railway') {
-    const pluginName = stringBinding(bindings, 'pluginName');
-    if (pluginName) {
-      envVars.DATABASE_URL = '${{' + pluginName + '.DATABASE_URL}}';
-      envVars.DIRECT_URL = '${{' + pluginName + '.DATABASE_PRIVATE_URL}}';
-      return { envVars, connectionUrl };
-    }
-  }
-
   const username = stringBinding(bindings, 'username');
   const password = stringBinding(bindings, 'password');
   const database = stringBinding(bindings, 'database');
   const port = portBinding(bindings, 5432);
 
-  if (provider === 'cloudsql') {
-    const connectionName = stringBinding(bindings, 'connectionName');
-    const socketHost = connectionName ? `/cloudsql/${connectionName}` : stringBinding(bindings, 'host');
-    const socketUrl = socketHost
-      ? socketDatabaseUrl({ username, password, database, socketHost })
-      : undefined;
-    const url = socketUrl ?? connectionUrl;
-
-    if (url) {
-      envVars.DATABASE_URL = url;
-      envVars.DIRECT_URL = url;
-    }
-    const replicas = Object.entries(replicaBindings(bindings)).sort(([left], [right]) => left.localeCompare(right));
-    const replicaConnectionNames = replicas
-      .map(([, replica]) => stringBinding(replica, 'connectionName'))
-      .filter((value): value is string => Boolean(value));
-    if (connectionName) {
-      const connectionNames = [connectionName, ...replicaConnectionNames].join(',');
-      envVars.CLOUD_SQL_CONNECTION_NAME = connectionNames;
-      envVars.INSTANCE_CONNECTION_NAME = connectionNames;
-    }
-    if (socketHost) {
-      envVars.DATABASE_HOST = socketHost;
-      envVars.DB_HOST = socketHost;
-      envVars.PGHOST = socketHost;
-    }
-    for (const [name, replica] of replicas) {
-      const replicaConnectionName = stringBinding(replica, 'connectionName');
-      const replicaUrl = replicaConnectionName
-        ? socketDatabaseUrl({
-          username,
-          password,
-          database,
-          socketHost: `/cloudsql/${replicaConnectionName}`,
-        })
-        : stringBinding(replica, 'connectionUrl');
-      if (replicaUrl) {
-        envVars[databaseReplicaEnvKey(name)] = replicaUrl;
-        if (replicas.length === 1) envVars.DATABASE_READ_URL = replicaUrl;
-      }
-    }
-  } else {
-    if (connectionUrl) {
-      envVars.DATABASE_URL = connectionUrl;
-      envVars.DIRECT_URL = connectionUrl;
-    }
-    const host = stringBinding(bindings, 'host');
-    if (host) {
-      envVars.DATABASE_HOST = host;
-      envVars.DB_HOST = host;
-      envVars.PGHOST = host;
-    }
-    if (provider === 'supabase') {
-      envVars.DATABASE_SSL = 'true';
-    }
+  if (connectionUrl) {
+    envVars.DATABASE_URL = connectionUrl;
+    envVars.DIRECT_URL = connectionUrl;
+  }
+  const host = stringBinding(bindings, 'host');
+  if (host) {
+    envVars.DATABASE_HOST = host;
+    envVars.DB_HOST = host;
+    envVars.PGHOST = host;
   }
 
   if (stringBinding(bindings, 'pooledUrl')) {
@@ -190,4 +116,14 @@ export function buildDatabaseEnvVarsFromComponent(component: Component): { envVa
   }
 
   return { envVars, connectionUrl };
+}
+
+export function buildDatabaseEnvVarsFromComponent(component: Component): DatabaseRuntimeProjection {
+  const standard = buildStandardDatabaseRuntimeProjection(component);
+  const bindings = component.bindings as Record<string, unknown>;
+  const provider = stringBinding(bindings, 'provider');
+  const projection = provider
+    ? providerRegistry.get(provider)?.databaseRuntime
+    : undefined;
+  return projection?.project(component, standard) ?? standard;
 }

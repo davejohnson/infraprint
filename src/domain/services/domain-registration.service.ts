@@ -36,7 +36,7 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function summarizeRegistrarDomain(domain: RegistrarDomainCandidate) {
   return {
-    name: domain.name,
+    name: normalizeDomain(domain.name),
     registrable: domain.registrable,
     tier: domain.tier ?? null,
     reason: domain.reason ?? null,
@@ -219,7 +219,7 @@ export async function planCloudflareDomainRegistration(params: {
   let candidate: RegistrarDomainCandidate | undefined;
   try {
     const checked = await adapter.checkRegistrarDomains(accountId, [domain]);
-    candidate = checked.find((entry) => entry.name.toLowerCase() === domain) ?? checked[0];
+    candidate = checked.find((entry) => normalizeDomain(entry.name) === domain);
   } catch (error) {
     warnings.push(`Cloudflare Registrar availability check failed for ${domain}: ${error instanceof Error ? error.message : String(error)}`);
     return { warnings };
@@ -319,7 +319,7 @@ export async function applyCloudflareDomainRegistration(params: {
   let candidate: RegistrarDomainCandidate | undefined;
   try {
     const checked = await adapter.checkRegistrarDomains(accountId, [domain]);
-    candidate = checked.find((entry) => entry.name.toLowerCase() === domain) ?? checked[0];
+    candidate = checked.find((entry) => normalizeDomain(entry.name) === domain);
   } catch (error) {
     return {
       success: false,
@@ -341,6 +341,25 @@ export async function applyCloudflareDomainRegistration(params: {
       message: `${domain} is premium priced`,
       error: 'Cloudflare Registrar API does not support premium domain registration.',
       data: { candidate: summarizeRegistrarDomain(candidate) },
+    };
+  }
+
+  const reviewedCandidate = asRecord(action.metadata?.candidate);
+  const reviewedRegistration = asRecord(action.metadata?.registration);
+  const currentCandidate = summarizeRegistrarDomain(candidate);
+  const currentRegistration = registrationOptions(environmentSpec);
+  if (
+    !reviewedCandidate
+    || !reviewedRegistration
+    || JSON.stringify(reviewedCandidate) !== JSON.stringify(currentCandidate)
+    || JSON.stringify(reviewedRegistration) !== JSON.stringify(currentRegistration)
+  ) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: `Cloudflare registration terms for ${domain} changed after planning`,
+      error: 'Availability, pricing, tier, or registration options no longer match the explicitly confirmed plan. Re-run hv_plan and review the new billable action.',
+      data: { candidate: currentCandidate },
     };
   }
 

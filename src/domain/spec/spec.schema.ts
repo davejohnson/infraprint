@@ -71,7 +71,7 @@ export const serviceSpecSchema = z.object({
     environmentVariableNameSchema,
     databaseEnvAliasSourceSchema
   ).optional(),
-}).superRefine((service, ctx) => {
+}).strict().superRefine((service, ctx) => {
   if (service.workloadKind === 'cron' && !service.cronSchedule) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -214,7 +214,17 @@ export const databaseSpecSchema = z.object({
 export const cacheSpecSchema = z.object({
   provider: providerIdSchema,
   engine: z.literal('redis').default('redis'),
-});
+  /** Provider-native placement. Omitted values preserve an existing cache. */
+  region: z.string().trim().min(1).optional(),
+  /** Existing provider-native network name or full resource id. */
+  network: z.string().trim().min(1).optional(),
+  /** Existing provider-native subnet name or full resource id. */
+  subnetwork: z.string().trim().min(1).optional(),
+  /** Provider-native service tier, for example BASIC or STANDARD_HA. */
+  tier: z.string().trim().min(1).optional(),
+  /** Provider-native capacity string, for example 1gb. */
+  size: z.string().trim().min(1).optional(),
+}).strict();
 
 /**
  * Provider-managed traffic distribution in front of deployed web services.
@@ -237,7 +247,7 @@ export const deploySpecSchema = z.object({
   autoDeploy: z.boolean().optional(),
   /** Production promotion source label, usually staging. Used for workflow guidance. */
   promoteFrom: z.string().min(1).optional(),
-});
+}).strict();
 
 export const collaborationLabelSpecSchema = z.object({
   name: z.string().min(1),
@@ -256,7 +266,7 @@ export const collaborationSpecSchema = z.object({
     enabled: z.boolean().default(true),
     labels: z.array(collaborationLabelSpecSchema).default([]),
     templates: z.boolean().default(true),
-  }).default({}),
+  }).strict().default({}),
   pullRequests: z.object({
     targetBranch: z.string().min(1).default('main'),
     requirePr: z.boolean().default(true),
@@ -273,7 +283,7 @@ export const collaborationSpecSchema = z.object({
     username: z.string().min(1),
     permission: z.enum(['pull', 'triage', 'push', 'maintain', 'admin']).default('push'),
   }).strict()).default([]),
-}).default({});
+}).strict().default({});
 
 const automationIdSchema = z.string().regex(
   /^[a-z][a-z0-9-]{0,62}$/,
@@ -476,7 +486,7 @@ const githubCollaborationSpecSchema = z.object({
     enabled: z.boolean().default(true),
     labels: z.array(collaborationLabelSpecSchema).default([]),
     templates: z.boolean().default(true),
-  }).default({}),
+  }).strict().default({}),
   pullRequests: z.object({
     targetBranch: z.string().min(1).default('main'),
     requirePr: z.boolean().default(true),
@@ -728,7 +738,7 @@ export const envFileSpecSchema = z.object({
   include: z.array(z.string().min(1)).default([]),
   /** Exact .env keys to omit even if the mode or include list would select them. */
   exclude: z.array(z.string().min(1)).default([]),
-}).default({});
+}).strict().default({});
 
 export const delegatedSecretSpecSchema = z.object({
   /** Delegated values are supplied explicitly at plan time and never stored in the spec. */
@@ -772,7 +782,7 @@ export const migrationsSpecSchema = z.object({
   mode: z.enum(['none', 'releaseCommand', 'tool']),
   runInDeploy: z.boolean().optional(),
   command: z.string().min(1).optional(),
-});
+}).strict();
 
 export const domainRegistrationSpecSchema = z.object({
   provider: z.literal('cloudflare').default('cloudflare'),
@@ -781,7 +791,7 @@ export const domainRegistrationSpecSchema = z.object({
   years: z.number().int().min(1).max(10).optional(),
   autoRenew: z.boolean().optional(),
   privacyMode: z.enum(['redaction', 'off']).optional(),
-});
+}).strict();
 
 export const iosTestflightGroupSpecSchema = z.object({
   internal: z.boolean().default(false),
@@ -790,7 +800,7 @@ export const iosTestflightGroupSpecSchema = z.object({
   feedbackEnabled: z.boolean().optional(),
   hasAccessToAllBuilds: z.boolean().optional(),
   testers: z.array(z.string().email()).default([]),
-});
+}).strict();
 
 const runtimeEnvVarNameSchema = z.string().regex(
   /^[A-Za-z_][A-Za-z0-9_]*$/,
@@ -882,9 +892,9 @@ export const iosSpecSchema = z.object({
   capabilities: z.array(z.string().min(1)).default([]),
   testflight: z.object({
     groups: z.record(z.string().min(1), iosTestflightGroupSpecSchema).default({}),
-  }).optional(),
+  }).strict().optional(),
   release: iosReleaseSpecSchema.optional(),
-}).superRefine((ios, ctx) => {
+}).strict().superRefine((ios, ctx) => {
   for (const [name, group] of Object.entries(ios.testflight?.groups ?? {})) {
     if (group.publicLinkLimit !== undefined && !group.publicLinkEnabled) {
       ctx.addIssue({
@@ -933,7 +943,7 @@ export const iosSpecSchema = z.object({
  * hypervibe wires env vars and apps own the tables).
  */
 export const queueSpecSchema = z.object({
-  /** Subscriber ack deadline in seconds (Pub/Sub only; ignored on the postgres backend). */
+  /** Subscriber ack deadline in seconds. Provider capability validation limits this to managed Pub/Sub queues. */
   ackDeadlineSeconds: z.number().int().min(10).max(600).optional(),
 }).strict();
 
@@ -1367,7 +1377,7 @@ export const environmentSpecSchema = z.object({
     provider: z.string().min(1),
     /** Optional desired placement. Omit to use the provider's sensible default. */
     region: z.string().trim().min(1).optional(),
-  }),
+  }).strict(),
   services: z.record(z.string().min(1), serviceSpecSchema).default({}),
   database: databaseSpecSchema.optional(),
   cache: cacheSpecSchema.optional(),
@@ -1409,7 +1419,7 @@ export const environmentSpecSchema = z.object({
   payments: paymentsSpecSchema.optional(),
   /** Kept only to produce an actionable migration error for old specs. */
   autofix: z.unknown().optional(),
-}).superRefine((environment, ctx) => {
+}).strict().superRefine((environment, ctx) => {
   if (environment.autofix !== undefined) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -1689,15 +1699,6 @@ export const environmentSpecSchema = z.object({
       });
     }
   }
-  if (environment.queues && Object.keys(environment.queues).length > 0
-    && environment.hosting.provider === 'railway'
-    && (!environment.database || environment.database.engine !== 'postgres')) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'railway queues are postgres-backed (pg-boss model): declare a postgres spec.database',
-      path: ['queues'],
-    });
-  }
   const databaseAliasKeys = new Set<string>();
   const replicaRuntimeKeys = new Set(environment.database?.resilience
     ? [
@@ -1731,7 +1732,7 @@ export const environmentSpecSchema = z.object({
     }
   }
   for (const [serviceName, service] of Object.entries(environment.services)) {
-    for (const [alias, source] of Object.entries(service.databaseEnvAliases ?? {})) {
+    for (const alias of Object.keys(service.databaseEnvAliases ?? {})) {
       databaseAliasKeys.add(alias);
       if (!environment.database) {
         ctx.addIssue({
@@ -1972,7 +1973,7 @@ export const projectSpecSchema = z.object({
     delegatedSecretSpecSchema
   ).default({}),
   environments: z.record(z.string().min(1), environmentSpecSchema),
-}).superRefine((spec, ctx) => {
+}).strict().superRefine((spec, ctx) => {
   for (const [targetName, target] of Object.entries(spec.environments)) {
     const migration = target.dataMigration;
     if (!migration) continue;

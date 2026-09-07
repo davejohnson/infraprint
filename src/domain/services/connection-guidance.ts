@@ -206,7 +206,7 @@ const GUIDANCE: Record<string, ConnectionGuidance> = {
   'aws-secrets': {
     provider: 'aws-secrets',
     displayName: 'AWS Secrets Manager',
-    tokenType: 'AWS IAM access key (accessKeyId/secretAccessKey, plus sessionToken for temporary STS session credentials)',
+    tokenType: 'AWS SDK default credential chain or explicit IAM access key (accessKeyId/secretAccessKey, plus sessionToken for temporary STS credentials)',
     setupUrl: 'https://console.aws.amazon.com/iam/home#/security_credentials',
     setupUrls: [
       {
@@ -225,17 +225,18 @@ const GUIDANCE: Record<string, ConnectionGuidance> = {
     permissions: [
       'secretsmanager:GetSecretValue and secretsmanager:ListSecrets for read-only resolution (ListSecrets is required for connection verification and hv_secrets).',
     ],
-    credentialExample: 'hv_connections provider="aws-secrets" credentialsRef="file:/absolute/path/aws-secrets.json"',
+    credentialExample: 'hv_connections provider="aws-secrets"',
     notes: [
       'Prefer temporary STS credentials when your organization can issue them. Never create or use root-user access keys.',
-      'Credentials come from the connection or the AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN environment variables; profiles, SSO, and instance roles are not read.',
+      'With credentials omitted, Hypervibe uses the AWS SDK default provider chain: environment variables, shared profiles and SSO, web identity, ECS task credentials, or an EC2 instance role.',
+      'For unattended automation, pass an explicit credentialsRef JSON containing accessKeyId and secretAccessKey, plus sessionToken when using temporary STS credentials.',
       'The secret access key is shown only when it is created. Save it outside the repository.',
     ],
   },
   'azure-postgres': {
     provider: 'azure-postgres',
     displayName: 'Azure Database for PostgreSQL',
-    tokenType: 'Microsoft Entra application service principal (tenantId, clientId, and clientSecret) scoped to one existing Azure subscription/resource group',
+    tokenType: 'Microsoft Entra application service principal (tenantId, clientId, and clientSecret) for one Azure subscription',
     setupUrl: 'https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade',
     setupUrls: [
       {
@@ -263,7 +264,8 @@ const GUIDANCE: Record<string, ConnectionGuidance> = {
     ],
     credentialExample: 'hv_connections provider="azure-postgres" credentialsRef="file:/absolute/path/azure-postgres.json"',
     notes: [
-      'The JSON file must contain tenantId, subscriptionId, clientId, clientSecret, resourceGroup, and location. Optional postgresSkuName, postgresSkuTier, postgresVersion, and postgresStorageSizeGb values select the server shape.',
+      'The JSON file contains only tenantId, subscriptionId, clientId, and clientSecret. Reuse the verified azure-container-apps connection when possible; resource-group identity, location, and server shape are lifecycle state, never credentials.',
+      'Hypervibe places PostgreSQL in the exact resource group owned by the same Azure Container Apps environment. This lifecycle intentionally rejects non-Azure hosting until a different network contract is implemented.',
       'Hypervibe creates one Flexible Server, one logical app database, and a firewall rule whose start/end are 0.0.0.0. Microsoft defines that rule as access from Azure services; it includes other customers’ Azure resources, so strong generated database credentials remain essential.',
       'The generated administrator credential and connection URL are encrypted in local component state and never returned in plans, receipts, logs, or repo bindings.',
       'Client secrets expire. Store this JSON outside the repository, rotate before expiry, and reconnect with the replacement value.',
@@ -272,7 +274,7 @@ const GUIDANCE: Record<string, ConnectionGuidance> = {
   'azure-managed-redis': {
     provider: 'azure-managed-redis',
     displayName: 'Azure Managed Redis',
-    tokenType: 'Microsoft Entra application service principal (tenantId, clientId, and clientSecret) scoped to one existing Azure subscription/resource group',
+    tokenType: 'Microsoft Entra application service principal (tenantId, clientId, and clientSecret) for one Azure subscription',
     setupUrl: 'https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade',
     setupUrls: [
       {
@@ -299,8 +301,9 @@ const GUIDANCE: Record<string, ConnectionGuidance> = {
     ],
     credentialExample: 'hv_connections provider="azure-managed-redis" credentialsRef="file:/absolute/path/azure-managed-redis.json"',
     notes: [
-      'The JSON file must contain tenantId, subscriptionId, clientId, clientSecret, resourceGroup, and location. Optional redisSkuName selects the billable cache size and defaults to Balanced_B0.',
-      'Hypervibe creates one TLS-only Azure Managed Redis cluster and its default database with access-key authentication enabled. The access key and REDIS_URL are encrypted locally and never enter output or repo state.',
+      'The JSON file contains only tenantId, subscriptionId, clientId, and clientSecret. Reuse the verified azure-container-apps connection when possible; resource-group identity and placement are lifecycle state, never credentials.',
+      'Hypervibe creates one public-network-enabled, TLS-only Azure Managed Redis cluster in the exact resource group owned by the same Azure Container Apps environment. The default database uses encrypted client protocol and access-key authentication; non-Azure hosting is rejected.',
+      'Set cache.region and cache.size in desired state when the documented defaults are unsuitable. Azure Managed Redis network, subnetwork, and tier fields are rejected by this public-endpoint lifecycle instead of being ignored.',
       'Client secrets expire. Store this JSON outside the repository, rotate before expiry, and reconnect with the replacement value.',
     ],
   },
@@ -435,8 +438,8 @@ const GUIDANCE: Record<string, ConnectionGuidance> = {
       'Grant roles/pubsub.editor when using queues.',
       'For read-only GCS inventory, explicitly prepare gcsAccess="inspect" to enable storage.googleapis.com and grant roles/storage.viewer.',
       'For GCS create, object transfer, or teardown, explicitly prepare gcsAccess="lifecycle" to grant roles/storage.admin after reviewing that broader project-scoped access.',
-      'For read-only Memorystore inventory, explicitly prepare memorystoreAccess="inspect" to enable redis.googleapis.com and grant roles/redis.viewer.',
-      'For Memorystore create or teardown, explicitly prepare memorystoreAccess="lifecycle" to grant roles/redis.admin after reviewing that broader project-scoped access.',
+      'For read-only Memorystore inventory, explicitly prepare memorystoreAccess="inspect" to enable Redis/Compute APIs and grant roles/redis.viewer plus roles/compute.networkViewer.',
+      'For Memorystore create or teardown, explicitly prepare memorystoreAccess="lifecycle" to grant roles/redis.admin, roles/compute.networkViewer, and roles/compute.networkUser after reviewing that broader project-scoped access.',
       'For Pub/Sub queue lifecycle, explicitly prepare queueAccess="lifecycle" to enable pubsub.googleapis.com and grant roles/pubsub.editor. Other preparation modes never add that role.',
       'Grant roles/logging.viewer and roles/logging.viewAccessor for logs.',
       'Native custom domains use the Cloud Run domain-mapping API covered by roles/run.admin. The connected identity must also be authorized for the verified base domain before apply.',
@@ -472,14 +475,15 @@ const GUIDANCE: Record<string, ConnectionGuidance> = {
     permissions: [
       'Grant roles/redis.viewer for connection verification and live observation of Memorystore instances.',
       'Grant roles/redis.admin when Hypervibe should create and delete Memorystore instances through hv_plan/hv_apply.',
+      'Grant roles/compute.networkViewer so plan/apply can prove the selected existing VPC and subnet, and roles/compute.networkUser so Cloud Run can attach Direct VPC egress.',
       'Grant serviceusage.services.use on the target project (roles/serviceusage.serviceUsageConsumer is the standard role) and enable redis.googleapis.com before connecting.',
       'When reusing Cloud Run credentials, preview hv_connections provider="cloudrun" action="prepare" memorystoreAccess="inspect" for inventory or memorystoreAccess="lifecycle" for create/delete, then explicitly confirm the reviewed preparation.',
-      'The Cloud Run runtime separately needs a declarative VPC egress path to the authorizedNetwork. The current Cloud Run adapter does not create that path, so the Cloud Run + Memorystore full-stack live profile remains blocked.',
+      'Declare cache.region/network/subnetwork/tier/size in hv_spec. Hypervibe verifies the existing network and configures Cloud Run Direct VPC egress; it never creates a VPC or subnet implicitly.',
     ],
     credentialExample: 'hv_connections provider="memorystore" credentialsRef="file:/absolute/path/memorystore.json"',
     notes: [
       'If the project already has a verified cloudrun connection, Hypervibe reuses it; no second Google service-account key is required.',
-      'The JSON must include projectId, credentials (the service-account JSON as a string), and region. authorizedNetwork may select an existing full VPC resource name; it defaults to projects/<projectId>/global/networks/default.',
+      'The connection JSON contains authentication only: projectId and credentials (the service-account JSON as a string). Placement belongs under environments.<name>.cache in hv_spec; omitted placement defaults new caches to us-central1 and the existing default VPC/default regional subnet.',
       'Hypervibe creates private-IP Redis with AUTH enabled and transit encryption disabled. Access is limited by the selected VPC, so never treat the resulting REDIS_URL as internet reachable.',
       'Google recommends short-lived credentials over service-account JSON keys. If a key is required, rotate it and grant only the project roles above.',
     ],
@@ -545,19 +549,19 @@ const GUIDANCE: Record<string, ConnectionGuidance> = {
   elasticache: {
     provider: 'elasticache',
     displayName: 'Amazon ElastiCache',
-    tokenType: 'AWS IAM access key (accessKeyId/secretAccessKey, plus sessionToken for temporary STS credentials) scoped to one account, region, and VPC',
+    tokenType: 'the verified AWS IAM access key pair used by ECS (accessKeyId/secretAccessKey) and scoped to one account',
     setupUrl: 'https://console.aws.amazon.com/iam/home#/security_credentials',
     permissions: [
-      'For verification and observation: elasticache:DescribeServerlessCaches, ec2:DescribeSubnets, and ec2:DescribeSecurityGroups.',
+      'Reuse the verified ecs connection; do not create a separate placement credential. For verification and observation add elasticache:DescribeServerlessCaches plus ec2:DescribeVpcs, ec2:DescribeSubnets, and ec2:DescribeSecurityGroups to that IAM principal.',
       'For lifecycle management through hv_plan/hv_apply: elasticache:CreateServerlessCache, elasticache:DeleteServerlessCache, elasticache:AddTagsToResource, ec2:CreateSecurityGroup, ec2:AuthorizeSecurityGroupIngress, ec2:DeleteSecurityGroup, and ec2:CreateTags.',
       'If the account has never used ElastiCache, allow iam:CreateServiceLinkedRole only when iam:AWSServiceName equals elasticache.amazonaws.com, or have an administrator create that service-linked role first.',
     ],
-    credentialExample: 'hv_connections provider="elasticache" credentialsRef="file:/absolute/path/elasticache.json"',
+    credentialExample: 'hv_connections provider="ecs" credentialsRef="file:/absolute/path/aws-ecs.json"',
     notes: [
-      'The JSON must include accessKeyId, secretAccessKey, region, at least two subnetIds in distinct availability zones, and one or more securityGroupIds used by the workloads that connect to the cache.',
-      'Hypervibe creates a dedicated managed security group that accepts TCP 6379 only from the declared workload security groups, then creates a TLS-only serverless Valkey cache in those subnets.',
+      'The JSON needs only accessKeyId and secretAccessKey. Region and size belong in environments.<name>.cache; network, subnet, and security-group IDs are never connection credentials.',
+      'The ECS project action creates and binds a tagged workload security group in the region\'s exact default VPC. ElastiCache re-observes that binding read-only, creates a dedicated managed security group accepting TCP 6379 only from the workload group, and creates TLS-only serverless Valkey in the exact default subnets.',
       'Deletion waits for provider-confirmed cache absence before removing the managed security group. Cache deletion is data-bearing and exact-action confirmation remains required.',
-      'Prefer temporary STS credentials. Scope mutation permissions to the intended account, region, VPC, and Hypervibe-tagged resources where AWS supports resource-level conditions.',
+      'Scope mutation permissions to the intended account, region, default VPC, and Hypervibe-tagged resources where AWS supports resource-level conditions.',
     ],
   },
   ecs: {
@@ -580,8 +584,8 @@ const GUIDANCE: Record<string, ConnectionGuidance> = {
       },
     ],
     permissions: [
-      'For identity and observation: sts:GetCallerIdentity; ecs:ListClusters, ecs:DescribeClusters, ecs:ListServices, ecs:DescribeServices, ecs:DescribeExpressGatewayService; ecr:DescribeRepositories, ecr:ListTagsForResource; iam:GetRole, iam:ListAttachedRolePolicies; ec2:DescribeVpcs; acm:ListCertificates, acm:DescribeCertificate, acm:ListTagsForCertificate; and elasticloadbalancing:DescribeLoadBalancers, DescribeTargetGroups, DescribeListeners, DescribeListenerCertificates, and DescribeRules.',
-      'For the reviewed project action: ec2:CreateDefaultVpc when the selected region lacks one; ecr:CreateRepository, ecr:DeleteRepository, ecr:TagResource; iam:CreateRole, iam:DeleteRole, iam:TagRole, iam:AttachRolePolicy, iam:DetachRolePolicy, and iam:PassRole limited to Hypervibe hv-* roles; and ecs:CreateCluster, ecs:DeleteCluster, ecs:TagResource.',
+      'For identity and observation: sts:GetCallerIdentity; ecs:ListClusters, ecs:DescribeClusters, ecs:ListServices, ecs:DescribeServices, ecs:DescribeExpressGatewayService; ecr:DescribeRepositories, ecr:ListTagsForResource; iam:GetRole, iam:ListAttachedRolePolicies; ec2:DescribeVpcs, ec2:DescribeSubnets, ec2:DescribeSecurityGroups; acm:ListCertificates, acm:DescribeCertificate, acm:ListTagsForCertificate; and elasticloadbalancing:DescribeLoadBalancers, DescribeTargetGroups, DescribeListeners, DescribeListenerCertificates, and DescribeRules.',
+      'For the reviewed project action: ec2:CreateDefaultVpc when the selected region lacks one, plus ec2:CreateSecurityGroup, ec2:DeleteSecurityGroup, and ec2:CreateTags for the deterministic Hypervibe workload group; ecr:CreateRepository, ecr:DeleteRepository, ecr:TagResource; iam:CreateRole, iam:DeleteRole, iam:TagRole, iam:AttachRolePolicy, iam:DetachRolePolicy, and iam:PassRole limited to Hypervibe hv-* roles; and ecs:CreateCluster, ecs:DeleteCluster, ecs:TagResource.',
       'Allow the project action to attach only AmazonECSTaskExecutionRolePolicy and AmazonECSInfrastructureRoleforExpressGatewayServices. The latter is AWS\'s managed infrastructure policy for Express Mode.',
       'For service lifecycle and CI release: ecs:CreateExpressGatewayService, ecs:UpdateExpressGatewayService, ecs:DeleteExpressGatewayService, ecs:DescribeExpressGatewayService; ecr:GetAuthorizationToken plus ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage, ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload, and ecr:PutImage on hypervibe/* repositories; and iam:PassRole for the two exact project roles.',
       'For declared custom domains: acm:RequestCertificate, acm:AddTagsToCertificate, acm:DescribeCertificate, acm:ListCertificates, acm:ListTagsForCertificate, acm:DeleteCertificate, elasticloadbalancing:DescribeLoadBalancers, DescribeTargetGroups, DescribeListeners, DescribeListenerCertificates, DescribeRules, AddListenerCertificates, RemoveListenerCertificates, and ModifyRule on Express-managed load balancers.',
@@ -589,7 +593,7 @@ const GUIDANCE: Record<string, ConnectionGuidance> = {
     ],
     credentialExample: 'hv_connections provider="ecs" credentialsRef="file:/absolute/path/aws-ecs.json"',
     notes: [
-      'The JSON needs only accessKeyId and secretAccessKey. Do not include region, cluster, repository, VPC, subnet, security-group, IAM-role, load-balancer, listener, or certificate IDs—Hypervibe creates and binds those through plan/apply.',
+      'The JSON needs only accessKeyId and secretAccessKey. Do not include region, cluster, repository, VPC, subnet, security-group, IAM-role, load-balancer, listener, or certificate IDs—Hypervibe creates and binds those through plan/apply. The same verified ecs connection is reused by ElastiCache.',
       'Hypervibe uses us-west-2 when environments.<name>.hosting.region is omitted. An agent may declare another AWS region in the spec when latency, residency, or existing infrastructure requires it.',
       'AWS does not publish a documented pre-filled access-key creation template. The official IAM page cannot safely preselect a user or permissions, so Hypervibe does not invent dashboard query parameters.',
       'ECS Express Mode creates the Fargate service, public HTTPS endpoint, load balancer, security groups, autoscaling, monitoring, and networking components. Hypervibe owns the smaller prerequisite project boundary and exact-digest CI release.',
@@ -722,15 +726,16 @@ const GUIDANCE: Record<string, ConnectionGuidance> = {
     tokenType: 'AWS IAM access key (accessKeyId/secretAccessKey, plus sessionToken for temporary STS credentials)',
     setupUrl: 'https://console.aws.amazon.com/iam/home#/security_credentials',
     permissions: [
-      'For verification and observation: rds:DescribeDBInstances, ec2:DescribeVpcs, ec2:DescribeSecurityGroups, and ec2:DescribeSecurityGroupRules.',
+      'For verification and observation: rds:DescribeDBInstances, rds:DescribeDBSubnetGroups, ec2:DescribeVpcs, ec2:DescribeSubnets, ec2:DescribeSecurityGroups, and ec2:DescribeSecurityGroupRules.',
       'For operation-scoped hv_db_query access: ec2:AuthorizeSecurityGroupIngress and ec2:RevokeSecurityGroupIngress on the database security group.',
       'For lifecycle management through hv_plan/hv_apply: rds:CreateDBInstance, rds:DeleteDBInstance, rds:AddTagsToResource, ec2:CreateSecurityGroup, ec2:DeleteSecurityGroup, and ec2:CreateTags.',
     ],
-    credentialExample: 'hv_connections provider="rds" credentialsRef="file:/absolute/path/rds.json"',
+    credentialExample: 'reuse the verified ECS identity automatically with hv_connections provider="ecs" credentialsRef="file:/absolute/path/aws.json"; a separate compatible identity may use hv_connections provider="rds" credentialsRef="file:/absolute/path/rds.json"',
     notes: [
-      'The JSON must include accessKeyId, secretAccessKey, and region; include sessionToken for temporary STS credentials, plus vpcId/dbSubnetGroupName when the region has no suitable default VPC.',
+      'RDS desired state is accepted only for ECS-hosted environments. Hypervibe derives region and the exact default-VPC workload network from the persisted ECS binding; it never creates or guesses that hosting network from a database action.',
+      'A standalone RDS JSON includes accessKeyId and secretAccessKey, with sessionToken for temporary STS credentials. Legacy region/vpcId/dbSubnetGroupName values must match the bound ECS account, region, and default VPC.',
       'Scope RDS mutation permissions to the intended DB instance ARNs and EC2 mutation permissions to security groups in the intended account, region, and VPC. AWS describe actions generally require Resource="*".',
-      'Hypervibe-created RDS instances are publicly addressable but start with no public ingress. hv_db_query adds only the current caller IPv4 /32 and removes it after the query. Private-only RDS requires a durable VPC/SSM path declared outside this diagnostic call.',
+      'Hypervibe-created RDS instances have one durable PostgreSQL rule from the exact ECS workload security group. hv_db_query may add only the current caller IPv4 /32 under a separate operation-scoped label and removes it after the query.',
       'Prefer temporary STS credentials. IAM user secret access keys are shown only once when created and should be rotated regularly.',
     ],
   },
@@ -982,6 +987,9 @@ function credentialExample(
       break;
     case 'stripe':
       if (options.scope) example = example.replace('scope="development"', `scope="${options.scope}"`);
+      break;
+    case 'elasticache':
+      if (options.scope) example = example.replace('provider="ecs"', `provider="ecs" scope="${options.scope}"`);
       break;
   }
   if (options.scope && !example.includes(`scope="${options.scope}"`)) {

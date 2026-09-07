@@ -16,7 +16,7 @@ import {
 import '../../../adapters/providers/openai/openai.adapter.js';
 import { getSecretStore } from '../../../adapters/secrets/secret-store.js';
 import { executePlanApply } from '../../../application/apply-plan.js';
-import { createToolContext } from '../../../tools/context.js';
+import { createToolContext } from '../../../application/context.js';
 import type { Project } from '../../entities/project.entity.js';
 import { PlanService } from '../../plan/plan.service.js';
 import type { PlanAction } from '../../plan/plan.types.js';

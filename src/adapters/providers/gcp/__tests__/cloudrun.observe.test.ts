@@ -46,6 +46,13 @@ const webService = {
   labels: { 'infraprint-environment': 'production', 'infraprint-service': 'web' },
   terminalCondition: { type: 'Ready', state: 'CONDITION_SUCCEEDED' },
   template: {
+    vpcAccess: {
+      networkInterfaces: [{
+        network: 'projects/gcp-project/global/networks/default',
+        subnetwork: 'projects/gcp-project/regions/us-central1/subnetworks/default',
+      }],
+      egress: 'PRIVATE_RANGES_ONLY',
+    },
     containers: [{
       image: 'us-central1-docker.pkg.dev/gcp-project/infraprint/production-web:main',
       env: [
@@ -209,6 +216,11 @@ describe('CloudRunAdapter.observe', () => {
       config: {
         healthCheckPath: '/healthz',
         public: true,
+        cacheNetwork: {
+          network: 'projects/gcp-project/global/networks/default',
+          subnetwork: 'projects/gcp-project/regions/us-central1/subnetworks/default',
+          egress: 'PRIVATE_RANGES_ONLY',
+        },
       },
       envVarKeys: ['DATABASE_URL', 'SECRET_VALUE'],
       status: 'running',
@@ -284,12 +296,198 @@ describe('CloudRunAdapter.observe', () => {
     expect(observed.partial).toBe(true);
     expect(observed.warnings).toHaveLength(1);
     expect(observed.warnings[0]).toContain('Failed to list Cloud Run services');
+    expect(observed.completeness?.services).toBe('unknown');
     expect(observed.services).toHaveLength(1);
     expect(observed.services[0]).toMatchObject({
       name: 'cron',
       workloadKind: 'cron',
       status: 'running',
     });
+  });
+
+  it('marks service observation unknown when the Cloud Run job list fails', async () => {
+    const adapter = await connectedAdapter();
+
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes('/domainmappings?')) return Response.json({ items: [] });
+      if (url.includes('/services?')) return Response.json({ services: [] });
+      if (url.includes('/jobs?')) return new Response('unavailable', { status: 503 });
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    const observed = await adapter.observe(environmentWith({
+      provider: 'cloudrun',
+      projectId: 'gcp-project',
+    }));
+
+    expect(observed.completeness?.services).toBe('unknown');
+    expect(observed.partial).toBe(true);
+    expect(observed.warnings).toEqual([
+      expect.stringContaining('Failed to list Cloud Run jobs'),
+    ]);
+  });
+
+  it('keeps IAM observation failures visible and marks services unknown', async () => {
+    const adapter = await connectedAdapter();
+
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes('/domainmappings?')) return Response.json({ items: [] });
+      if (url.includes('/services?')) return Response.json({ services: [webService] });
+      if (url.includes('/jobs?')) return Response.json({ jobs: [] });
+      if (url.endsWith('/services/gcp-project-web:getIamPolicy')) {
+        return new Response('permission denied', { status: 403 });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    const observed = await adapter.observe(environmentWith({
+      provider: 'cloudrun',
+      projectId: 'gcp-project',
+    }));
+
+    expect(observed.completeness?.services).toBe('unknown');
+    expect(observed.partial).toBe(true);
+    expect(observed.warnings).toEqual([
+      expect.stringContaining('Failed to read Cloud Run IAM policy for gcp-project-web'),
+    ]);
+    expect(observed.services[0]?.config).not.toHaveProperty('public');
+  });
+
+  it('marks services unknown when a per-job Scheduler lookup fails', async () => {
+    const adapter = await connectedAdapter();
+
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes('/domainmappings?')) return Response.json({ items: [] });
+      if (url.includes('/services?')) return Response.json({ services: [] });
+      if (url.includes('/jobs?')) return Response.json({ jobs: [cronJob] });
+      if (url.endsWith('/jobs/gcp-project-cron-schedule')) {
+        return new Response('scheduler unavailable', { status: 503 });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    const observed = await adapter.observe(environmentWith({
+      provider: 'cloudrun',
+      projectId: 'gcp-project',
+    }));
+
+    expect(observed.completeness?.services).toBe('unknown');
+    expect(observed.partial).toBe(true);
+    expect(observed.warnings).toEqual([
+      expect.stringContaining('Failed to read Cloud Scheduler job gcp-project-cron-schedule'),
+    ]);
+    expect(observed.services).toHaveLength(1);
+  });
+
+  it('rejects a defined non-array Cloud Run collection as incomplete observation', async () => {
+    const adapter = await connectedAdapter();
+
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes('/domainmappings?')) return Response.json({ items: [] });
+      if (url.includes('/services?')) return Response.json({ services: { item: webService } });
+      if (url.includes('/jobs?')) return Response.json({ jobs: [] });
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    const observed = await adapter.observe(environmentWith({
+      provider: 'cloudrun',
+      projectId: 'gcp-project',
+    }));
+
+    expect(observed.completeness?.services).toBe('unknown');
+    expect(observed.services).toEqual([]);
+    expect(observed.warnings).toEqual([
+      expect.stringContaining('non-array services collection'),
+    ]);
+  });
+
+  it('rejects a repeated Cloud Run page token instead of completing a cyclic list', async () => {
+    const adapter = await connectedAdapter();
+    let servicePageCalls = 0;
+
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes('/domainmappings?')) return Response.json({ items: [] });
+      if (url.includes('/services?')) {
+        servicePageCalls += 1;
+        return Response.json({ services: [], nextPageToken: 'repeat-token' });
+      }
+      if (url.includes('/jobs?')) return Response.json({ jobs: [] });
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    const observed = await adapter.observe(environmentWith({
+      provider: 'cloudrun',
+      projectId: 'gcp-project',
+    }));
+
+    expect(servicePageCalls).toBe(2);
+    expect(observed.completeness?.services).toBe('unknown');
+    expect(observed.services).toEqual([]);
+    expect(observed.warnings).toEqual([
+      expect.stringContaining('repeated a nextPageToken'),
+    ]);
+  });
+
+  it.each([
+    'projects/other-project/locations/us-central1/services/gcp-project-web',
+    'projects/gcp-project/locations/europe-west1/services/gcp-project-web',
+    'projects/gcp-project/locations/us-central1/jobs/gcp-project-web',
+  ])('rejects a Cloud Run service outside the exact collection scope: %s', async (name) => {
+    const adapter = await connectedAdapter();
+
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes('/domainmappings?')) return Response.json({ items: [] });
+      if (url.includes('/services?')) return Response.json({ services: [{ ...webService, name }] });
+      if (url.includes('/jobs?')) return Response.json({ jobs: [] });
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    const observed = await adapter.observe(environmentWith({
+      provider: 'cloudrun',
+      projectId: 'gcp-project',
+    }));
+
+    expect(observed.completeness?.services).toBe('unknown');
+    expect(observed.services).toEqual([]);
+    expect(observed.warnings).toEqual([
+      expect.stringContaining('outside exact project gcp-project, region us-central1, or kind services'),
+    ]);
+  });
+
+  it('rejects duplicate Cloud Run resource IDs across pages', async () => {
+    const adapter = await connectedAdapter();
+    let servicePageCalls = 0;
+
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes('/domainmappings?')) return Response.json({ items: [] });
+      if (url.includes('/services?')) {
+        servicePageCalls += 1;
+        return servicePageCalls === 1
+          ? Response.json({ services: [webService], nextPageToken: 'page-2' })
+          : Response.json({ services: [{ ...webService }] });
+      }
+      if (url.includes('/jobs?')) return Response.json({ jobs: [] });
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    const observed = await adapter.observe(environmentWith({
+      provider: 'cloudrun',
+      projectId: 'gcp-project',
+    }));
+
+    expect(servicePageCalls).toBe(2);
+    expect(observed.completeness?.services).toBe('unknown');
+    expect(observed.services).toEqual([]);
+    expect(observed.warnings).toEqual([
+      expect.stringContaining('duplicate services resource id gcp-project-web'),
+    ]);
   });
 
   it('attaches, observes, and terminally detaches one exact Cloud Run domain mapping', async () => {

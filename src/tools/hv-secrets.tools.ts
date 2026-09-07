@@ -84,14 +84,14 @@ export function registerHvSecretsTools(commands: CommandRegistrar, ctx: CommandC
     {
       project: projectField.describe('Optional Hypervibe project name/id for validated context. Project-only still lists sources. Omit to use no project context for source/manager lists or auto-detect only in GitHub/hosting modes.'),
       env: envField.describe('Exact environment for hosting-variable inspection. Required in hosting mode; never inferred from project alone.'),
-      key: z.string().optional().describe('Hosting variable name or key within a manager secret'),
+      key: z.string().min(1).optional().describe('Hosting variable name or key within a manager secret'),
       provider: z.enum(SECRET_MANAGER_PROVIDERS).optional(),
-      path: z.string().optional().describe('Secret-manager path'),
-      version: z.string().optional().describe('Secret-manager version'),
-      service: z.string().optional().describe('Hosting service name'),
-      pathPrefix: z.string().optional().describe('With provider and no path: restrict listed manager paths'),
+      path: z.string().min(1).optional().describe('Secret-manager path'),
+      version: z.string().min(1).optional().describe('Secret-manager version'),
+      service: z.string().min(1).optional().describe('Hosting service name'),
+      pathPrefix: z.string().min(1).optional().describe('With provider and no path: restrict listed manager paths'),
       include: z.array(z.literal('github')).optional().describe('Also list GitHub Actions secret names'),
-      repo: z.string().optional().describe('GitHub owner/name; defaults to the project git remote'),
+      repo: z.string().min(1).optional().describe('GitHub owner/name; defaults to the project git remote'),
     },
     wrapCommandHandler(async ({ project: projectRef, env, key, provider, path, version, service, pathPrefix, include, repo }) => {
       const selectedProject = projectRef
@@ -106,7 +106,7 @@ export function registerHvSecretsTools(commands: CommandRegistrar, ctx: CommandC
         if (!provider || !path) throw new HvError('VALIDATION', 'provider and path must be passed together.');
         const secret = await (await managerAdapter(ctx, provider, selectedProject?.name)).getSecret(path, key, version);
         return commandSuccess({
-          secretRef: `${provider}://${path}${key ? `#${key}` : ''}`,
+          secretRef: `${provider}://${path}${key ? `#${key}` : ''}${version ? `@${version}` : ''}`,
           value: REDACTED,
           present: secret.value.length > 0,
           version: secret.version,

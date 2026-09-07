@@ -3,10 +3,14 @@ import { commandError, commandSuccess, type CommandEnvelope } from './results.js
 import { providerRegistry } from '../domain/registry/provider.registry.js';
 import { inspectProvider } from './inspect-provider.js';
 import { suppliedOptionNames } from './command-options.js';
+import {
+  parseUnresolvedDatabaseMutation,
+  parseUnresolvedDatastoreMutation,
+} from '../domain/ports/database.port.js';
 
 export interface ImportProviderInput {
   provider: string;
-  mode?: 'adopt' | 'retained-cleanup' | 'retained-database-cleanup' | 'retained-resource-cleanup';
+  mode?: 'adopt' | 'retained-cleanup' | 'retained-database-cleanup' | 'retained-cache-cleanup' | 'retained-resource-cleanup';
   resource?: string;
   project?: string;
   env?: string;
@@ -246,11 +250,41 @@ async function retainDatabaseCleanup(
   if (engine !== 'postgres') {
     return commandError('UNSUPPORTED', `Retained cleanup supports PostgreSQL, but ${externalId} was reported as ${engine ?? 'an unknown engine'}.`);
   }
+  const resourceName = stringValue(exact[0].name) ?? externalId;
+  const unresolvedComponents = ctx.repos.components.findByEnvironmentId(environment.id)
+    .filter((component) => (
+      component.type === 'postgres'
+      && component.externalId === null
+      && component.bindings.provisioningIncomplete === true
+      && component.bindings.provider === provider
+    ));
+  if (unresolvedComponents.length > 1) {
+    return commandError('VALIDATION', `Multiple unresolved ${provider} database markers exist for ${project.name}/${environment.name}.`, {
+      hint: 'Repair the duplicate local component state before selecting a data-bearing cleanup target.',
+    });
+  }
+  if (unresolvedComponents.length === 1) {
+    const marker = parseUnresolvedDatabaseMutation(unresolvedComponents[0]!.bindings);
+    if (
+      !marker
+      || marker.resourceName !== resourceName
+      || !sameRecord(marker.providerScope, providerScope)
+    ) {
+      return commandError('VALIDATION', `Database ${externalId} does not exactly match the unresolved ${provider} create marker.`, {
+        details: {
+          inspected: { externalId, name: resourceName, providerScope },
+          unresolvedMarker: marker,
+        },
+        hint: 'Refresh hv_inspect for the marker’s exact provider name and full scope. Hypervibe will not retarget unresolved local state to a different database.',
+        next: ['hv_inspect'],
+      });
+    }
+  }
   const previousDatabase = {
     provider,
     externalId,
     engine,
-    name: stringValue(exact[0].name) ?? externalId,
+    name: resourceName,
     providerScope,
   };
 
@@ -283,6 +317,209 @@ async function retainDatabaseCleanup(
   });
 }
 
+async function retainCacheCleanup(
+  ctx: CommandContext,
+  input: ImportProviderInput,
+  provider: string
+): Promise<CommandEnvelope> {
+  if (!input.project || !input.env || !input.id?.trim()) {
+    return commandError('VALIDATION', 'retained-cache-cleanup requires project, env, and the exact cache id returned by hv_inspect.', {
+      hint: `Run hv_inspect provider="${provider}" resource="cache", then pass one exact returned id with the current Hypervibe project and environment.`,
+      next: ['hv_inspect', 'hv_import'],
+    });
+  }
+  const registration = providerRegistry.get(provider);
+  const contract = registration?.inspection?.selectors.cache;
+  const acceptedSelectors = new Set([
+    ...(contract?.required ?? []),
+    ...(contract?.optional ?? []),
+    ...(contract?.oneOf?.flat() ?? []),
+  ]);
+  if (
+    !providerRegistry.supports(provider, 'cache')
+    || !registration?.inspection?.resources.includes('cache')
+    || contract?.mode !== 'provider-resource'
+    || contract.list !== true
+    || !acceptedSelectors.has('id')
+    || !acceptedSelectors.has('limit')
+    || (contract.scopeKeys?.length ?? 0) === 0
+  ) {
+    return commandError('UNSUPPORTED', `${registration?.metadata.displayName ?? provider} cannot inventory and retain an exact cache cleanup target.`, {
+      hint: 'A provider-owned, bounded exact-id cache inspection contract with durable scope is required before Hypervibe can authorize cleanup.',
+      next: ['hv_inspect'],
+    });
+  }
+
+  const project = ctx.resolveProjectOrThrow({ project: input.project });
+  const environment = ctx.resolveEnvironmentOrThrow(project, input.env);
+  const currentBindings = record(environment.platformBindings) ?? {};
+  if (record(currentBindings.previousCache)) {
+    return commandError('VALIDATION', 'A retained cache cleanup target already exists for this environment.', {
+      details: { previousCache: currentBindings.previousCache },
+      hint: 'Finish the existing retained cleanup plan before recording another data-bearing target.',
+      next: ['hv_plan'],
+    });
+  }
+
+  const externalId = input.id.trim();
+  const activeComponent = ctx.repos.components.findByEnvironmentId(environment.id).find((component) => (
+    component.type === 'redis'
+    && component.bindings.provider === provider
+    && (
+      component.externalId
+      ?? stringValue(component.bindings.instanceId)
+      ?? stringValue(component.bindings.serviceId)
+    ) === externalId
+  ));
+  if (activeComponent) {
+    return commandError('VALIDATION', `Cache ${externalId} is the active locally bound ${provider} component for ${project.name}/${environment.name}.`, {
+      hint: 'Change desired state and use the ordinary hv_plan/hv_apply cache destroy lifecycle; retained cleanup is only for an abandoned unbound identity.',
+      next: ['hv_plan'],
+    });
+  }
+
+  const unresolvedComponents = ctx.repos.components.findByEnvironmentId(environment.id)
+    .filter((component) => (
+      component.type === 'redis'
+      && component.externalId === null
+      && component.bindings.provisioningIncomplete === true
+      && component.bindings.provider === provider
+    ));
+  if (unresolvedComponents.length > 1) {
+    return commandError('VALIDATION', `Multiple unresolved ${provider} cache markers exist for ${project.name}/${environment.name}.`, {
+      hint: 'Repair the duplicate local component state before selecting a data-bearing cleanup target.',
+    });
+  }
+  const unresolvedMarker = unresolvedComponents.length === 1
+    ? parseUnresolvedDatastoreMutation(unresolvedComponents[0]!.bindings, 'cache')
+    : null;
+  if (unresolvedComponents.length === 1 && !unresolvedMarker) {
+    return commandError('VALIDATION', `The unresolved ${provider} cache marker is malformed.`, {
+      hint: 'Repair the local marker before selecting any provider resource for deletion.',
+    });
+  }
+
+  const forensic = await inspectProvider(ctx, {
+    provider,
+    project: project.name,
+    resource: 'cache',
+    id: externalId,
+  });
+  const caches = Array.isArray(forensic.caches) ? forensic.caches : [];
+  const exactById = caches
+    .map(record)
+    .filter((cache): cache is Record<string, unknown> => Boolean(cache))
+    .filter((cache) => stringValue(cache.id) === externalId);
+  const exact = unresolvedMarker
+    ? exactById.filter((cache) => {
+        const scope = record(cache.providerScope);
+        return scope && sameRecord(scope, unresolvedMarker.providerScope);
+      })
+    : exactById;
+  if (forensic.partial !== false || forensic.truncated !== false) {
+    return commandError('PROVIDER_ERROR', `${registration.metadata.displayName} returned an incomplete cache inventory; cleanup identity was not retained.`, {
+      details: forensic,
+      hint: 'Resolve the provider read failure and refresh hv_inspect before retaining a data-bearing deletion target.',
+      next: ['hv_inspect'],
+    });
+  }
+  if (forensic.observation !== 'present' || exact.length === 0) {
+    return commandError('NOT_FOUND', `${registration.metadata.displayName} did not confirm cache ${externalId} is present.`, {
+      details: forensic,
+      hint: 'Refresh hv_inspect inventory. Hypervibe will not retain or delete an unverified identity.',
+      next: ['hv_inspect'],
+    });
+  }
+  if (exact.length !== 1) {
+    return commandError('VALIDATION', `${registration.metadata.displayName} did not return one unambiguous cache for id ${externalId}.`, {
+      details: forensic,
+      hint: 'Use one exact durable provider id from a fresh inventory; Hypervibe will not choose between scoped candidates.',
+      next: ['hv_inspect'],
+    });
+  }
+  if (exact[0].cleanupSupported === false) {
+    return commandError('UNSUPPORTED', `${registration.metadata.displayName} can inventory cache ${externalId}, but its provider resource kind cannot be deleted through the lifecycle adapter.`, {
+      details: { cache: exact[0] },
+      hint: 'Keep the resource visible in hv_inspect; do not retain it as a deletion target until the provider exposes a supported teardown operation.',
+      next: ['hv_inspect'],
+    });
+  }
+  const providerScope = record(exact[0].providerScope);
+  const requiredScopeKeys = contract.scopeKeys ?? [];
+  if (
+    !providerScope
+    || Object.keys(providerScope).length === 0
+    || Object.entries(providerScope).some(([key, value]) => (
+      !key.trim() || typeof value !== 'string' || !value.trim()
+    ))
+    || requiredScopeKeys.some((key) => typeof providerScope[key] !== 'string' || !providerScope[key])
+  ) {
+    return commandError('PROVIDER_ERROR', `${registration.metadata.displayName} did not return the durable provider scope for cache ${externalId}.`, {
+      details: { cache: exact[0], requiredScopeKeys },
+      hint: 'The provider inspector must return a complete, non-secret providerScope before this id can become a deletion target.',
+      next: ['hv_inspect'],
+    });
+  }
+  const providerEngine = stringValue(exact[0].engine);
+  if (providerEngine !== 'redis' && providerEngine !== 'valkey') {
+    return commandError('UNSUPPORTED', `Retained cache cleanup supports Redis-compatible caches, but ${externalId} was reported as ${providerEngine ?? 'an unknown engine'}.`);
+  }
+  const resourceName = stringValue(exact[0].name) ?? externalId;
+  if (unresolvedMarker) {
+    if (
+      unresolvedMarker.resourceName !== resourceName
+      || !sameRecord(unresolvedMarker.providerScope, providerScope)
+    ) {
+      return commandError('VALIDATION', `Cache ${externalId} does not exactly match the unresolved ${provider} create marker.`, {
+        details: {
+          inspected: { externalId, name: resourceName, engine: providerEngine, providerScope },
+          unresolvedMarker,
+        },
+        hint: 'Refresh hv_inspect for the marker’s exact provider name and full scope. Hypervibe will not retarget unresolved local state to a different cache.',
+        next: ['hv_inspect'],
+      });
+    }
+  }
+  const resourceKind = stringValue(exact[0].resourceKind);
+  const previousCache = {
+    provider,
+    externalId,
+    engine: 'redis',
+    providerEngine,
+    name: resourceName,
+    providerScope,
+    ...(resourceKind ? { resourceKind } : {}),
+  };
+
+  if (!input.confirm) {
+    return commandError('CONFIRM_REQUIRED', `This will retain ${provider} cache ${externalId} as the exact data-bearing deletion target for ${project.name}/${environment.name}. No provider resource will be changed yet.`, {
+      details: { previousCache },
+      hint: 'Re-run hv_import with confirm=true, then use hv_plan scope="retained-cleanup" and explicitly confirm its cache destroy action.',
+      next: ['hv_import'],
+    });
+  }
+
+  ctx.repos.environments.updatePlatformBindings(environment.id, { previousCache });
+  ctx.repos.audit.create({
+    action: 'cache.previous.retained',
+    resourceType: 'environment',
+    resourceId: environment.id,
+    details: { project: project.name, environment: environment.name, provider, externalId, providerScope },
+  });
+  return commandSuccess({
+    retainedCacheCleanup: {
+      provider,
+      project: project.name,
+      environment: environment.name,
+      externalId,
+      providerScope,
+    },
+  }, {
+    hint: 'Run hv_plan with scope="retained-cleanup" and confirm only the exact retained cache destroy action after reviewing the identity and scope.',
+    next: ['hv_plan'],
+  });
+}
+
 export type ProviderImportDriver = (
   ctx: CommandContext,
   input: ImportProviderInput
@@ -298,6 +535,13 @@ function record(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function sameRecord(left: Record<string, unknown>, right: Record<string, unknown>): boolean {
+  const sorted = (value: Record<string, unknown>) => Object.fromEntries(
+    Object.entries(value).sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+  );
+  return JSON.stringify(sorted(left)) === JSON.stringify(sorted(right));
 }
 
 async function retainHostingCleanup(
@@ -476,7 +720,7 @@ export async function importProvider(
       databaseMappings: input.databaseMappings,
       cacheMappings: input.cacheMappings,
     }
-    : mode === 'retained-database-cleanup'
+    : mode === 'retained-database-cleanup' || mode === 'retained-cache-cleanup'
       ? {
         resource: input.resource,
         region: input.region,
@@ -508,6 +752,9 @@ export async function importProvider(
   }
   if (mode === 'retained-database-cleanup') {
     return retainDatabaseCleanup(ctx, input, provider);
+  }
+  if (mode === 'retained-cache-cleanup') {
+    return retainCacheCleanup(ctx, input, provider);
   }
   if (mode === 'retained-resource-cleanup') {
     return retainResourceCleanup(ctx, input, provider);

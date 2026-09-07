@@ -199,6 +199,17 @@ Generic orchestration owns sequencing and policy:
 - producing provider-neutral receipts,
 - and preserving the spec/plan/apply contract.
 
+Every registered hosting lifecycle declares the exact `workloadKinds` its
+adapter can reconcile end to end (`web`, `worker`, and/or `cron`). Registry
+registration rejects missing, empty, duplicate, or unknown claims. Spec
+validation checks every declared service against that provider-owned metadata
+before a new project is persisted and before plan/apply can observe or mutate a
+provider project or environment. Do not infer worker support from deployment
+category, cron support from a vendor's general product surface, or either from
+an adapter's unrelated feature flags. A provider is listed for a workload kind
+only after its create, update, CI/deploy, observation, and teardown paths handle
+that kind; any limits on exact kind observation remain separately declared.
+
 Product-specific surfaces such as SendGrid email setup or Stripe payments may stay opinionated when they are not part of generic infrastructure reconciliation.
 
 ## Platform Bindings
@@ -340,12 +351,13 @@ provider; deletion remains a separately reviewed `hv_plan`/`hv_apply` action.
 those previous-host destroy actions. The same isolated scope may include one
 exact abandoned PostgreSQL identity recorded through
 `hv_import mode="retained-database-cleanup"` after provider-owned inventory.
-That binding carries the durable provider id and provider-native account/project
+It may likewise include one exact Redis-compatible cache identity recorded through
+`hv_import mode="retained-cache-cleanup"`. These bindings carry the durable provider id and provider-native account/project
 and region/organization scope, never connection material. Planning and apply
 re-observe that exact scoped identity; deletion is data-bearing and
 confirmation-gated, and the binding is cleared only after provider-confirmed
 terminal absence. It observes the current host for the usual stale-plan
-fingerprint, preflights only the current and retained hosting or database
+fingerprint, preflights only the current and retained hosting, database, or cache
 providers, and neither loads deploy env files nor resolves unrelated
 integrations. `hv_apply` derives that isolation from the persisted plan scope,
 not caller input.
@@ -403,6 +415,10 @@ handler. A load-balancer hostname owns routing for `environment.domain`, so the
 ordinary single-service domain/DNS action is mutually exclusive while the
 load-balancer spec is present. Teardown reverses the dependency order and must
 confirm terminal absence before clearing each binding.
+Provider-internal ingress created as part of a hosting lifecycle, such as the
+ECS Express ALB, remains owned by that hosting action and is not advertised as
+a generic edge load-balancer provider. The generic contract is for redundant
+public origins and requires the explicit monitor/pool/hostname lifecycle above.
 
 Opt-in live load-balancer conformance exercises that same desired-state path
 against disposable provider resources. Test cleanup removes the public
@@ -1035,6 +1051,16 @@ pending receipt until `hv_ci_status` proves the workflow succeeded and
 `hv_health` proves the endpoint. Rollback never reverses database migrations or
 provider-side manual configuration; tool-mode migration steps are skipped during
 rollback, while startup/release-command migrations must remain backward-compatible.
+
+Direct-provider deploy runs do not currently persist a provider-neutral,
+immutable release identity that can be restored and re-observed. Their service
+receipts and historical spec revision are not proof of the deployed source or
+image. `hv_rollback` therefore fails closed for direct-provider environments,
+including when given a historical `toRunId`; it must never redeploy the current
+spec or checkout and describe that mutation as restoration. Direct-provider
+rollback may be added only through an adapter capability that persists the exact
+immutable release identity, freezes it into action-scoped authority, and
+re-verifies it immediately before and after mutation.
 
 Do not switch a project to `deploy.trigger: "native"` just to avoid missing CI, package, or image credentials. That changes the desired infrastructure contract. Provider-native deploys are an explicit opt-in and may require provider-specific external app access such as the Railway GitHub App.
 

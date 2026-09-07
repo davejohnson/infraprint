@@ -1,18 +1,20 @@
 import { z } from 'zod';
+import { hostingBindingsSchema } from '../../domain/ports/hosting.port.js';
 
 /**
  * Zod schemas for JSON TEXT columns, used with parseJsonColumn so reads are
  * validated instead of blind `JSON.parse` + type assertions.
  *
- * All schemas are passthrough (tolerate extra keys) and carry defaults so a
- * corrupt row degrades to an empty value rather than throwing.
+ * All schemas are passthrough (to preserve provider-owned extension fields)
+ * and carry defaults only for genuinely empty legacy columns. Non-empty
+ * corrupt or schema-invalid state is rejected by parseJsonColumn.
  */
 
 /** projects.policies — free-form policy map (includes legacy desiredState). */
 export const policiesColumnSchema = z.record(z.unknown()).default({});
 
 /** environments.platform_bindings — provider bindings (see HostingBindings). */
-export const platformBindingsColumnSchema = z.record(z.unknown()).default({});
+export const platformBindingsColumnSchema = hostingBindingsSchema;
 
 /** services.build_config */
 export const buildConfigColumnSchema = z

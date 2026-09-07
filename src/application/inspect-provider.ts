@@ -11,6 +11,7 @@ import { getProjectScopeHints } from '../domain/services/project-scope.js';
 import type { Component } from '../domain/entities/component.entity.js';
 import type { Environment } from '../domain/entities/environment.entity.js';
 import type { ObservedState } from '../domain/ports/observe.port.js';
+import { parseHostingBindings } from '../domain/ports/hosting.port.js';
 
 export interface InspectProviderInput {
   provider?: string;
@@ -46,6 +47,26 @@ function hostingBindingForProvider(
   if (current?.provider === provider) return current;
   const previous = asRecord(current?.previousHosting);
   return previous?.provider === provider ? previous : undefined;
+}
+
+function compatibleDatastoreHostingBinding(
+  environment: Environment,
+  datastoreProvider: string,
+  resource: string | undefined
+): Record<string, unknown> | undefined {
+  if (resource !== 'database' && resource !== 'cache') return undefined;
+  const hosting = parseHostingBindings(environment);
+  if (!hosting.provider || !hosting.projectId) return undefined;
+  const lifecycle = providerRegistry.getMetadata(datastoreProvider)?.lifecycle;
+  const compatibleHostingProviders = resource === 'database'
+    ? lifecycle?.databaseConnectivity?.compatibleHostingProviders
+    : lifecycle?.cacheConnectivity?.compatibleHostingProviders;
+  if (!compatibleHostingProviders?.includes(hosting.provider)) return undefined;
+  return {
+    provider: hosting.provider,
+    projectId: hosting.projectId,
+    ...(hosting.environmentId ? { environmentId: hosting.environmentId } : {}),
+  };
 }
 
 function advertisedResources(providerName: string): string[] {
@@ -84,6 +105,17 @@ function selectorMode(
   };
 }
 
+function contractAcceptsSelector(
+  contract: ProviderInspectionSelectorContract | undefined,
+  selector: ProviderInspectionSelector
+): boolean {
+  return Boolean(contract && [
+    ...(contract.required ?? []),
+    ...(contract.optional ?? []),
+    ...(contract.oneOf?.flat() ?? []),
+  ].includes(selector));
+}
+
 function advertisedInspectionModes(providerName: string): Array<Record<string, unknown>> {
   const registered = providerRegistry.get(providerName);
   if (!registered) return [];
@@ -110,10 +142,14 @@ function advertisedInspectionModes(providerName: string): Array<Record<string, u
     }
   }
   if (providerRegistry.supports(providerName, 'hosting')) {
+    const supportsRegion = contractAcceptsSelector(
+      inspection?.selectors.environment,
+      'region'
+    );
     modes.push(selectorMode('environment', {
       mode: 'environment',
       required: ['project', 'env'],
-      optional: ['scope', 'region'],
+      optional: ['scope', ...(supportsRegion ? ['region' as const] : [])],
     }, 'environment'));
   }
   if (providerRegistry.supports(providerName, 'database')) {
@@ -163,6 +199,8 @@ function listProviders(ctx: CommandContext): Record<string, unknown> {
         provider: registered.metadata.name,
         displayName: registered.metadata.displayName,
         category: registered.metadata.category,
+        maturity: registered.metadata.maturity ?? {},
+        lifecycle: registered.metadata.lifecycle ?? {},
         resources: advertisedResources(registered.metadata.name),
         retainedCleanupResources: [...(registered.retainedCleanup?.resources ?? [])],
         inspectionModes: advertisedInspectionModes(registered.metadata.name),
@@ -264,6 +302,7 @@ function validateStatefulInspectionResult(params: {
   result: Record<string, unknown>;
   limit: number;
 }): void {
+  if (params.contract.list !== true) return;
   const collectionKey = params.contract.collectionKey
     ?? (params.resource === 'database'
       ? 'databases'
@@ -272,8 +311,6 @@ function validateStatefulInspectionResult(params: {
         : params.resource === 'storage'
           ? 'storage'
           : undefined);
-  if (!collectionKey) return;
-  const collection = params.result[collectionKey];
   const fail = (reason: string, details: Record<string, unknown> = {}): never => {
     throw new HvError(
       'PROVIDER_ERROR',
@@ -284,6 +321,18 @@ function validateStatefulInspectionResult(params: {
       }
     );
   };
+  // Some provider-owned list modes (notably environment forensics) expose
+  // more than one top-level collection and therefore have no single
+  // collectionKey. Enforce the public limit on every returned collection so
+  // an adapter/API over-return can never leak through hv_inspect.
+  for (const [key, value] of Object.entries(params.result)) {
+    if (key === 'warnings' || key === collectionKey || !Array.isArray(value)) continue;
+    if (value.length > params.limit) {
+      fail(`returned ${value.length} ${key} entries above limit ${params.limit}.`, { collectionKey: key });
+    }
+  }
+  if (!collectionKey) return;
+  const collection = params.result[collectionKey];
   if (!Array.isArray(collection)) {
     fail(`missing ${collectionKey} collection.`);
   }
@@ -333,11 +382,24 @@ function validateStatefulInspectionResult(params: {
 function componentForProvider(
   ctx: CommandContext,
   environment: Environment,
-  providerName: string
+  providerName: string,
+  resource: 'database' | 'cache' | undefined
 ): Component | null {
-  return ctx.repos.components.findByEnvironmentId(environment.id).find((component) => (
+  const expectedType = resource === 'database'
+    ? 'postgres'
+    : resource === 'cache'
+      ? 'redis'
+      : undefined;
+  const matches = ctx.repos.components.findByEnvironmentId(environment.id).filter((component) => (
     component.bindings.provider === providerName
-  )) ?? null;
+    && (!expectedType || component.type === expectedType)
+  ));
+  if (matches.length > 1) {
+    throw new HvError('VALIDATION', `Multiple ${providerName} ${resource ?? 'datastore'} components are bound to environment "${environment.name}".`, {
+      hint: 'Repair the duplicate local component identities before provider inspection. Hypervibe will not choose the first match.',
+    });
+  }
+  return matches[0] ?? null;
 }
 
 function boundedObservation(observed: ObservedState): Record<string, unknown> {
@@ -476,13 +538,23 @@ export async function inspectProvider(
   }
 
   if (environment) {
-    const invalid = input.resource === 'storage'
-      ? []
+    const supportsRegion = contractAcceptsSelector(
+      providerInspection?.selectors.environment,
+      'region'
+    );
+    const invalid = (input.resource === 'storage'
+      ? [input.region !== undefined ? 'region' : undefined]
       : [
         input.id !== undefined ? 'id' : undefined,
         (!input.resource || input.resource === 'environment') && input.name !== undefined ? 'name' : undefined,
         input.limit !== undefined && !hostingForensics ? 'limit' : undefined,
-      ].filter((field): field is string => Boolean(field));
+        input.region !== undefined && (
+          !hostingEnvironmentInspection
+          || !supportsRegion
+          || input.resource === 'database'
+          || input.resource === 'cache'
+        ) ? 'region' : undefined,
+      ]).filter((field): field is string => Boolean(field));
     if (invalid.length > 0) {
       const corrected = { ...input };
       for (const field of invalid) delete corrected[field as keyof InspectProviderInput];
@@ -547,6 +619,15 @@ export async function inspectProvider(
   const adapter = resolved.adapter as unknown as Record<string, unknown>;
   const limit = Math.max(1, Math.min(input.limit ?? 25, 100));
   const currentHostingProvider = environment ? hostingProvider(environment) : undefined;
+  const datastoreInspectionResource = inspectionResource
+    ?? input.resource
+    ?? (environment && registered.metadata.category === 'database'
+      ? 'database'
+      : environment && registered.metadata.category === 'cache'
+        ? 'cache'
+        : undefined);
+  const datastoreInspection = datastoreInspectionResource === 'database'
+    || datastoreInspectionResource === 'cache';
   const request: ProviderInspectionRequest = {
     scope: requestedScope,
     resource: inspectionResource,
@@ -563,7 +644,13 @@ export async function inspectProvider(
             projectId: environment.projectId,
             name: environment.name,
           },
-          binding: hostingBindingForProvider(environment, providerName),
+          binding: datastoreInspection
+            ? compatibleDatastoreHostingBinding(
+              environment,
+              providerName,
+              datastoreInspectionResource
+            )
+            : hostingBindingForProvider(environment, providerName),
         }
       : {}),
   };
@@ -652,7 +739,12 @@ export async function inspectProvider(
         };
       }
 
-      const component = componentForProvider(ctx, environment, providerName);
+      const componentResource = input.resource === 'database' || input.resource === 'cache'
+        ? input.resource
+        : registered.metadata.category === 'database' || registered.metadata.category === 'cache'
+          ? registered.metadata.category
+          : undefined;
+      const component = componentForProvider(ctx, environment, providerName, componentResource);
       const observeDatabase = adapter.observeDatabase;
       const databaseInventoryContract = providerInspection?.selectors.database;
       if (
@@ -668,6 +760,8 @@ export async function inspectProvider(
           name: request.name,
           limit: request.limit,
           ...(request.project ? { project: request.project } : {}),
+          ...(request.environment ? { environment: request.environment } : {}),
+          ...(request.binding ? { binding: request.binding } : {}),
         });
         if (inspected.resource !== 'database') {
           throw new HvError('PROVIDER_ERROR', `${registered.metadata.displayName} returned the wrong inspection resource.`, {
@@ -698,7 +792,7 @@ export async function inspectProvider(
           observed: null,
           binding: 'missing',
           inventory: inspected,
-          warning: 'These are provider-account candidates, not environment attribution. Use hv_import for explicit adoption or retained cleanup; Hypervibe did not select a database.',
+          warning: 'These are provider-account candidates, not environment attribution. Generic database adoption is not implemented; hv_import mode="retained-database-cleanup" can retain one freshly inspected exact ID only for confirmation-gated deletion. Hypervibe did not select a database.',
         };
       }
       if ((standardResource === 'database' || !standardResource) && typeof observeDatabase === 'function') {

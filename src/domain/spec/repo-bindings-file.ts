@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import path from 'path';
+import { z } from 'zod';
 import type { Environment } from '../entities/environment.entity.js';
 import type { Project } from '../entities/project.entity.js';
 import { findRepoRoot, repoSpecEnabled } from './repo-spec-file.js';
@@ -24,6 +25,16 @@ export interface RepoBindingsFile {
 const HYPERVIBE_DIR = '.hypervibe';
 const BINDINGS_FILE = 'bindings.json';
 const SENSITIVE_KEY_PATTERN = /(^|_)?(secret|token|password|connectionstring|connectionurl|databaseurl|databaseprivateurl|privateurl|privatekey|apikey)($|_)?/i;
+const repoBindingsFileSchema = z.object({
+  version: z.literal(1),
+  project: z.string().trim().min(1),
+  environments: z.record(
+    z.string().min(1),
+    z.object({
+      platformBindings: z.record(z.unknown()),
+    }).strict()
+  ),
+}).strict();
 
 function bindingsPath(root: string): string {
   return path.join(root, HYPERVIBE_DIR, BINDINGS_FILE);
@@ -109,22 +120,58 @@ function presentStorageInstanceScopes(platformBindings: Record<string, unknown>)
   };
 }
 
-function normalizeDocument(raw: unknown, projectName: string): RepoBindingsFile {
-  const record = asRecord(raw) ?? {};
-  const environments = asRecord(record.environments) ?? {};
+function parseDocument(raw: unknown, file: string, projectName?: string): RepoBindingsFile {
+  const parsed = repoBindingsFileSchema.safeParse(raw);
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .slice(0, 5)
+      .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+      .join('; ');
+    throw new Error(
+      `${file} does not match the repository bindings schema: ${issues}. `
+      + 'Fix the file (or intentionally delete it when no shared bindings should remain) and retry.'
+    );
+  }
+  if (projectName && parsed.data.project !== projectName) {
+    throw new Error(
+      `${file} belongs to project "${parsed.data.project}", not resolved project "${projectName}". `
+      + 'Use the matching checkout or repair the repository bindings project identity before retrying.'
+    );
+  }
+
   const normalized: RepoBindingsFile['environments'] = {};
-  for (const [envName, value] of Object.entries(environments)) {
-    const envRecord = asRecord(value);
-    const platformBindings = asRecord(envRecord?.platformBindings);
-    if (platformBindings) {
-      normalized[envName] = { platformBindings: sanitize(platformBindings) as Record<string, unknown> };
-    }
+  for (const [envName, value] of Object.entries(parsed.data.environments)) {
+    normalized[envName] = {
+      platformBindings: sanitize(value.platformBindings) as Record<string, unknown>,
+    };
   }
   return {
     version: 1,
-    project: typeof record.project === 'string' && record.project.trim() ? record.project : projectName,
+    project: parsed.data.project,
     environments: normalized,
   };
+}
+
+function readExistingBindingsFile(file: string): string | null {
+  try {
+    return readFileSync(file, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+      return null;
+    }
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    throw new Error(`${file} could not be read${code ? ` (${code})` : ''}. Fix the file permissions and retry.`);
+  }
+}
+
+function parseBindingsJson(raw: string, file: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `${file} is not valid JSON. Fix the file (or intentionally delete it when no shared bindings should remain) and retry.`
+    );
+  }
 }
 
 export function readRepoBindingsFile(projectName?: string, startDir = primaryWorkspaceDirectory()): { path: string; document: RepoBindingsFile } | null {
@@ -136,16 +183,9 @@ export function readRepoBindingsFile(projectName?: string, startDir = primaryWor
     return null;
   }
   const file = bindingsPath(root);
-  if (!existsSync(file)) {
-    return null;
-  }
-  const raw = JSON.parse(readFileSync(file, 'utf8'));
-  const rawProject = asRecord(raw)?.project;
-  const fallbackProject = typeof rawProject === 'string' ? rawProject : '';
-  const document = normalizeDocument(raw, projectName ?? fallbackProject);
-  if (projectName && document.project !== projectName) {
-    return null;
-  }
+  const raw = readExistingBindingsFile(file);
+  if (raw === null) return null;
+  const document = parseDocument(parseBindingsJson(raw, file), file, projectName);
   return { path: file, document };
 }
 
@@ -159,12 +199,10 @@ export function writeRepoBindingsForEnvironment(project: Project, environment: E
   }
 
   const file = bindingsPath(root);
-  const current = existsSync(file)
-    ? normalizeDocument(JSON.parse(readFileSync(file, 'utf8')), project.name)
-    : { version: 1 as const, project: project.name, environments: {} };
-  if (current.project !== project.name) {
-    return null;
-  }
+  const raw = readExistingBindingsFile(file);
+  const current = raw === null
+    ? { version: 1 as const, project: project.name, environments: {} }
+    : parseDocument(parseBindingsJson(raw, file), file, project.name);
 
   const platformBindings = presentStorageInstanceScopes(
     sanitize(environment.platformBindings) as Record<string, unknown>
@@ -175,7 +213,13 @@ export function writeRepoBindingsForEnvironment(project: Project, environment: E
     current.environments[environment.name] = { platformBindings };
   }
   if (Object.keys(current.environments).length === 0) {
-    if (existsSync(file)) unlinkSync(file);
+    if (raw !== null) {
+      try {
+        unlinkSync(file);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') throw error;
+      }
+    }
     return null;
   }
   const dir = path.dirname(file);

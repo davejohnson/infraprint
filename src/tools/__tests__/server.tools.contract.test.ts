@@ -91,6 +91,23 @@ describe('server tool surface', () => {
       'The only supported dispatch path'
     );
     expect(names).not.toContain('hv_db_migrate');
+    expect(tools.find((tool) => tool.name === 'hv_logs')?.annotations?.readOnlyHint).toBe(true);
+    expect(tools.find((tool) => tool.name === 'hv_apply')?.annotations?.readOnlyHint).toBe(false);
+    await client.close();
+    await server.close();
+  });
+
+  it('returns structured validation errors for unknown MCP arguments instead of dropping them', async () => {
+    const { client, server } = await makeClient();
+    const result = await client.callTool({
+      name: 'hv_logs',
+      arguments: { source: 'service', limti: 1 },
+    });
+    const body = parseToolEnvelope(result);
+
+    expect(body).toMatchObject({ ok: false, error: { code: 'VALIDATION' } });
+    expect(JSON.stringify(body.error?.details)).toContain('limti');
+    expect(result.isError).toBe(true);
     await client.close();
     await server.close();
   });

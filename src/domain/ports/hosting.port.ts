@@ -78,34 +78,179 @@ export interface HostingBindings {
       branch?: string;
     };
   }>;
+
+  /**
+   * Durable, non-secret blockers for service creates whose provider outcome
+   * was not fully reconciled. These are recovery hints, never normal service
+   * bindings or deletion authority.
+   */
+  serviceCreateRecovery?: Record<string, HostingServiceCreateRecovery>;
+}
+
+export interface HostingServiceCreateRecovery {
+  provider: string;
+  operation: 'create';
+  resourceName: string;
+  providerScope: Record<string, string>;
+  state: 'unresolved' | 'identified' | 'mismatched';
+  serviceId?: string;
+  returnedName?: string;
+}
+
+const nonEmptyHostingBindingString = z.string().trim().min(1);
+const hostingProviderScopeSchema = z.record(nonEmptyHostingBindingString)
+  .refine(
+    (scope) => Object.keys(scope).length > 0
+      && Object.keys(scope).every((key) => key.trim().length > 0),
+    'Provider scope must contain at least one non-empty key and value.'
+  );
+
+export function createHostingServiceCreateRecovery(input: {
+  provider: string;
+  resourceName: string;
+  providerScope: Record<string, string>;
+  state: HostingServiceCreateRecovery['state'];
+  serviceId?: string;
+  returnedName?: string;
+}): HostingServiceCreateRecovery {
+  const provider = input.provider.trim();
+  const resourceName = input.resourceName.trim();
+  const providerScope = Object.fromEntries(
+    Object.entries(input.providerScope)
+      .map(([key, value]) => [key.trim(), value.trim()] as const)
+      .sort(([left], [right]) => left.localeCompare(right))
+  );
+  const serviceId = input.serviceId?.trim();
+  const returnedName = input.returnedName?.trim();
+  if (!provider || !resourceName || Object.keys(providerScope).length === 0
+    || Object.entries(providerScope).some(([key, value]) => !key || !value)
+    || (input.state === 'unresolved' && serviceId)
+    || (input.state !== 'unresolved' && !serviceId)
+    || (input.state === 'identified' && returnedName !== resourceName)
+    || (input.state === 'mismatched' && returnedName === resourceName)) {
+    throw new Error('A hosting service-create recovery marker requires a consistent provider, name, scope, state, and optional provider id.');
+  }
+  return {
+    provider,
+    operation: 'create',
+    resourceName,
+    providerScope,
+    state: input.state,
+    ...(serviceId ? { serviceId } : {}),
+    ...(returnedName ? { returnedName } : {}),
+  };
+}
+
+export const hostingServiceCreateRecoverySchema = z.object({
+  provider: nonEmptyHostingBindingString,
+  operation: z.literal('create'),
+  resourceName: nonEmptyHostingBindingString,
+  providerScope: hostingProviderScopeSchema,
+  state: z.enum(['unresolved', 'identified', 'mismatched']),
+  serviceId: nonEmptyHostingBindingString.optional(),
+  returnedName: nonEmptyHostingBindingString.optional(),
+}).strict().superRefine((marker, ctx) => {
+  if (marker.state === 'unresolved' && marker.serviceId) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'An unresolved service create cannot claim a provider service ID.',
+      path: ['serviceId'],
+    });
+  }
+  if (marker.state !== 'unresolved' && !marker.serviceId) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'An identified or mismatched service create requires a provider service ID.',
+      path: ['serviceId'],
+    });
+  }
+  if (marker.state === 'identified' && marker.returnedName !== marker.resourceName) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'An identified service create must return the exact requested resource name.',
+      path: ['returnedName'],
+    });
+  }
+  if (marker.state === 'mismatched' && marker.returnedName === marker.resourceName) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'A mismatched service create cannot return the exact requested resource name.',
+      path: ['returnedName'],
+    });
+  }
+});
+
+export function parseHostingServiceCreateRecovery(
+  value: unknown
+): HostingServiceCreateRecovery | null {
+  const parsed = hostingServiceCreateRecoverySchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
 }
 
 /**
- * Tolerant runtime schema for platformBindings blobs. Passthrough at every
- * level so provider-specific extras (ci sync metadata, Railway rebind data,
- * scheduler bindings) survive a parse round-trip; every field optional so
- * legacy rows never throw. Use parseHostingBindings for reads.
+ * Runtime schema for platformBindings blobs. Passthrough at every level keeps
+ * provider-specific extras (CI sync metadata, Railway rebind data, scheduler
+ * bindings), while malformed known identity and recovery keys fail closed.
  */
+const hostingServiceBindingSchema = z.object({
+  serviceId: nonEmptyHostingBindingString.optional(),
+  url: z.string().optional(),
+  customDomains: z.array(z.string()).optional(),
+  imageUri: z.string().optional(),
+  workloadKind: z.string().optional(),
+  resourceType: z.string().optional(),
+  jobName: nonEmptyHostingBindingString.optional(),
+  schedulerJobName: nonEmptyHostingBindingString.optional(),
+  source: z.object({
+    repo: z.string().optional(),
+    branch: z.string().optional(),
+  }).passthrough().optional(),
+}).passthrough();
+
+const hostingServicesSchema = z.record(hostingServiceBindingSchema)
+  .refine(
+    (services) => Object.keys(services).every((name) => name.trim().length > 0),
+    'Service binding names must not be empty.'
+  );
+
+const serviceCreateRecoveryMapSchema = z.record(hostingServiceCreateRecoverySchema)
+  .refine(
+    (recoveries) => Object.keys(recoveries).every((name) => name.trim().length > 0),
+    'Service-create recovery names must not be empty.'
+  );
+
+const retainedProviderScopeSchema = z.record(nonEmptyHostingBindingString)
+  .refine(
+    (scope) => Object.keys(scope).length > 0 && Object.keys(scope).every((key) => key.trim().length > 0),
+    'Retained provider scope must contain non-empty keys and values.'
+  );
+
+const previousDatabaseSchema = z.object({
+  provider: nonEmptyHostingBindingString,
+  externalId: nonEmptyHostingBindingString,
+  engine: z.literal('postgres'),
+  name: nonEmptyHostingBindingString,
+  providerScope: retainedProviderScopeSchema,
+}).passthrough();
+
+const previousCacheSchema = z.object({
+  provider: nonEmptyHostingBindingString,
+  externalId: nonEmptyHostingBindingString,
+  engine: z.literal('redis'),
+  providerEngine: z.enum(['redis', 'valkey']),
+  name: nonEmptyHostingBindingString,
+  resourceKind: nonEmptyHostingBindingString.optional(),
+  providerScope: retainedProviderScopeSchema,
+}).passthrough();
+
 export const hostingBindingsSchema = z.object({
-  provider: z.string().optional(),
-  projectId: z.string().optional(),
-  environmentId: z.string().optional(),
-  services: z.record(
-    z.object({
-      serviceId: z.string().optional(),
-      url: z.string().optional(),
-      customDomains: z.array(z.string()).optional(),
-      imageUri: z.string().optional(),
-      workloadKind: z.string().optional(),
-      resourceType: z.string().optional(),
-      jobName: z.string().optional(),
-      schedulerJobName: z.string().optional(),
-      source: z.object({
-        repo: z.string().optional(),
-        branch: z.string().optional(),
-      }).passthrough().optional(),
-    }).passthrough()
-  ).optional(),
+  provider: nonEmptyHostingBindingString.optional(),
+  projectId: nonEmptyHostingBindingString.optional(),
+  environmentId: nonEmptyHostingBindingString.optional(),
+  services: hostingServicesSchema.optional(),
+  serviceCreateRecovery: serviceCreateRecoveryMapSchema.optional(),
+  previousDatabase: previousDatabaseSchema.optional(),
+  previousCache: previousCacheSchema.optional(),
   domainDns: z.object({
     name: z.string().optional(),
     proxied: z.boolean().optional(),
@@ -123,19 +268,19 @@ export const hostingBindingsSchema = z.object({
     }).strict()).optional(),
   }).passthrough().optional(),
   maintenance: z.record(z.unknown()).optional(),
-}).passthrough();
+}).passthrough().default({});
 
 export type ParsedHostingBindings = z.infer<typeof hostingBindingsSchema>;
 
 /**
  * Read an environment's platformBindings as HostingBindings-shaped data.
- * Never throws: malformed blobs (legacy rows, hand-edited files) return {}.
+ * Missing legacy state is empty; malformed known keys throw so callers cannot
+ * reinterpret a corrupt identity or recovery marker as permission to create.
  */
 export function parseHostingBindings(
   environment: Pick<Environment, 'platformBindings'> | null | undefined
 ): ParsedHostingBindings {
-  const parsed = hostingBindingsSchema.safeParse(environment?.platformBindings ?? {});
-  return parsed.success ? parsed.data : {};
+  return hostingBindingsSchema.parse(environment?.platformBindings ?? {});
 }
 
 /**

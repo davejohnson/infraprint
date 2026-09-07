@@ -157,7 +157,7 @@ export async function verifyConnection(provider: string, scope?: string): Promis
 
   try {
     const decryptedCreds = secretStore.decryptObject(connection.credentialsEncrypted);
-    const adapter = registeredProvider.factory(decryptedCreds);
+    const adapter = await registeredProvider.factory(decryptedCreds);
 
     // Check if adapter has a verify method
     if (typeof (adapter as { verify?: () => Promise<unknown> }).verify !== 'function') {

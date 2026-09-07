@@ -18,7 +18,11 @@ import type {
   Receipt,
   VerifyResult,
 } from '../../../domain/ports/provider.port.js';
-import { providerRegistry, type ProviderInspectionRequest } from '../../../domain/registry/provider.registry.js';
+import {
+  providerRegistry,
+  standardDatabaseRuntimeProjection,
+  type ProviderInspectionRequest,
+} from '../../../domain/registry/provider.registry.js';
 import { environmentForInspection } from '../../../domain/registry/provider-inspection.js';
 import { dnsZoneScopeForDomain } from '../../../domain/services/domain-scope.js';
 import {
@@ -1507,14 +1511,22 @@ providerRegistry.register({
         'HYPERVIBE_FLY_ORGANIZATION_SLUG',
       ]],
     },
+    maturity: {
+      lifecycle: {
+        hosting: { status: 'ready-for-live' },
+        database: { status: 'ready-for-live' },
+      },
+    },
     lifecycle: {
       hosting: {
+        workloadKinds: ['web', 'worker'],
         customDomains: 'managed',
         domainTrafficProxy: 'supported',
         maintenance: 'unsupported',
         teardownBoundary: 'services',
       },
       databaseEngines: ['postgres'],
+      databaseConnectivity: { compatibleHostingProviders: ['fly'] },
     },
     orchestration: {
       diff: {
@@ -1533,10 +1545,10 @@ providerRegistry.register({
       nativeBranchDeploy: { nonNativeSourcePolicy: 'block' },
     },
   },
-  factory: (credentials) => {
+  factory: async (credentials) => {
     const validated = FlyCredentialsSchema.parse(credentials);
     const adapter = new FlyAdapter();
-    void adapter.connect(validated);
+    await adapter.connect(validated);
     return adapter;
   },
   inspection: {
@@ -1550,6 +1562,7 @@ providerRegistry.register({
       adapter as FlyAdapter
     ).inspectEnvironmentResources(request),
   },
+  databaseRuntime: standardDatabaseRuntimeProjection,
   derivedAdapters: {
     database: (adapter) => (adapter as FlyAdapter).createDatabaseAdapter(),
   },

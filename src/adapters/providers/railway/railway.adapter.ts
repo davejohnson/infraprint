@@ -13,12 +13,25 @@ import type {
 } from '../../../domain/ports/provider.port.js';
 import type { Environment } from '../../../domain/entities/environment.entity.js';
 import type { Service } from '../../../domain/entities/service.entity.js';
-import { parseHostingBindings } from '../../../domain/ports/hosting.port.js';
+import {
+  createHostingServiceCreateRecovery,
+  parseHostingBindings,
+  parseHostingServiceCreateRecovery,
+  type HostingServiceCreateRecovery,
+} from '../../../domain/ports/hosting.port.js';
+import {
+  createStorageCreateRecovery,
+  parseStorageCreateRecovery,
+  type StorageCreateRecovery,
+} from '../../../domain/ports/storage.port.js';
 import { githubPackagePullCredentials } from '../github/package-pull.js';
 import type { Component, ComponentType } from '../../../domain/entities/component.entity.js';
 import { hashEnvValue } from '../../../domain/ports/observe.port.js';
 import type { ObservedCache, ObservedDatabase, ObservedService, ObservedState, ObservedStorage } from '../../../domain/ports/observe.port.js';
-import { providerRegistry } from '../../../domain/registry/provider.registry.js';
+import {
+  providerRegistry,
+  type DatabaseRuntimeProjection,
+} from '../../../domain/registry/provider.registry.js';
 import {
   buildRailwayGitHubActionsSteps,
   diagnoseRailwayWorkflowLog,
@@ -36,6 +49,21 @@ import type {
   MaintenanceWorkloadObservation,
   MaintenanceWorkloadSnapshot,
 } from '../../../domain/ports/maintenance.port.js';
+import type {
+  IProviderBuildLogsAdapter,
+  IProviderDeploymentsAdapter,
+  IProviderRuntimeLogsAdapter,
+  ProviderBuildLogsRequest,
+  ProviderDeployment,
+  ProviderDeploymentsRequest,
+  ProviderRuntimeLogsRequest,
+  ProviderRuntimeLogsResult,
+} from '../../../domain/ports/provider-logs.port.js';
+import type {
+  IProviderEnvironmentVariablesAdapter,
+  ProviderEnvironmentVariablesRequest,
+  ProviderEnvironmentVariablesResult,
+} from '../../../domain/ports/provider-env-vars.port.js';
 
 // Credentials schema for self-registration
 export const RailwayCredentialsSchema = z.object({
@@ -73,6 +101,54 @@ type RailwayDeploymentInstance = {
 type RailwayDeploymentInstanceSelection =
   | { recognized: false }
   | { recognized: true; instance: RailwayDeploymentInstance | null };
+
+export interface RailwayVolumeTarget {
+  projectId: string;
+  environmentId: string;
+  serviceId: string;
+  mountPath: string;
+}
+
+export type RailwayVolumeResolution =
+  | { success: true; state: 'absent' }
+  | { success: true; state: 'present'; volumeId: string; pendingDeletion: boolean }
+  | { success: false; error: string; volumeId?: string };
+
+interface RailwayVolumeInstance {
+  instanceId: string;
+  volumeId: string;
+  projectId: string;
+  environmentId: string;
+  serviceId: string;
+  mountPath: string;
+  deletedAt: string | null;
+  isPendingDeletion: boolean;
+}
+
+class RailwayProjectPaginationError extends Error {}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function projectRailwayDatabaseRuntime(
+  component: Component,
+  standard: DatabaseRuntimeProjection
+): DatabaseRuntimeProjection {
+  const bindings = component.bindings as Record<string, unknown>;
+  const pluginName = typeof bindings.pluginName === 'string' && bindings.pluginName.length > 0
+    ? bindings.pluginName
+    : undefined;
+  if (!pluginName) return standard;
+
+  return {
+    envVars: {
+      DATABASE_URL: '${{' + pluginName + '.DATABASE_URL}}',
+      DIRECT_URL: '${{' + pluginName + '.DATABASE_PRIVATE_URL}}',
+    },
+    connectionUrl: standard.connectionUrl,
+  };
+}
 
 function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -119,7 +195,13 @@ function railwayNamePart(value: string): string {
     || 'default';
 }
 
-export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAdapter {
+export class RailwayAdapter implements
+  IProviderAdapter,
+  IWorkloadMaintenanceAdapter,
+  IProviderRuntimeLogsAdapter,
+  IProviderDeploymentsAdapter,
+  IProviderBuildLogsAdapter,
+  IProviderEnvironmentVariablesAdapter {
   readonly name = 'railway';
 
   readonly capabilities: ProviderCapabilities = {
@@ -202,29 +284,30 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
       const bindings = environment.platformBindings as { projectId?: string };
       const existingProjectId = bindings.projectId;
       if (existingProjectId) {
-        // Verify project still exists
-        const query = gql`
-          query GetProject($id: String!) {
-            project(id: $id) {
-              id
-              name
-            }
-          }
-        `;
+        let existing: { id: string; name: string } | null;
         try {
-          const result = await this.client.request<{ project: { id: string; name: string } }>(query, {
-            id: existingProjectId,
-          });
-          if (result.project) {
-            return {
-              success: true,
-              message: `Using existing Railway project: ${result.project.name}`,
-              data: { projectId: result.project.id, projectName: result.project.name, created: false },
-            };
-          }
-        } catch {
-          // Project doesn't exist anymore, create new one
+          existing = await this.getProjectIdentity(existingProjectId);
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Failed to ensure Railway project',
+            error: `Could not verify bound Railway project ${existingProjectId}, so Hypervibe refused to replace or rebind it: ${this.describeError(error)}`,
+            data: { projectId: existingProjectId, verification: 'unknown' },
+          };
         }
+        if (existing) {
+          return {
+            success: true,
+            message: `Using existing Railway project: ${existing.name}`,
+            data: { projectId: existing.id, projectName: existing.name, created: false },
+          };
+        }
+        return {
+          success: false,
+          message: 'Failed to ensure Railway project',
+          error: `Bound Railway project ${existingProjectId} is absent. Hypervibe will not silently create a replacement or adopt a same-name project; re-run hv_plan after clearing or importing the intended binding.`,
+          data: { projectId: existingProjectId, verification: 'absent' },
+        };
       }
 
       let existingByName: RailwayProject[];
@@ -243,9 +326,13 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
       if (existingByName.length === 1) {
         const existing = existingByName[0];
         return {
-          success: true,
-          message: `Using existing Railway project: ${existing.name}`,
-          data: { projectId: existing.id, projectName: existing.name, created: false },
+          success: false,
+          message: 'Failed to ensure Railway project',
+          error: `Railway project "${existing.name}" (${existing.id}) already exists but is not bound to this environment. Hypervibe will not silently adopt it; use hv_import to adopt that exact project, then run hv_plan again.`,
+          data: {
+            projectName,
+            adoptionCandidateProjectId: existing.id,
+          },
         };
       }
       if (existingByName.length > 1) {
@@ -263,9 +350,10 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         };
       }
 
-      // Create a new Railway project. Railway GraphQL schema differs across accounts/versions,
-      // so try a few compatible mutation shapes before failing.
-      let created: { id: string; name: string } | null = null;
+      // Railway has used multiple input names over time. A second mutation is
+      // safe only when GraphQL validation proves the previous resolver never
+      // ran; transport failures and malformed acknowledgements are unknown.
+      let created: { id: string; name?: string } | null = null;
       let createError: string | undefined;
       try {
         created = await this.createProject(projectName);
@@ -280,12 +368,32 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         };
       }
 
+      let verified: { id: string; name: string } | null;
+      try {
+        verified = await this.waitForProjectIdentity(created.id, projectName);
+      } catch (error) {
+        return {
+          success: false,
+          message: `Created Railway project "${projectName}" but could not verify it`,
+          error: this.describeError(error),
+          data: { projectId: created.id, projectName: created.name ?? projectName, created: true, verification: 'unknown' },
+        };
+      }
+      if (!verified) {
+        return {
+          success: false,
+          message: `Created Railway project "${projectName}" but verification did not find it`,
+          error: 'Provider project creation is not yet confirmed. Re-run hv_plan before retrying.',
+          data: { projectId: created.id, projectName: created.name ?? projectName, created: true, verification: 'absent' },
+        };
+      }
+
       return {
         success: true,
-        message: `Created Railway project: ${created.name}`,
+        message: `Created Railway project: ${verified.name}`,
         data: {
-          projectId: created.id,
-          projectName: created.name,
+          projectId: verified.id,
+          projectName: verified.name,
           created: true,
         },
       };
@@ -335,7 +443,7 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
       };
     }
 
-    const environments = (details.environments?.edges ?? []).map((edge) => edge.node);
+    const environments = details.environments.edges.map((edge) => edge.node);
     const bound = bindings.environmentId
       ? environments.find((candidate) => candidate.id === bindings.environmentId)
       : undefined;
@@ -349,6 +457,14 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           environmentName: bound.name,
           created: false,
         },
+      };
+    }
+    if (bindings.environmentId) {
+      return {
+        success: false,
+        message: `Failed to ensure Railway environment "${environment.name}"`,
+        error: `Bound Railway environment ${bindings.environmentId} is absent from project ${projectId}. Hypervibe will not silently replace it or adopt a same-name environment; re-run hv_plan after clearing or importing the intended binding.`,
+        data: { projectId, environmentId: bindings.environmentId, verification: 'absent' },
       };
     }
 
@@ -366,18 +482,26 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
     if (named.length === 1) {
       const existing = named[0]!;
       return {
-        success: true,
-        message: `Using existing Railway environment: ${existing.name}`,
+        success: false,
+        message: `Failed to ensure Railway environment "${environment.name}"`,
+        error: `Railway environment "${existing.name}" (${existing.id}) already exists but is not bound locally. Hypervibe will not silently adopt it; use hv_import to adopt that exact environment, then run hv_plan again.`,
         data: {
           projectId,
-          environmentId: existing.id,
-          environmentName: existing.name,
-          created: false,
+          adoptionCandidateEnvironmentId: existing.id,
         },
       };
     }
 
-    const environmentId = await this.createRailwayEnvironment(projectId, environment.name);
+    let environmentId: string | undefined;
+    try {
+      environmentId = await this.createRailwayEnvironment(projectId, environment.name);
+    } catch (error) {
+      return {
+        success: false,
+        message: `Failed to create Railway environment "${environment.name}"`,
+        error: this.describeError(error),
+      };
+    }
     if (!environmentId) {
       return {
         success: false,
@@ -386,9 +510,13 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
       };
     }
 
-    let verified: RailwayProjectDetails | null;
+    let verifiedEnvironment: { id: string; name: string } | null;
     try {
-      verified = await this.getProjectDetails(projectId);
+      verifiedEnvironment = await this.waitForEnvironmentIdentity(
+        projectId,
+        environmentId,
+        environment.name
+      );
     } catch (error) {
       return {
         success: false,
@@ -397,9 +525,6 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         data: { projectId, environmentId, created: true, verification: 'unknown' },
       };
     }
-    const verifiedEnvironment = verified?.environments?.edges
-      ?.map((edge) => edge.node)
-      .find((candidate) => candidate.id === environmentId);
     if (!verifiedEnvironment) {
       return {
         success: false,
@@ -408,7 +533,6 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         data: { projectId, environmentId, created: true, verification: 'absent' },
       };
     }
-
     return {
       success: true,
       message: `Created Railway environment: ${verifiedEnvironment.name}`,
@@ -421,12 +545,12 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
     };
   }
 
-  private async createProject(projectName: string): Promise<{ id: string; name: string } | null> {
-    if (!this.client) return null;
+  private async createProject(projectName: string): Promise<{ id: string; name?: string }> {
+    if (!this.client) throw new Error('Not connected. Call connect() first.');
     const workspaceId = await this.resolveWorkspaceId();
 
-    const attempts: Array<{ mutation: string; variables: Record<string, unknown>; label: string }> = [
-      {
+    const attempts: Array<{ mutation: string; variables: Record<string, unknown>; label: string }> = workspaceId
+      ? [{
         label: 'input.workspaceId',
         mutation: `
           mutation CreateProject($name: String!, $workspaceId: String!) {
@@ -437,8 +561,7 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           }
         `,
         variables: { name: projectName, workspaceId },
-      },
-      {
+      }, {
         label: 'input.teamId',
         mutation: `
           mutation CreateProject($name: String!, $teamId: String) {
@@ -448,9 +571,9 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
             }
           }
         `,
-        variables: { name: projectName, teamId: this.credentials?.teamId ?? workspaceId ?? null },
-      },
-      {
+        variables: { name: projectName, teamId: this.credentials?.teamId ?? workspaceId },
+      }]
+      : [{
         label: 'input.name_only',
         mutation: `
           mutation CreateProject($name: String!) {
@@ -461,30 +584,35 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           }
         `,
         variables: { name: projectName },
-      },
-    ];
+      }];
 
     const errors: string[] = [];
     for (const attempt of attempts) {
-      if (attempt.label === 'input.workspaceId' && !workspaceId) {
-        errors.push('input.workspaceId: No workspaceId available from credentials or Railway account');
-        continue;
-      }
       try {
-        const result = await this.client.request<{ projectCreate: { id: string; name: string } }>(
+        const result = await this.client.request<unknown>(
           gql`${attempt.mutation}`,
           attempt.variables
         );
-        if (result?.projectCreate?.id) {
-          return result.projectCreate;
+        if (!isRecord(result) || !isRecord(result.projectCreate)) {
+          throw new Error(`${attempt.label}: Railway returned an invalid projectCreate acknowledgement; creation state is unknown and Hypervibe will not issue another mutation.`);
         }
-        errors.push(`${attempt.label}: Railway returned empty projectCreate payload`);
+        const id = result.projectCreate.id;
+        if (typeof id !== 'string' || id.length === 0) {
+          throw new Error(`${attempt.label}: Railway returned a projectCreate acknowledgement without an id; creation state is unknown and Hypervibe will not issue another mutation.`);
+        }
+        const name = typeof result.projectCreate.name === 'string' && result.projectCreate.name.length > 0
+          ? result.projectCreate.name
+          : undefined;
+        return { id, ...(name ? { name } : {}) };
       } catch (error) {
+        if (!this.isGraphqlSchemaCompatibilityError(error)) {
+          throw error;
+        }
         errors.push(`${attempt.label}: ${this.describeError(error)}`);
       }
     }
 
-    throw new Error(errors.join(' | '));
+    throw new Error(`Railway project creation is unsupported by the available GraphQL schema variants: ${errors.join(' | ')}`);
   }
 
   private async resolveWorkspaceId(): Promise<string | null> {
@@ -507,24 +635,25 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
       return this.resolvedWorkspaceId;
     }
 
-    try {
-      const workspaces = await this.getWorkspaces();
-      const id = workspaces[0]?.id;
-      this.resolvedWorkspaceId = id ?? null;
-      return this.resolvedWorkspaceId;
-    } catch {
-      this.resolvedWorkspaceId = null;
-      return this.resolvedWorkspaceId;
+    const workspaces = await this.getWorkspaces();
+    if (workspaces.length > 1) {
+      throw new Error(
+        `Multiple Railway workspaces are visible (${workspaces.map((workspace) => `${workspace.name ?? 'unnamed'} (${workspace.id})`).join(', ')}). Set credentials.workspaceId explicitly; Hypervibe will not guess a project-creation scope.`
+      );
     }
+    this.resolvedWorkspaceId = workspaces[0]?.id ?? null;
+    return this.resolvedWorkspaceId;
   }
 
   private async getWorkspaces(): Promise<Array<{ id: string; name?: string }>> {
-    if (!this.client) return [];
+    if (!this.client) throw new Error('Not connected. Call connect() first.');
     const attempts: Array<{
+      label: string;
       query: string;
       parse: (payload: unknown) => Array<{ id: string; name?: string }>;
     }> = [
       {
+        label: 'me.workspaces.edges',
         // Connection-style shape (older API responses)
         query: `
           query MyWorkspacesConnection {
@@ -541,23 +670,25 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           }
         `,
         parse: (payload) => {
-          const result = payload as {
-            me?: {
-              workspaces?: {
-                edges?: Array<{ node?: { id?: string; name?: string } }>;
-              };
+          if (!isRecord(payload) || !isRecord(payload.me) || !isRecord(payload.me.workspaces)
+            || !Array.isArray(payload.me.workspaces.edges)) {
+            throw new Error('Railway returned an invalid me.workspaces connection.');
+          }
+          return payload.me.workspaces.edges.map((edge, index) => {
+            if (!isRecord(edge) || !isRecord(edge.node)
+              || typeof edge.node.id !== 'string' || edge.node.id.length === 0
+              || (edge.node.name !== undefined && typeof edge.node.name !== 'string')) {
+              throw new Error(`Railway returned an invalid workspace at edge ${index}.`);
+            }
+            return {
+              id: edge.node.id,
+              ...(typeof edge.node.name === 'string' ? { name: edge.node.name } : {}),
             };
-          };
-          const edges = result.me?.workspaces?.edges ?? [];
-          return edges
-            .map((edge) => ({
-              id: edge.node?.id ?? '',
-              name: edge.node?.name,
-            }))
-            .filter((workspace) => workspace.id.length > 0);
+          });
         },
       },
       {
+        label: 'me.workspaces direct',
         // Direct array/object shape (newer API responses)
         query: `
           query MyWorkspacesDirect {
@@ -570,19 +701,28 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           }
         `,
         parse: (payload) => {
-          const result = payload as {
-            me?: {
-              workspaces?: { id?: string; name?: string } | Array<{ id?: string; name?: string }>;
+          if (!isRecord(payload) || !isRecord(payload.me) || !('workspaces' in payload.me)) {
+            throw new Error('Railway returned an invalid direct workspace inventory.');
+          }
+          const raw = payload.me.workspaces;
+          const list = Array.isArray(raw) ? raw : isRecord(raw) ? [raw] : null;
+          if (!list) {
+            throw new Error('Railway returned an invalid direct workspace collection.');
+          }
+          return list.map((workspace, index) => {
+            if (!isRecord(workspace) || typeof workspace.id !== 'string' || workspace.id.length === 0
+              || (workspace.name !== undefined && typeof workspace.name !== 'string')) {
+              throw new Error(`Railway returned an invalid workspace at index ${index}.`);
+            }
+            return {
+              id: workspace.id,
+              ...(typeof workspace.name === 'string' ? { name: workspace.name } : {}),
             };
-          };
-          const raw = result.me?.workspaces;
-          const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
-          return list
-            .map((workspace) => ({ id: workspace.id ?? '', name: workspace.name }))
-            .filter((workspace) => workspace.id.length > 0);
+          });
         },
       },
       {
+        label: 'me.workspace',
         // Singular workspace shape fallback
         query: `
           query MyWorkspaceSingular {
@@ -595,27 +735,194 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           }
         `,
         parse: (payload) => {
-          const result = payload as { me?: { workspace?: { id?: string; name?: string } } };
-          const workspace = result.me?.workspace;
-          if (!workspace?.id) return [];
-          return [{ id: workspace.id, name: workspace.name }];
+          if (!isRecord(payload) || !isRecord(payload.me) || !('workspace' in payload.me)) {
+            throw new Error('Railway returned an invalid singular workspace inventory.');
+          }
+          const workspace = payload.me.workspace;
+          if (workspace === null) return [];
+          if (!isRecord(workspace) || typeof workspace.id !== 'string' || workspace.id.length === 0
+            || (workspace.name !== undefined && typeof workspace.name !== 'string')) {
+            throw new Error('Railway returned an invalid singular workspace.');
+          }
+          return [{
+            id: workspace.id,
+            ...(typeof workspace.name === 'string' ? { name: workspace.name } : {}),
+          }];
         },
       },
     ];
 
+    const schemaErrors: string[] = [];
     for (const attempt of attempts) {
       try {
         const result = await this.client.request<unknown>(gql`${attempt.query}`);
         const parsed = attempt.parse(result);
-        if (parsed.length > 0) {
-          return parsed;
+        const seen = new Set<string>();
+        for (const workspace of parsed) {
+          if (seen.has(workspace.id)) {
+            throw new Error(`Railway returned duplicate workspace id ${workspace.id}.`);
+          }
+          seen.add(workspace.id);
         }
-      } catch {
-        // Try the next schema variant.
+        return parsed;
+      } catch (error) {
+        if (!this.isGraphqlSchemaCompatibilityError(error)) {
+          throw error;
+        }
+        schemaErrors.push(`${attempt.label}: ${this.describeError(error)}`);
       }
     }
 
-    return [];
+    throw new Error(`Railway workspace observation is unsupported by the available GraphQL schema variants: ${schemaErrors.join(' | ')}`);
+  }
+
+  private async getProjectIdentity(projectId: string): Promise<{ id: string; name: string } | null> {
+    if (!this.client) throw new Error('Not connected. Call connect() first.');
+    const query = gql`
+      query GetProjectIdentity($id: String!) {
+        project(id: $id) {
+          id
+          name
+        }
+      }
+    `;
+    try {
+      const result = await this.client.request<unknown>(query, { id: projectId });
+      if (!isRecord(result) || !('project' in result)) {
+        throw new Error(`Railway returned an invalid project identity response for ${projectId}.`);
+      }
+      if (result.project === null) return null;
+      if (!isRecord(result.project)
+        || typeof result.project.id !== 'string'
+        || result.project.id !== projectId
+        || typeof result.project.name !== 'string'
+        || result.project.name.length === 0) {
+        throw new Error(`Railway returned a partial or mismatched project identity for ${projectId}.`);
+      }
+      return { id: result.project.id, name: result.project.name };
+    } catch (error) {
+      if (this.isProviderConfirmedNotFound(error, 'project')) return null;
+      throw error;
+    }
+  }
+
+  private async waitForProjectIdentity(
+    projectId: string,
+    expectedName: string
+  ): Promise<{ id: string; name: string } | null> {
+    const configuredAttempts = Number(process.env.HYPERVIBE_RAILWAY_CREATE_VERIFY_ATTEMPTS ?? 10);
+    const configuredDelayMs = Number(process.env.HYPERVIBE_RAILWAY_CREATE_VERIFY_DELAY_MS ?? 250);
+    const attempts = Number.isFinite(configuredAttempts) && configuredAttempts >= 1
+      ? Math.floor(configuredAttempts)
+      : 10;
+    const delayMs = Number.isFinite(configuredDelayMs) && configuredDelayMs >= 0
+      ? configuredDelayMs
+      : 250;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const project = await this.getProjectIdentity(projectId);
+      if (project) {
+        if (project.name !== expectedName) {
+          throw new Error(`Railway project ${projectId} was expected to be named "${expectedName}" but is named "${project.name}".`);
+        }
+        return project;
+      }
+      if (attempt < attempts - 1) {
+        await this.sleep(Math.min(delayMs * (2 ** attempt), 2000));
+      }
+    }
+    return null;
+  }
+
+  private async waitForEnvironmentIdentity(
+    projectId: string,
+    environmentId: string,
+    expectedName: string
+  ): Promise<{ id: string; name: string } | null> {
+    const configuredAttempts = Number(process.env.HYPERVIBE_RAILWAY_CREATE_VERIFY_ATTEMPTS ?? 10);
+    const configuredDelayMs = Number(process.env.HYPERVIBE_RAILWAY_CREATE_VERIFY_DELAY_MS ?? 250);
+    const attempts = Number.isFinite(configuredAttempts) && configuredAttempts >= 1
+      ? Math.floor(configuredAttempts)
+      : 10;
+    const delayMs = Number.isFinite(configuredDelayMs) && configuredDelayMs >= 0
+      ? configuredDelayMs
+      : 250;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const project = await this.getProjectDetails(projectId);
+      if (!project) {
+        throw new Error(`Railway project ${projectId} disappeared while verifying environment ${environmentId}.`);
+      }
+      const matches = project.environments.edges
+        .map((edge) => edge.node)
+        .filter((environment) => environment.id === environmentId);
+      if (matches.length > 1) {
+        throw new Error(`Railway returned duplicate environment id ${environmentId} in project ${projectId}.`);
+      }
+      const environment = matches[0];
+      if (environment) {
+        if (environment.name !== expectedName) {
+          throw new Error(`Railway environment ${environmentId} was expected to be named "${expectedName}" but is named "${environment.name}".`);
+        }
+        return { id: environment.id, name: environment.name };
+      }
+      if (attempt < attempts - 1) {
+        await this.sleep(Math.min(delayMs * (2 ** attempt), 2000));
+      }
+    }
+    return null;
+  }
+
+  private isGraphqlSchemaCompatibilityError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    const response = (error as Error & {
+      response?: {
+        errors?: Array<{
+          message?: string;
+          path?: Array<string | number>;
+          extensions?: Record<string, unknown>;
+        }>;
+      };
+    }).response;
+    const errors = response?.errors;
+    if (!Array.isArray(errors) || errors.length === 0) return false;
+
+    const schemaMessage = /^(Cannot query field|Unknown argument|Unknown type|Unknown field|Variable .+ is never used|Field .+ is not defined by type|Field .+ must not have a selection|Field .+ must have a selection of subfields)/i;
+    return errors.every((entry) => {
+      if (Array.isArray(entry.path) && entry.path.length > 0) return false;
+      const code = typeof entry.extensions?.code === 'string'
+        ? entry.extensions.code.toUpperCase()
+        : undefined;
+      return code === 'GRAPHQL_VALIDATION_FAILED'
+        || (typeof entry.message === 'string' && schemaMessage.test(entry.message));
+    });
+  }
+
+  private isProviderConfirmedNotFound(error: unknown, expectedRootField: string): boolean {
+    if (!(error instanceof Error)) return false;
+    const response = (error as Error & {
+      response?: {
+        status?: number;
+        errors?: Array<{ extensions?: Record<string, unknown> }>;
+      };
+    }).response;
+    const errors = response?.errors;
+    if (!Array.isArray(errors) || errors.length === 0) return false;
+    return errors.every((entry) => {
+      const path = (entry as { path?: Array<string | number> }).path;
+      const code = typeof entry.extensions?.code === 'string'
+        ? entry.extensions.code.toUpperCase()
+        : undefined;
+      const statusCode = entry.extensions?.statusCode;
+      const exactRoot = Array.isArray(path)
+        && path.length === 1
+        && path[0] === expectedRootField;
+      return exactRoot && (
+        code === 'NOT_FOUND'
+          || code === 'RESOURCE_NOT_FOUND'
+          || statusCode === 404
+          || statusCode === '404'
+      );
+    });
   }
 
   private describeError(error: unknown): string {
@@ -650,6 +957,24 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
       return error.message;
     }
     return String(error);
+  }
+
+  private isMutationOutcomeUncertain(error: unknown): boolean {
+    if (!(error instanceof Error)) return true;
+    const status = (error as Error & { response?: { status?: number | string } }).response?.status;
+    const numericStatus = typeof status === 'number'
+      ? status
+      : typeof status === 'string' && /^\d+$/.test(status)
+        ? Number(status)
+        : undefined;
+    // Most provider HTTP 4xx responses are definitive rejections. HTTP 408 is
+    // different: a timeout can be returned after the resolver committed. As
+    // with transport failures, malformed GraphQL successes, and 5xx responses,
+    // it must be reconciled rather than treated as permission to retry.
+    return numericStatus === undefined
+      || numericStatus < 400
+      || numericStatus === 408
+      || numericStatus >= 500;
   }
 
   async ensureComponent(type: ComponentType, environment: Environment): Promise<ComponentResult> {
@@ -737,309 +1062,6 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
     const existingServiceId = serviceResolution.serviceId;
     const existingServiceName = serviceResolution.serviceName ?? serviceName;
     if (existingServiceId) {
-      const ensured = serviceResolution.verifiedInEnvironment
-        ? { success: true as const, created: false }
-        : await this.ensureServiceInstanceForEnvironment(
-          existingServiceId,
-          environmentId
-        );
-      if (!ensured.success) {
-        return {
-          component: {
-            id: '',
-            environmentId: environment.id,
-            type,
-            bindings: {},
-            externalId: null,
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          },
-          receipt: {
-            success: false,
-            message: `Existing ${type} service ${existingServiceName} is missing an instance in Railway environment ${environment.name}`,
-            error: ensured.error,
-            data: { serviceId: existingServiceId, serviceName: existingServiceName, environmentId },
-          },
-        };
-      }
-      // An earlier provisioning attempt may have created this environment's service without
-      // its bootstrap variables (the image then crashloops uninitialized).
-      // Verify and repair before reusing.
-      const repairKinds: string[] = [];
-      if (ensured.created) {
-        repairKinds.push('Railway environment instance');
-      }
-      let repaired = ensured.created;
-      let needsRedeploy = ensured.created;
-      const requiredVar = this.datastoreRequiredVar(type);
-      if (requiredVar) {
-        let variableReadError: string | undefined;
-        const existingVars = await this.fetchServiceVariables(projectId, existingServiceId, environmentId)
-          .catch((error) => {
-            variableReadError = this.describeError(error);
-            return null;
-          });
-        if (!existingVars) {
-          return {
-            component: {
-              id: '',
-              environmentId: environment.id,
-              type,
-              bindings: {},
-              externalId: null,
-              createdAt: new Date(),
-              updatedAt: new Date(),
-            },
-            receipt: {
-              success: false,
-              message: `Existing ${type} service ${existingServiceName} could not be verified in Railway environment ${environment.name}`,
-              error: variableReadError ?? 'Could not read Railway service variables',
-            },
-          };
-        }
-        if (existingVars && !existingVars[requiredVar]) {
-          const bootstrapVars = this.buildDatastoreBootstrapVars(type, existingServiceName);
-          const varsSet = bootstrapVars
-            ? await this.upsertServiceVariables(projectId, existingServiceId, environmentId, bootstrapVars)
-            : { success: true as const };
-          if (!varsSet.success) {
-            return {
-              component: {
-                id: '',
-                environmentId: environment.id,
-                type,
-                bindings: {},
-                externalId: null,
-                createdAt: new Date(),
-                updatedAt: new Date(),
-              },
-              receipt: {
-                success: false,
-                message: `Existing ${type} service ${existingServiceName} is missing ${requiredVar} and repair failed`,
-                error: varsSet.error,
-              },
-            };
-          }
-          repaired = true;
-          repairKinds.push('missing bootstrap variables');
-          needsRedeploy = true;
-        }
-      }
-      const mountPath = this.datastoreVolumeMountPath(type);
-      let volumeId: string | undefined;
-      if (ensured.created && mountPath) {
-        const volume = await this.attachServiceVolume(projectId, environmentId, existingServiceId, mountPath);
-        if (!volume.success) {
-          return {
-            component: {
-              id: '',
-              environmentId: environment.id,
-              type,
-              bindings: {},
-              externalId: null,
-              createdAt: new Date(),
-              updatedAt: new Date(),
-            },
-            receipt: {
-              success: false,
-              message: `Existing ${type} service ${existingServiceName} was added to ${environment.name} but failed to attach a volume`,
-              error: volume.error,
-            },
-          };
-        }
-        volumeId = volume.volumeId;
-        repaired = true;
-        repairKinds.push('persistent volume');
-        needsRedeploy = true;
-      }
-      if (needsRedeploy) {
-        const redeploy = await this.redeployDatastoreService(existingServiceId, environmentId);
-        if (!redeploy.success) {
-          return {
-            component: {
-              id: '',
-              environmentId: environment.id,
-              type,
-              bindings: {},
-              externalId: null,
-              createdAt: new Date(),
-              updatedAt: new Date(),
-            },
-            receipt: {
-              success: false,
-              message: `Existing ${type} service ${existingServiceName} was repaired but failed to redeploy`,
-              error: redeploy.error,
-            },
-          };
-        }
-      }
-
-      const component: Component = {
-        id: '',
-        environmentId: environment.id,
-        type,
-        bindings: {
-          resourceKind: 'service',
-          pluginName: existingServiceName,
-          ...(volumeId ? { volumeId } : {}),
-        },
-        externalId: existingServiceId,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-      return {
-        component,
-        receipt: {
-          success: true,
-          message: repaired
-            ? `Using existing ${type} datastore service (${existingServiceName}); repaired ${repairKinds.join(', ')} and redeployed`
-            : `Using existing ${type} datastore service (${existingServiceName})`,
-          data: { serviceId: existingServiceId, serviceName: existingServiceName, serviceBacked: true, reused: true, ...(repaired ? { repaired: true } : {}) },
-        },
-      };
-    }
-    const createMutation = gql`
-      mutation CreateService($input: ServiceCreateInput!) {
-        serviceCreate(input: $input) {
-          id
-          name
-        }
-      }
-    `;
-
-    try {
-      const result = await client.request<{ serviceCreate: { id: string; name: string } }>(
-        createMutation,
-        {
-          input: {
-            projectId,
-            environmentId,
-            name: serviceName,
-            source: {
-              image,
-            },
-          },
-        }
-      );
-
-      const ensured = await this.ensureServiceInstanceForEnvironment(
-        result.serviceCreate.id,
-        environmentId
-      );
-      if (!ensured.success) {
-        return {
-          component: {
-            id: '',
-            environmentId: environment.id,
-            type,
-            bindings: {},
-            externalId: null,
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          },
-          receipt: {
-            success: false,
-            message: `Created ${type} service ${result.serviceCreate.name} but Railway did not expose an instance in ${environment.name}`,
-            error: ensured.error,
-          },
-        };
-      }
-
-      const bootstrapVars = this.buildDatastoreBootstrapVars(type, serviceName);
-      if (bootstrapVars) {
-        const varsSet = await this.upsertServiceVariables(projectId, result.serviceCreate.id, environmentId, bootstrapVars);
-        if (!varsSet.success) {
-          return {
-            component: {
-              id: '',
-              environmentId: environment.id,
-              type,
-              bindings: {},
-              externalId: null,
-              createdAt: new Date(),
-              updatedAt: new Date(),
-            },
-            receipt: {
-              success: false,
-              message: `Created ${type} service ${result.serviceCreate.name} but failed to set bootstrap variables`,
-              error: varsSet.error,
-            },
-          };
-        }
-      }
-
-      // Persist data across redeploys; without a volume the datastore is ephemeral.
-      const mountPath = this.datastoreVolumeMountPath(type);
-      let volumeId: string | undefined;
-      if (mountPath) {
-        const volume = await this.attachServiceVolume(projectId, environmentId, result.serviceCreate.id, mountPath);
-        if (!volume.success) {
-          return {
-            component: {
-              id: '',
-              environmentId: environment.id,
-              type,
-              bindings: {},
-              externalId: null,
-              createdAt: new Date(),
-              updatedAt: new Date(),
-            },
-            receipt: {
-              success: false,
-              message: `Created ${type} service ${result.serviceCreate.name} but failed to attach a volume`,
-              error: volume.error,
-            },
-          };
-        }
-        volumeId = volume.volumeId;
-      }
-
-      // serviceCreate with source.image starts the first deployment before the
-      // variables/volume above exist (postgres crashloops with "superuser
-      // password is not specified"); redeploy so the container boots with them.
-      const redeploy = await this.redeployDatastoreService(result.serviceCreate.id, environmentId);
-      if (!redeploy.success) {
-        return {
-          component: {
-            id: '',
-            environmentId: environment.id,
-            type,
-            bindings: {},
-            externalId: null,
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          },
-          receipt: {
-            success: false,
-            message: `Created ${type} service ${result.serviceCreate.name} but failed to redeploy it with bootstrap configuration`,
-            error: redeploy.error,
-          },
-        };
-      }
-
-      const component: Component = {
-        id: '',
-        environmentId: environment.id,
-        type,
-        bindings: {
-          resourceKind: 'service',
-          pluginName: result.serviceCreate.name,
-          ...(volumeId ? { volumeId } : {}),
-        },
-        externalId: result.serviceCreate.id,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      return {
-        component,
-        receipt: {
-          success: true,
-          message: `Created ${type} datastore as Railway service (${result.serviceCreate.name})`,
-          data: { serviceId: result.serviceCreate.id, serviceName: result.serviceCreate.name, serviceBacked: true },
-        },
-      };
-    } catch (error) {
       return {
         component: {
           id: '',
@@ -1052,12 +1074,369 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         },
         receipt: {
           success: false,
-          message: `Failed to create ${type} service-backed datastore`,
-          error: this.describeError(error),
-          data: { phase: 'serviceCreate', projectId, environmentId, image },
+          message: `Railway ${type} datastore service ${existingServiceName} already exists but is not bound locally`,
+          error: `Hypervibe will not mutate or adopt Railway service ${existingServiceId} from a create action. Use hv_import to adopt that exact datastore, then re-run hv_plan.`,
+          data: {
+            adoptionCandidateServiceId: existingServiceId,
+            serviceName: existingServiceName,
+            projectId,
+            environmentId,
+          },
         },
       };
     }
+    const createMutation = gql`
+      mutation CreateService($input: ServiceCreateInput!) {
+        serviceCreate(input: $input) {
+          id
+          name
+        }
+      }
+    `;
+
+    let createdService: { id: string; name?: string } | undefined;
+    const emptyComponent = (): Component => ({
+      id: '',
+      environmentId: environment.id,
+      type,
+      bindings: {},
+      externalId: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const unresolvedCreateComponent = (): Component => {
+      const providerScope = { projectId, environmentId };
+      return {
+        id: '',
+        environmentId: environment.id,
+        type,
+        bindings: {
+          provider: 'railway',
+          providerScope,
+          unresolvedMutation: {
+            resourceKind: type === 'redis' ? 'cache' : 'database',
+            operation: 'create',
+            resourceName: serviceName,
+            providerScope,
+          },
+        },
+        externalId: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+    };
+    const partialCreatedService = (
+      identity: { id: string; name?: string },
+      volumeId?: string,
+      volumeTarget?: RailwayVolumeTarget
+    ): Component => ({
+      id: '',
+      environmentId: environment.id,
+      type,
+      bindings: {
+        provider: 'railway',
+        providerScope: {
+          projectId,
+          ...(type === 'redis' ? { environmentId } : {}),
+        },
+        resourceKind: 'service',
+        ...(identity.name ? { pluginName: identity.name } : {}),
+        ...(volumeId ? { volumeId } : {}),
+        ...(volumeTarget ? { volumeTarget } : {}),
+      },
+      externalId: identity.id,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    try {
+      const result = await client.request<{
+        serviceCreate?: { id?: unknown; name?: unknown } | null;
+      }>(
+        createMutation,
+        {
+          input: {
+            projectId,
+            environmentId,
+            name: serviceName,
+            source: {
+              image,
+            },
+          },
+        }
+      );
+      const returnedId = typeof result.serviceCreate?.id === 'string'
+        && result.serviceCreate.id.trim().length > 0
+        ? result.serviceCreate.id
+        : undefined;
+      const returnedName = typeof result.serviceCreate?.name === 'string'
+        && result.serviceCreate.name.trim().length > 0
+        ? result.serviceCreate.name
+        : undefined;
+
+      if (!returnedId) {
+        let recoveryError: string | undefined;
+        try {
+          createdService = await this.recoverServiceIdentityAfterCreate(
+            projectId,
+            serviceName,
+            environmentId
+          );
+        } catch (error) {
+          recoveryError = this.describeError(error);
+        }
+        return {
+          component: createdService
+            ? partialCreatedService(createdService)
+            : unresolvedCreateComponent(),
+          receipt: {
+            success: false,
+            message: createdService
+              ? `Railway created ${type} service ${createdService.name ?? serviceName}, but serviceCreate returned no valid id`
+              : `Railway serviceCreate returned no valid id for ${type}`,
+            error: 'The create acknowledgement was malformed, so Hypervibe stopped before any service-instance, variable, volume, or redeploy follow-up.',
+            data: {
+              phase: 'serviceCreate',
+              projectId,
+              environmentId,
+              image,
+              mutationAttempted: true,
+              ...(createdService
+                ? { recoveredServiceId: createdService.id, recoveredServiceName: createdService.name }
+                : { resourceCreated: 'unknown' }),
+              ...(recoveryError ? { recoveryError } : {}),
+            },
+          },
+        };
+      }
+
+      createdService = {
+        id: returnedId,
+        ...(returnedName ? { name: returnedName } : {}),
+      };
+      if (returnedName !== serviceName) {
+        return {
+          component: partialCreatedService(createdService),
+          receipt: {
+            success: false,
+            message: `Railway returned service ${returnedId} with an unexpected name after creating ${type}`,
+            error: returnedName
+              ? `Expected Railway service name "${serviceName}" but serviceCreate returned "${returnedName}". Hypervibe retained the returned id for cleanup and stopped before follow-up mutations.`
+              : `Expected Railway service name "${serviceName}" but serviceCreate returned no valid name. Hypervibe retained the returned id for cleanup and stopped before follow-up mutations.`,
+            data: {
+              phase: 'serviceCreate',
+              projectId,
+              environmentId,
+              image,
+              mutationAttempted: true,
+              returnedServiceId: returnedId,
+              ...(returnedName ? { returnedServiceName: returnedName } : {}),
+              expectedServiceName: serviceName,
+            },
+          },
+        };
+      }
+
+      const ensured = await this.ensureServiceInstanceForEnvironment(
+        createdService.id,
+        environmentId
+      );
+      if (!ensured.success) {
+        return {
+          component: partialCreatedService(createdService),
+          receipt: {
+            success: false,
+            message: `Created ${type} service ${createdService.name} but Railway did not expose an instance in ${environment.name}`,
+            error: ensured.error,
+          },
+        };
+      }
+
+      const bootstrapVars = this.buildDatastoreBootstrapVars(type, serviceName);
+      if (bootstrapVars) {
+        const varsSet = await this.upsertServiceVariables(projectId, createdService.id, environmentId, bootstrapVars);
+        if (!varsSet.success) {
+          return {
+            component: partialCreatedService(createdService),
+            receipt: {
+              success: false,
+              message: `Created ${type} service ${createdService.name} but failed to set bootstrap variables`,
+              error: varsSet.error,
+            },
+          };
+        }
+      }
+
+      // Persist data across redeploys; without a volume the datastore is ephemeral.
+      const mountPath = this.datastoreVolumeMountPath(type);
+      let volumeId: string | undefined;
+      let volumeTarget: RailwayVolumeTarget | undefined;
+      if (mountPath) {
+        volumeTarget = {
+          projectId,
+          environmentId,
+          serviceId: createdService.id,
+          mountPath,
+        };
+        const volume = await this.attachServiceVolume(volumeTarget);
+        if (!volume.success) {
+          return {
+            component: partialCreatedService(createdService, volume.volumeId, volumeTarget),
+            receipt: {
+              success: false,
+              message: `Created ${type} service ${createdService.name} but failed to attach a volume`,
+              error: volume.error,
+              data: {
+                phase: 'volumeCreate',
+                mutationAttempted: volume.mutationAttempted,
+                volumeTarget,
+                ...(volume.volumeId ? { volumeId: volume.volumeId } : {}),
+              },
+            },
+          };
+        }
+        volumeId = volume.volumeId;
+      }
+
+      // serviceCreate with source.image starts the first deployment before the
+      // variables/volume above exist (postgres crashloops with "superuser
+      // password is not specified"); redeploy so the container boots with them.
+      const redeploy = await this.redeployDatastoreService(createdService.id, environmentId);
+      if (!redeploy.success) {
+        return {
+          component: partialCreatedService(createdService, volumeId, volumeTarget),
+          receipt: {
+            success: false,
+            message: `Created ${type} service ${createdService.name} but failed to redeploy it with bootstrap configuration`,
+            error: redeploy.error,
+          },
+        };
+      }
+
+      const component: Component = {
+        id: '',
+        environmentId: environment.id,
+        type,
+        bindings: {
+          provider: 'railway',
+          providerScope: {
+            projectId,
+            ...(type === 'redis' ? { environmentId } : {}),
+          },
+          resourceKind: 'service',
+          pluginName: createdService.name,
+          ...(volumeId ? { volumeId } : {}),
+          ...(volumeTarget ? { volumeTarget } : {}),
+        },
+        externalId: createdService.id,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      return {
+        component,
+        receipt: {
+          success: true,
+          message: `Created ${type} datastore as Railway service (${createdService.name})`,
+          data: { serviceId: createdService.id, serviceName: createdService.name, serviceBacked: true },
+        },
+      };
+    } catch (error) {
+      const mutationOutcomeUncertain = !createdService && this.isMutationOutcomeUncertain(error);
+      let recoveryError: string | undefined;
+      if (!createdService && mutationOutcomeUncertain) {
+        try {
+          createdService = await this.recoverServiceIdentityAfterCreate(
+            projectId,
+            serviceName,
+            environmentId
+          );
+        } catch (recoveryFailure) {
+          recoveryError = this.describeError(recoveryFailure);
+        }
+      }
+      return {
+        component: createdService
+          ? partialCreatedService(createdService)
+          : mutationOutcomeUncertain
+            ? unresolvedCreateComponent()
+            : emptyComponent(),
+        receipt: {
+          success: false,
+          message: createdService
+            ? `Railway may have created ${type} service ${createdService.name}, but the create response or follow-up setup was not verified`
+            : `Failed to create ${type} service-backed datastore`,
+          error: this.describeError(error),
+          data: {
+            phase: 'serviceCreate',
+            projectId,
+            environmentId,
+            image,
+            mutationAttempted: true,
+            ...(createdService
+              ? { recoveredServiceId: createdService.id, recoveredServiceName: createdService.name }
+              : { resourceCreated: mutationOutcomeUncertain ? 'unknown' : false }),
+            ...(recoveryError ? { recoveryError } : {}),
+          },
+        },
+      };
+    }
+  }
+
+  /**
+   * A GraphQL transport failure can happen after Railway committed
+   * serviceCreate. The exact requested name was proved absent immediately
+   * before the mutation, so a later unique name match is attributable to this
+   * attempt and may be retained for explicit recovery/cleanup.
+   */
+  private async recoverServiceIdentityAfterCreate(
+    projectId: string,
+    serviceName: string,
+    environmentId?: string
+  ): Promise<{ id: string; name: string } | undefined> {
+    const configuredAttempts = Number(process.env.HYPERVIBE_RAILWAY_CREATE_VERIFY_ATTEMPTS ?? 10);
+    const configuredDelayMs = Number(process.env.HYPERVIBE_RAILWAY_CREATE_VERIFY_DELAY_MS ?? 250);
+    const attempts = Number.isFinite(configuredAttempts) && configuredAttempts >= 1
+      ? Math.min(Math.floor(configuredAttempts), 20)
+      : 10;
+    const delayMs = Number.isFinite(configuredDelayMs) && configuredDelayMs >= 0
+      ? configuredDelayMs
+      : 250;
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        let matches = (await this.listProjectServices(projectId, { throwOnFailure: true }))
+          .filter((service) => service.name === serviceName);
+        if (environmentId) {
+          const environmentMatches: typeof matches = [];
+          for (const match of matches) {
+            if (await this.serviceHasEnvironmentInstance(match.id, environmentId)) {
+              environmentMatches.push(match);
+            }
+          }
+          matches = environmentMatches;
+        }
+        if (matches.length > 1) {
+          throw new Error(
+            `Multiple Railway services named "${serviceName}"${environmentId ? ` in environment ${environmentId}` : ''} appeared after serviceCreate: ${matches.map((service) => service.id).join(', ')}.`
+          );
+        }
+        if (matches.length === 1) return matches[0];
+      } catch (error) {
+        lastError = error;
+      }
+      if (attempt < attempts - 1) {
+        await this.sleep(Math.min(delayMs * (2 ** attempt), 2000));
+      }
+    }
+
+    if (lastError) {
+      throw new Error(
+        `Could not recover the Railway service identity after an uncertain create: ${this.describeError(lastError)}`
+      );
+    }
+    return undefined;
   }
 
   private buildDatastoreBootstrapVars(type: ComponentType, serviceName: string): Record<string, string> | null {
@@ -1096,13 +1475,6 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
     return null;
   }
 
-  /** Env var that must exist for the datastore image to initialize; null = boots without vars. */
-  private datastoreRequiredVar(type: ComponentType): string | null {
-    if (type === 'postgres') return 'POSTGRES_PASSWORD';
-    if (type === 'redis') return 'REDIS_PASSWORD';
-    return null;
-  }
-
   private datastoreVolumeMountPath(type: ComponentType): string | null {
     if (type === 'postgres') return '/var/lib/postgresql/data';
     if (type === 'redis') return '/bitnami/redis/data';
@@ -1110,14 +1482,36 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
   }
 
   private async attachServiceVolume(
-    projectId: string,
-    environmentId: string,
-    serviceId: string,
-    mountPath: string
-  ): Promise<{ success: boolean; error?: string; volumeId?: string }> {
+    target: RailwayVolumeTarget
+  ): Promise<
+    | { success: true; volumeId: string; mutationAttempted: true }
+    | { success: false; error: string; volumeId?: string; mutationAttempted: boolean }
+  > {
     if (!this.client) {
-      return { success: false, error: 'Not connected. Call connect() first.' };
+      return {
+        success: false,
+        error: 'Not connected. Call connect() first.',
+        mutationAttempted: false,
+      };
     }
+
+    const preflight = await this.resolveServiceVolume(target);
+    if (!preflight.success) {
+      return {
+        success: false,
+        error: `Railway volume preflight is unknown: ${preflight.error}`,
+        mutationAttempted: false,
+      };
+    }
+    if (preflight.state === 'present') {
+      return {
+        success: false,
+        error: `Railway volume ${preflight.volumeId} already targets service ${target.serviceId} at ${target.mountPath}. Hypervibe will not silently adopt it from a create action.`,
+        volumeId: preflight.volumeId,
+        mutationAttempted: false,
+      };
+    }
+
     const mutation = gql`
       mutation VolumeCreate($input: VolumeCreateInput!) {
         volumeCreate(input: $input) {
@@ -1125,35 +1519,362 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         }
       }
     `;
+    let acknowledgedVolumeId: string | undefined;
+    let mutationError: string | undefined;
     try {
-      const result = await this.client.request<{ volumeCreate?: { id?: string } }>(mutation, {
-        input: { projectId, environmentId, serviceId, mountPath },
-      });
-      return { success: true, volumeId: result.volumeCreate?.id };
+      const result = await this.client.request<{
+        volumeCreate?: { id?: unknown } | null;
+      }>(mutation, { input: target });
+      if (typeof result.volumeCreate?.id === 'string'
+        && result.volumeCreate.id.trim().length > 0) {
+        acknowledgedVolumeId = result.volumeCreate.id;
+      } else {
+        mutationError = 'Railway volumeCreate returned no valid volume id.';
+      }
+    } catch (error) {
+      mutationError = this.describeError(error);
+    }
+
+    const recovered = await this.waitForCreatedServiceVolume(target, acknowledgedVolumeId);
+    if (recovered.success && recovered.state === 'present') {
+      return {
+        success: true,
+        volumeId: recovered.volumeId,
+        mutationAttempted: true,
+      };
+    }
+
+    const recoveryError = recovered.success
+      ? `No active volume became visible for service ${target.serviceId} at ${target.mountPath}.`
+      : recovered.error;
+    return {
+      success: false,
+      error: [
+        mutationError ? `volumeCreate: ${mutationError}` : undefined,
+        `recovery: ${recoveryError}`,
+      ].filter((value): value is string => Boolean(value)).join('; '),
+      ...(recovered.success
+        ? acknowledgedVolumeId ? { volumeId: acknowledgedVolumeId } : {}
+        : recovered.volumeId
+          ? { volumeId: recovered.volumeId }
+          : acknowledgedVolumeId
+            ? { volumeId: acknowledgedVolumeId }
+            : {}),
+      mutationAttempted: true,
+    };
+  }
+
+  async resolveServiceVolume(
+    target: RailwayVolumeTarget,
+    expectedVolumeId?: string
+  ): Promise<RailwayVolumeResolution> {
+    const invalidTargetField = (Object.entries(target) as Array<[
+      keyof RailwayVolumeTarget,
+      string,
+    ]>).find(([, value]) => typeof value !== 'string' || value.trim().length === 0);
+    if (invalidTargetField) {
+      return {
+        success: false,
+        error: `Railway volume target ${invalidTargetField[0]} must be a non-empty string.`,
+      };
+    }
+    if (expectedVolumeId !== undefined
+      && (typeof expectedVolumeId !== 'string' || expectedVolumeId.trim().length === 0)) {
+      return { success: false, error: 'Railway volume id must be a non-empty string.' };
+    }
+
+    try {
+      const volumes = await this.listEnvironmentVolumeInstances(target);
+      const live = volumes.filter((volume) => volume.deletedAt === null);
+      const targetMatches = live.filter((volume) => (
+        volume.projectId === target.projectId
+        && volume.environmentId === target.environmentId
+        && volume.serviceId === target.serviceId
+        && volume.mountPath === target.mountPath
+      ));
+      if (targetMatches.length > 1) {
+        return {
+          success: false,
+          error: `Multiple active Railway volumes match service ${target.serviceId} at ${target.mountPath}: ${targetMatches.map((volume) => volume.volumeId).join(', ')}.`,
+        };
+      }
+
+      if (expectedVolumeId) {
+        const idMatches = live.filter((volume) => volume.volumeId === expectedVolumeId);
+        if (idMatches.length > 1) {
+          return {
+            success: false,
+            error: `Railway returned duplicate active instances for volume ${expectedVolumeId}.`,
+          };
+        }
+        if (idMatches.length === 1 && targetMatches[0]?.volumeId !== expectedVolumeId) {
+          const actual = idMatches[0]!;
+          return {
+            success: false,
+            error: `Railway volume ${expectedVolumeId} is attached to service ${actual.serviceId} in environment ${actual.environmentId} at ${actual.mountPath}, not the recorded target.`,
+          };
+        }
+        if (targetMatches.length === 1 && targetMatches[0]!.volumeId !== expectedVolumeId) {
+          return {
+            success: false,
+            error: `Railway target ${target.serviceId}:${target.mountPath} resolves to volume ${targetMatches[0]!.volumeId}, not recorded volume ${expectedVolumeId}.`,
+          };
+        }
+      }
+
+      const match = targetMatches[0];
+      if (!match) return { success: true, state: 'absent' };
+      return {
+        success: true,
+        state: 'present',
+        volumeId: match.volumeId,
+        pendingDeletion: match.isPendingDeletion,
+      };
     } catch (error) {
       return { success: false, error: this.describeError(error) };
     }
   }
 
-  async deleteVolume(volumeId: string): Promise<{ success: boolean; error?: string }> {
+  private async listEnvironmentVolumeInstances(
+    target: RailwayVolumeTarget
+  ): Promise<RailwayVolumeInstance[]> {
+    if (!this.client) throw new Error('Not connected. Call connect() first.');
+    const query = gql`
+      query EnvironmentVolumeInstances(
+        $environmentId: String!
+        $projectId: String!
+        $after: String
+      ) {
+        environment(id: $environmentId, projectId: $projectId) {
+          id
+          volumeInstances(first: 100, after: $after) {
+            edges {
+              node {
+                id
+                serviceId
+                environmentId
+                mountPath
+                deletedAt
+                isPendingDeletion
+                volume {
+                  id
+                  projectId
+                }
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+      }
+    `;
+    const volumes: RailwayVolumeInstance[] = [];
+    const seenInstanceIds = new Set<string>();
+    const seenVolumeIds = new Set<string>();
+    const seenCursors = new Set<string>();
+    let after: string | null = null;
+
+    for (let page = 0; page < 100; page += 1) {
+      const result: unknown = await this.client.request<unknown>(query, {
+        environmentId: target.environmentId,
+        projectId: target.projectId,
+        after,
+      });
+      if (!isRecord(result) || !('environment' in result) || !isRecord(result.environment)
+        || result.environment.id !== target.environmentId
+        || !isRecord(result.environment.volumeInstances)
+        || !Array.isArray(result.environment.volumeInstances.edges)
+        || !isRecord(result.environment.volumeInstances.pageInfo)) {
+        throw new Error(
+          `Railway returned a partial or mismatched volume inventory for environment ${target.environmentId} in project ${target.projectId}.`
+        );
+      }
+      const connection: Record<string, unknown> = result.environment.volumeInstances;
+      const edges = connection.edges as unknown[];
+      for (const [index, edge] of edges.entries()) {
+        if (!isRecord(edge) || !isRecord(edge.node) || !isRecord(edge.node.volume)
+          || typeof edge.node.id !== 'string' || edge.node.id.trim().length === 0
+          || typeof edge.node.serviceId !== 'string' || edge.node.serviceId.trim().length === 0
+          || typeof edge.node.environmentId !== 'string' || edge.node.environmentId.trim().length === 0
+          || typeof edge.node.mountPath !== 'string' || edge.node.mountPath.trim().length === 0
+          || (edge.node.deletedAt !== null && typeof edge.node.deletedAt !== 'string')
+          || typeof edge.node.isPendingDeletion !== 'boolean'
+          || typeof edge.node.volume.id !== 'string' || edge.node.volume.id.trim().length === 0
+          || typeof edge.node.volume.projectId !== 'string' || edge.node.volume.projectId.trim().length === 0) {
+          throw new Error(
+            `Railway returned a partial volume identity at page ${page + 1}, edge ${index + 1}.`
+          );
+        }
+        if (edge.node.environmentId !== target.environmentId
+          || edge.node.volume.projectId !== target.projectId) {
+          throw new Error(
+            `Railway returned volume ${edge.node.volume.id} outside requested project/environment scope.`
+          );
+        }
+        if (seenInstanceIds.has(edge.node.id) || seenVolumeIds.has(edge.node.volume.id)) {
+          throw new Error(
+            `Railway returned duplicate volume identity ${edge.node.volume.id} while paginating environment ${target.environmentId}.`
+          );
+        }
+        seenInstanceIds.add(edge.node.id);
+        seenVolumeIds.add(edge.node.volume.id);
+        volumes.push({
+          instanceId: edge.node.id,
+          volumeId: edge.node.volume.id,
+          projectId: edge.node.volume.projectId,
+          environmentId: edge.node.environmentId,
+          serviceId: edge.node.serviceId,
+          mountPath: edge.node.mountPath,
+          deletedAt: edge.node.deletedAt,
+          isPendingDeletion: edge.node.isPendingDeletion,
+        });
+      }
+
+      const pageInfo: Record<string, unknown> = connection.pageInfo as Record<string, unknown>;
+      if (typeof pageInfo.hasNextPage !== 'boolean'
+        || (pageInfo.endCursor !== null && typeof pageInfo.endCursor !== 'string')) {
+        throw new Error(`Railway returned invalid volume pagination metadata for environment ${target.environmentId}.`);
+      }
+      if (!pageInfo.hasNextPage) return volumes;
+      if (typeof pageInfo.endCursor !== 'string' || pageInfo.endCursor.length === 0
+        || pageInfo.endCursor === after || seenCursors.has(pageInfo.endCursor)) {
+        throw new Error(`Railway returned a missing or repeated volume pagination cursor for environment ${target.environmentId}.`);
+      }
+      seenCursors.add(pageInfo.endCursor);
+      after = pageInfo.endCursor;
+    }
+
+    throw new Error(
+      `Railway volume inventory exceeded 100 pages for environment ${target.environmentId}; observation is incomplete.`
+    );
+  }
+
+  private async waitForCreatedServiceVolume(
+    target: RailwayVolumeTarget,
+    acknowledgedVolumeId?: string
+  ): Promise<RailwayVolumeResolution> {
+    const configuredAttempts = Number(process.env.HYPERVIBE_RAILWAY_CREATE_VERIFY_ATTEMPTS ?? 10);
+    const configuredDelayMs = Number(process.env.HYPERVIBE_RAILWAY_CREATE_VERIFY_DELAY_MS ?? 250);
+    const attempts = Number.isFinite(configuredAttempts) && configuredAttempts >= 1
+      ? Math.min(Math.floor(configuredAttempts), 20)
+      : 10;
+    const delayMs = Number.isFinite(configuredDelayMs) && configuredDelayMs >= 0
+      ? configuredDelayMs
+      : 250;
+    let lastError: string | undefined;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const resolution = await this.resolveServiceVolume(target);
+      if (!resolution.success) {
+        lastError = resolution.error;
+      } else if (resolution.state === 'present' && !resolution.pendingDeletion) {
+        if (acknowledgedVolumeId && resolution.volumeId !== acknowledgedVolumeId) {
+          return {
+            success: false,
+            error: `Railway volumeCreate acknowledged ${acknowledgedVolumeId}, but the exact target resolves to ${resolution.volumeId}.`,
+            volumeId: resolution.volumeId,
+          };
+        }
+        return resolution;
+      } else if (resolution.state === 'present') {
+        lastError = `Railway volume ${resolution.volumeId} is already pending deletion.`;
+      }
+      if (attempt < attempts - 1) {
+        await this.sleep(Math.min(delayMs * (2 ** attempt), 2000));
+      }
+    }
+
+    return lastError
+      ? { success: false, error: lastError }
+      : { success: true, state: 'absent' };
+  }
+
+  async deleteVolume(
+    volumeId: string,
+    target: RailwayVolumeTarget
+  ): Promise<{ success: boolean; error?: string; alreadyAbsent?: boolean }> {
     if (!this.client) {
       return { success: false, error: 'Not connected. Call connect() first.' };
     }
-    const mutation = gql`
-      mutation DeleteVolume($volumeId: String!) {
-        volumeDelete(volumeId: $volumeId)
-      }
-    `;
-    try {
-      const result = await this.client.request<Record<string, unknown>>(mutation, { volumeId });
-      const value = result.volumeDelete;
-      if (value === false || value === null) {
-        return { success: false, error: 'volumeDelete returned unsuccessful payload' };
-      }
-      return { success: true };
-    } catch (error) {
-      return { success: false, error: this.describeError(error) };
+    if (typeof volumeId !== 'string' || volumeId.trim().length === 0) {
+      return { success: false, error: 'Railway volume id must be a non-empty string.' };
     }
+
+    const existing = await this.resolveServiceVolume(target, volumeId);
+    if (!existing.success) {
+      return {
+        success: false,
+        error: `Railway volume identity is unknown before deletion: ${existing.error}`,
+      };
+    }
+    if (existing.state === 'absent') {
+      return { success: true, alreadyAbsent: true };
+    }
+
+    let mutationError: string | undefined;
+    if (!existing.pendingDeletion) {
+      const mutation = gql`
+        mutation DeleteVolume($volumeId: String!) {
+          volumeDelete(volumeId: $volumeId)
+        }
+      `;
+      try {
+        const result = await this.client.request<Record<string, unknown>>(mutation, { volumeId });
+        const value = result.volumeDelete;
+        const accepted = value === true
+          || value === 1
+          || value === volumeId
+          || (typeof value === 'string' && value.toLowerCase() === 'true')
+          || (isRecord(value) && (value.success === true || value.id === volumeId));
+        if (!accepted) {
+          return { success: false, error: 'volumeDelete returned unsuccessful payload' };
+        }
+      } catch (error) {
+        if (!this.isProviderConfirmedNotFound(error, 'volumeDelete')) {
+          mutationError = this.describeError(error);
+        }
+      }
+    }
+
+    const verification = await this.waitUntilVolumeDeleted(volumeId, target);
+    if (verification.deleted) return { success: true };
+    return {
+      success: false,
+      error: [
+        mutationError ? `volumeDelete: ${mutationError}` : undefined,
+        `volume deletion could not be verified: ${verification.error}`,
+      ].filter((value): value is string => Boolean(value)).join('; '),
+    };
+  }
+
+  private async waitUntilVolumeDeleted(
+    volumeId: string,
+    target: RailwayVolumeTarget
+  ): Promise<DeletionVerification> {
+    const configuredAttempts = Number(process.env.HYPERVIBE_RAILWAY_DELETE_ATTEMPTS ?? 40);
+    const configuredDelayMs = Number(process.env.HYPERVIBE_RAILWAY_DELETE_DELAY_MS ?? 500);
+    const attempts = Number.isFinite(configuredAttempts) && configuredAttempts >= 1
+      ? Math.min(Math.floor(configuredAttempts), 120)
+      : 40;
+    const delayMs = Number.isFinite(configuredDelayMs) && configuredDelayMs >= 0
+      ? configuredDelayMs
+      : 500;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const resolution = await this.resolveServiceVolume(target, volumeId);
+      if (!resolution.success) {
+        return { deleted: false, error: resolution.error };
+      }
+      if (resolution.state === 'absent') return { deleted: true };
+      if (attempt < attempts - 1) {
+        await this.sleep(Math.min(delayMs * (2 ** attempt), 2000));
+      }
+    }
+    return {
+      deleted: false,
+      error: `volume ${volumeId} still exists after ${attempts} observation attempts.`,
+    };
   }
 
   private async redeployDatastoreService(
@@ -1217,22 +1938,27 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
   ): Promise<string | undefined> {
     if (!this.client) return undefined;
     const bindings = environment.platformBindings as { environmentId?: string };
-    let environmentId = bindings.environmentId;
+    const environmentId = bindings.environmentId;
     const projectEnvironments = await this.listProjectEnvironments(projectId);
     const environmentIds = projectEnvironments.map((env) => env.id);
-    if (environmentId && environmentIds.includes(environmentId)) {
-      return environmentId;
+    if (environmentId) {
+      if (environmentIds.includes(environmentId)) return environmentId;
+      throw new Error(`Bound Railway environment ${environmentId} is absent from project ${projectId}. Hypervibe will not silently rebind by name or create a replacement.`);
     }
-    const byName = projectEnvironments.find((env) => env.name.toLowerCase() === environment.name.toLowerCase());
-    if (byName?.id) {
-      return byName.id;
+    const byName = projectEnvironments.filter(
+      (candidate) => candidate.name.toLowerCase() === environment.name.toLowerCase()
+    );
+    if (byName.length > 0) {
+      throw new Error(
+        `Railway environment "${environment.name}" is not bound locally${byName.length === 1 ? `; ${byName[0]!.id} is an adoption candidate` : ` and has duplicate candidates: ${byName.map((candidate) => candidate.id).join(', ')}`}. Use hv_import to adopt the exact environment before mutating it.`
+      );
     }
     return undefined;
   }
 
   private async listProjectEnvironments(projectId: string): Promise<Array<{ id: string; name: string }>> {
     const client = this.client;
-    if (!client) return [];
+    if (!client) throw new Error('Not connected. Call connect() first.');
     const envQuery = gql`
       query GetEnvironments($projectId: String!) {
         project(id: $projectId) {
@@ -1247,35 +1973,45 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         }
       }
     `;
-    try {
-      const envResult = await client.request<{
-        project?: {
-          environments?:
-            | { edges?: Array<{ node?: { id?: string; name?: string } }> }
-            | Array<{ id?: string; name?: string }>;
-        };
-      }>(envQuery, { projectId });
-      const envs = envResult.project?.environments;
-      if (!envs) return [];
-
-      if (Array.isArray(envs)) {
-        return envs
-          .map((e) => ({ id: e.id ?? '', name: e.name ?? '' }))
-          .filter((env) => env.id.length > 0 && env.name.length > 0);
-      }
-      const edges = envs.edges ?? [];
-      return edges
-        .map((e) => ({ id: e.node?.id ?? '', name: e.node?.name ?? '' }))
-        .filter((env) => env.id.length > 0 && env.name.length > 0);
-    } catch {
-      return [];
+    const envResult = await client.request<unknown>(envQuery, { projectId });
+    if (!isRecord(envResult) || !('project' in envResult)) {
+      throw new Error(`Railway returned an invalid environment inventory response for project ${projectId}.`);
     }
+    if (envResult.project === null) return [];
+    if (!isRecord(envResult.project)
+      || (envResult.project.id !== undefined && envResult.project.id !== projectId)) {
+      throw new Error(`Railway returned a mismatched environment inventory for project ${projectId}.`);
+    }
+    const envs = envResult.project.environments as
+      | { edges?: Array<{ node?: { id?: string; name?: string } }> }
+      | Array<{ id?: string; name?: string }>
+      | undefined;
+    if (!envs) {
+      throw new Error(`Railway returned an invalid environment inventory for project ${projectId}.`);
+    }
+
+    const rawEnvironments = Array.isArray(envs)
+      ? envs
+      : Array.isArray(envs.edges)
+        ? envs.edges.map((edge) => edge.node)
+        : null;
+    if (!rawEnvironments || rawEnvironments.some((env) => (
+      !env || typeof env.id !== 'string' || !env.id || typeof env.name !== 'string' || !env.name
+    ))) {
+      throw new Error(`Railway returned a partial environment inventory for project ${projectId}.`);
+    }
+    const parsed = rawEnvironments.map((env) => ({ id: env!.id!, name: env!.name! }));
+    if (new Set(parsed.map((env) => env.id)).size !== parsed.length) {
+      throw new Error(`Railway returned duplicate environment ids for project ${projectId}.`);
+    }
+    return parsed;
   }
 
   private async createRailwayEnvironment(projectId: string, environmentName: string): Promise<string | undefined> {
-    if (!this.client) return undefined;
-    const attempts: Array<{ mutation: string; variables: Record<string, unknown> }> = [
+    if (!this.client) throw new Error('Not connected. Call connect() first.');
+    const attempts: Array<{ label: string; mutation: string; variables: Record<string, unknown> }> = [
       {
+        label: 'environmentCreate.input',
         mutation: `
           mutation CreateEnvironment($projectId: String!, $name: String!) {
             environmentCreate(input: { projectId: $projectId, name: $name }) {
@@ -1287,6 +2023,7 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         variables: { projectId, name: environmentName },
       },
       {
+        label: 'environmentCreate.arguments',
         mutation: `
           mutation CreateEnvironment($projectId: String!, $name: String!) {
             environmentCreate(projectId: $projectId, name: $name) {
@@ -1299,30 +2036,27 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
       },
     ];
 
+    const schemaErrors: string[] = [];
     for (const attempt of attempts) {
       try {
-        const result = await this.client.request<Record<string, unknown>>(gql`${attempt.mutation}`, attempt.variables);
-        const created = result.environmentCreate as { id?: string } | undefined;
-        if (created?.id) return created.id;
-      } catch {
-        // Try next schema variant.
+        const result = await this.client.request<unknown>(gql`${attempt.mutation}`, attempt.variables);
+        if (!isRecord(result) || !isRecord(result.environmentCreate)) {
+          throw new Error(`${attempt.label}: Railway returned an invalid environmentCreate acknowledgement; creation state is unknown and Hypervibe will not issue another mutation.`);
+        }
+        const id = result.environmentCreate.id;
+        if (typeof id !== 'string' || id.length === 0) {
+          throw new Error(`${attempt.label}: Railway returned an environmentCreate acknowledgement without an id; creation state is unknown and Hypervibe will not issue another mutation.`);
+        }
+        return id;
+      } catch (error) {
+        if (!this.isGraphqlSchemaCompatibilityError(error)) {
+          throw error;
+        }
+        schemaErrors.push(`${attempt.label}: ${this.describeError(error)}`);
       }
     }
 
-    return undefined;
-  }
-
-  private async resolveServiceIdForProject(
-    projectId: string,
-    serviceName: string,
-    boundServiceId?: string
-  ): Promise<string | undefined> {
-    const services = await this.listProjectServices(projectId);
-    if (boundServiceId && services.some((s) => s.id === boundServiceId)) {
-      return boundServiceId;
-    }
-    const byName = services.find((s) => s.name === serviceName);
-    return byName?.id;
+    throw new Error(`Railway environment creation is unsupported by the available GraphQL schema variants: ${schemaErrors.join(' | ')}`);
   }
 
   private railwayServiceNameForEnvironment(baseName: string, environmentName: string): string {
@@ -1369,27 +2103,45 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
     environmentId: string,
     boundServiceId?: string
   ): Promise<{ serviceId?: string; serviceName?: string; ignoredBoundServiceId?: string; verifiedInEnvironment?: boolean }> {
-    const services = await this.listProjectServices(projectId);
+    // An empty list is valid only after a successful provider read. If both
+    // supported query shapes fail, propagate the error so deploy cannot turn
+    // an unknown inventory into permission to create a duplicate service.
+    const services = await this.listProjectServices(projectId, { throwOnFailure: true });
     const names = new Set(Array.isArray(serviceNames) ? serviceNames : [serviceNames]);
-    const candidates = [
-      ...(boundServiceId && services.some((s) => s.id === boundServiceId) ? [boundServiceId] : []),
-      ...services
-        .filter((s) => names.has(s.name) && s.id !== boundServiceId)
-        .map((s) => s.id),
-    ];
+    if (boundServiceId) {
+      const bound = services.find((service) => service.id === boundServiceId);
+      if (!bound) {
+        throw new Error(`Bound Railway service ${boundServiceId} is absent from project ${projectId}. Hypervibe will not silently create or adopt a replacement.`);
+      }
+      const hasInstance = await this.serviceHasEnvironmentInstance(bound.id, environmentId);
+      return {
+        serviceId: bound.id,
+        serviceName: bound.name,
+        verifiedInEnvironment: hasInstance,
+      };
+    }
 
-    for (const serviceId of candidates) {
+    const candidates = services.filter((service) => names.has(service.name));
+    const environmentMatches: Array<{ id: string; name: string }> = [];
+    for (const candidate of candidates) {
       // A failed instance read is not evidence that this project-level
       // service is absent from the target environment. Propagate the failure
       // so callers cannot create a duplicate service from an unknown read.
-      const hasInstance = await this.serviceHasEnvironmentInstance(serviceId, environmentId);
-      if (hasInstance) {
-        const serviceName = services.find((s) => s.id === serviceId)?.name;
-        return { serviceId, serviceName, verifiedInEnvironment: true };
+      if (await this.serviceHasEnvironmentInstance(candidate.id, environmentId)) {
+        environmentMatches.push(candidate);
       }
     }
+    if (environmentMatches.length > 1) {
+      throw new Error(
+        `Multiple Railway services match ${Array.from(names).map((name) => `"${name}"`).join(' or ')} in environment ${environmentId}: ${environmentMatches.map((service) => `${service.name} (${service.id})`).join(', ')}. Hypervibe will not guess which service to manage.`
+      );
+    }
+    if (environmentMatches.length === 1) {
+      const match = environmentMatches[0]!;
+      return { serviceId: match.id, serviceName: match.name, verifiedInEnvironment: true };
+    }
 
-    return boundServiceId ? { ignoredBoundServiceId: boundServiceId } : {};
+    return {};
   }
 
   private async serviceHasEnvironmentInstance(
@@ -1415,16 +2167,25 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
       }
     `;
 
-    const result = await this.client.request<{
-      service?: {
-        serviceInstances?: {
-          edges?: Array<{ node?: { environmentId?: string } }>;
-        };
-      } | null;
-    }>(query, { serviceId });
-
-    return (result.service?.serviceInstances?.edges ?? [])
-      .some((edge) => edge.node?.environmentId === environmentId);
+    const result = await this.client.request<unknown>(query, { serviceId });
+    if (!isRecord(result) || !('service' in result) || !isRecord(result.service)
+      || (result.service.id !== undefined && result.service.id !== serviceId)
+      || !isRecord(result.service.serviceInstances)
+      || !Array.isArray(result.service.serviceInstances.edges)) {
+      throw new Error(`Railway returned a partial or mismatched service-instance inventory for ${serviceId}.`);
+    }
+    const environmentIds: string[] = [];
+    for (const edge of result.service.serviceInstances.edges) {
+      if (!isRecord(edge) || !isRecord(edge.node)
+        || typeof edge.node.environmentId !== 'string' || edge.node.environmentId.length === 0) {
+        throw new Error(`Railway returned a partial service-instance identity for ${serviceId}.`);
+      }
+      environmentIds.push(edge.node.environmentId);
+    }
+    if (new Set(environmentIds).size !== environmentIds.length) {
+      throw new Error(`Railway returned duplicate environment instances for service ${serviceId}.`);
+    }
+    return environmentIds.includes(environmentId);
   }
 
   private async ensureServiceInstanceForEnvironment(
@@ -1454,13 +2215,15 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
 
   private async listProjectServices(
     projectId: string,
-    options?: { throwOnFailure?: boolean }
+    _options?: { throwOnFailure?: boolean }
   ): Promise<Array<{ id: string; name: string }>> {
     const client = this.client;
-    if (!client) return [];
-    let lastError: unknown;
+    if (!client) throw new Error('Not connected. Call connect() first.');
+    const schemaErrors: string[] = [];
     const attempts = [
-      gql`
+      {
+        label: 'project.services.edges',
+        query: gql`
         query GetProjectServicesConnection($projectId: String!) {
           project(id: $projectId) {
             services {
@@ -1474,7 +2237,10 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           }
         }
       `,
-      gql`
+      },
+      {
+        label: 'project.services direct',
+        query: gql`
         query GetProjectServicesDirect($projectId: String!) {
           project(id: $projectId) {
             services {
@@ -1484,11 +2250,12 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           }
         }
       `,
+      },
     ];
 
-    for (const query of attempts) {
+    for (const attempt of attempts) {
       try {
-        const result = await client.request<Record<string, unknown>>(query, { projectId });
+        const result = await client.request<Record<string, unknown>>(attempt.query, { projectId });
         const project = result.project as
           | {
               services?:
@@ -1497,32 +2264,49 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
             }
           | undefined;
         const services = project?.services;
-        if (!services) continue;
-        if (Array.isArray(services)) {
-          return services
-            .map((s) => ({ id: s.id ?? '', name: s.name ?? '' }))
-            .filter((s) => s.id.length > 0 && s.name.length > 0);
+        if (!project || !services) {
+          throw new Error(`Railway returned no project service collection for ${projectId}`);
         }
-        const edges = services.edges ?? [];
-        return edges
-          .map((e) => ({ id: e.node?.id ?? '', name: e.node?.name ?? '' }))
-          .filter((s) => s.id.length > 0 && s.name.length > 0);
+        if (Array.isArray(services)) {
+          if (services.some((service) => !service.id || !service.name)) {
+            throw new Error(`Railway returned a partial project service list for ${projectId}`);
+          }
+          const parsed = services.map((service) => ({ id: service.id!, name: service.name! }));
+          if (new Set(parsed.map((service) => service.id)).size !== parsed.length) {
+            throw new Error(`Railway returned duplicate service ids for project ${projectId}`);
+          }
+          return parsed;
+        }
+        if (!Array.isArray(services.edges)) {
+          throw new Error(`Railway returned an invalid project service connection for ${projectId}`);
+        }
+        if (services.edges.some((edge) => !edge.node?.id || !edge.node?.name)) {
+          throw new Error(`Railway returned a partial project service list for ${projectId}`);
+        }
+        const parsed = services.edges.map((edge) => ({ id: edge.node!.id!, name: edge.node!.name! }));
+        if (new Set(parsed.map((service) => service.id)).size !== parsed.length) {
+          throw new Error(`Railway returned duplicate service ids for project ${projectId}`);
+        }
+        return parsed;
       } catch (error) {
-        lastError = error;
-        // Try next shape.
+        if (!this.isGraphqlSchemaCompatibilityError(error)) {
+          throw error;
+        }
+        schemaErrors.push(`${attempt.label}: ${this.describeError(error)}`);
       }
     }
 
-    if (options?.throwOnFailure && lastError) {
-      throw lastError;
-    }
-
-    return [];
+    throw new Error(`Railway service observation is unsupported by the available GraphQL schema variants: ${schemaErrors.join(' | ')}`);
   }
 
   async deleteProject(projectId: string): Promise<{ success: boolean; error?: string }> {
     if (!this.client) {
       return { success: false, error: 'Not connected. Call connect() first.' };
+    }
+    const existing = await this.projectExists(projectId);
+    if (existing.state === 'absent') return { success: true };
+    if (existing.state === 'unknown') {
+      return { success: false, error: `project absence is unknown (${projectId}): ${existing.error}` };
     }
 
     const attempts: Array<{ mutation: string; variables: Record<string, unknown>; label: string }> = [
@@ -1559,10 +2343,9 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
     for (const attempt of attempts) {
       try {
         const result = await this.client.request<Record<string, unknown>>(gql`${attempt.mutation}`, attempt.variables);
-        const accepted = this.isDeleteAccepted(result, 'projectDelete');
+        const accepted = this.isDeleteAccepted(result, 'projectDelete', projectId);
         if (!accepted) {
-          errors.push(`${attempt.label}: delete mutation returned unsuccessful payload`);
-          continue;
+          return { success: false, error: `${attempt.label}: delete mutation returned unsuccessful payload` };
         }
         const verification = await this.waitUntilProjectDeleted(projectId);
         if (verification.deleted) {
@@ -1574,8 +2357,11 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         };
       } catch (error) {
         const message = this.describeError(error);
-        if (message.toLowerCase().includes('not found')) {
+        if (this.isProviderConfirmedNotFound(error, 'projectDelete')) {
           return { success: true };
+        }
+        if (!this.isGraphqlSchemaCompatibilityError(error)) {
+          return { success: false, error: `${attempt.label}: ${message}` };
         }
         errors.push(`${attempt.label}: ${message}`);
       }
@@ -1608,7 +2394,7 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         }
       `;
       const result = await this.client.request<Record<string, unknown>>(mutation, { id: environmentId });
-      if (!this.isDeleteAccepted(result, 'environmentDelete')) {
+      if (!this.isDeleteAccepted(result, 'environmentDelete', environmentId)) {
         return { success: false, error: 'environmentDelete.id: delete mutation returned unsuccessful payload' };
       }
       const attempts = Number(process.env.HYPERVIBE_RAILWAY_DELETE_ATTEMPTS ?? 40);
@@ -1631,7 +2417,7 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         error: `environment still exists after ${attempts} observation attempts (${environmentId})`,
       };
     } catch (error) {
-      if (this.describeError(error).toLowerCase().includes('not found')) {
+      if (this.isProviderConfirmedNotFound(error, 'environmentDelete')) {
         return { success: true, alreadyAbsent: true };
       }
       return { success: false, error: `environmentDelete.id: ${this.describeError(error)}` };
@@ -1661,7 +2447,7 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         }
       `;
       const result = await this.client.request<Record<string, unknown>>(mutation, { id: serviceId });
-      const accepted = this.isDeleteAccepted(result, 'serviceDelete');
+      const accepted = this.isDeleteAccepted(result, 'serviceDelete', serviceId);
       if (!accepted) {
         return { success: false, error: 'serviceDelete.id: delete mutation returned unsuccessful payload' };
       }
@@ -1674,7 +2460,7 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         error: `serviceDelete.id: delete acknowledged but could not be verified: ${verification.error}`,
       };
     } catch (error) {
-      if (this.describeError(error).toLowerCase().includes('not found')) {
+      if (this.isProviderConfirmedNotFound(error, 'serviceDelete')) {
         return { success: true, alreadyAbsent: true };
       }
       return { success: false, error: `serviceDelete.id: ${this.describeError(error)}` };
@@ -1683,17 +2469,17 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
 
   private isDeleteAccepted(
     payload: Record<string, unknown>,
-    field: 'projectDelete' | 'environmentDelete' | 'serviceDelete'
+    field: 'projectDelete' | 'environmentDelete' | 'serviceDelete',
+    expectedId: string
   ): boolean {
     const value = payload[field];
     if (typeof value === 'boolean') return value;
-    if (typeof value === 'number') return value !== 0;
-    if (typeof value === 'string') return value.length > 0 && value.toLowerCase() !== 'false';
-    if (value && typeof value === 'object') {
-      const record = value as Record<string, unknown>;
-      if ('success' in record) return Boolean(record.success);
-      if ('id' in record) return Boolean(record.id);
-      return true;
+    if (typeof value === 'number') return value === 1;
+    if (typeof value === 'string') return value === expectedId || value.toLowerCase() === 'true';
+    if (isRecord(value)) {
+      if ('success' in value) return value.success === true;
+      if ('id' in value) return value.id === expectedId;
+      return false;
     }
     return false;
   }
@@ -1754,12 +2540,18 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           }
         }
       `;
-      const result = await this.client.request<{ project: { id: string } | null }>(query, { id: projectId });
-      return result.project?.id ? { state: 'present' } : { state: 'absent' };
+      const result = await this.client.request<unknown>(query, { id: projectId });
+      if (!isRecord(result) || !('project' in result)) {
+        return { state: 'unknown', error: `Railway returned an invalid project existence response for ${projectId}.` };
+      }
+      if (result.project === null) return { state: 'absent' };
+      if (!isRecord(result.project) || result.project.id !== projectId) {
+        return { state: 'unknown', error: `Railway returned a partial or mismatched project identity for ${projectId}.` };
+      }
+      return { state: 'present' };
     } catch (error) {
-      const message = this.describeError(error);
-      if (message.toLowerCase().includes('not found')) return { state: 'absent' };
-      return { state: 'unknown', error: message };
+      if (this.isProviderConfirmedNotFound(error, 'project')) return { state: 'absent' };
+      return { state: 'unknown', error: this.describeError(error) };
     }
   }
 
@@ -1775,12 +2567,18 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           }
         }
       `;
-      const result = await this.client.request<{ service: { id: string } | null }>(query, { id: serviceId });
-      return result.service?.id ? { state: 'present' } : { state: 'absent' };
+      const result = await this.client.request<unknown>(query, { id: serviceId });
+      if (!isRecord(result) || !('service' in result)) {
+        return { state: 'unknown', error: `Railway returned an invalid service existence response for ${serviceId}.` };
+      }
+      if (result.service === null) return { state: 'absent' };
+      if (!isRecord(result.service) || result.service.id !== serviceId) {
+        return { state: 'unknown', error: `Railway returned a partial or mismatched service identity for ${serviceId}.` };
+      }
+      return { state: 'present' };
     } catch (error) {
-      const message = this.describeError(error);
-      if (message.toLowerCase().includes('not found')) return { state: 'absent' };
-      return { state: 'unknown', error: message };
+      if (this.isProviderConfirmedNotFound(error, 'service')) return { state: 'absent' };
+      return { state: 'unknown', error: this.describeError(error) };
     }
   }
 
@@ -1801,36 +2599,36 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           }
         }
       `;
-      const result = await this.client.request<{
-        project: { id: string; environments?: { edges?: Array<{ node?: { id?: string } }> } } | null;
-      }>(query, { projectId });
-      if (!result.project) return { state: 'absent' };
-      const exists = result.project.environments?.edges?.some((edge) => edge.node?.id === environmentId) ?? false;
+      const result = await this.client.request<unknown>(query, { projectId });
+      if (!isRecord(result) || !('project' in result)) {
+        return { state: 'unknown', error: `Railway returned an invalid environment existence response for project ${projectId}.` };
+      }
+      if (result.project === null) return { state: 'absent' };
+      if (!isRecord(result.project) || result.project.id !== projectId
+        || !isRecord(result.project.environments) || !Array.isArray(result.project.environments.edges)) {
+        return { state: 'unknown', error: `Railway returned a partial or mismatched environment inventory for project ${projectId}.` };
+      }
+      const ids: string[] = [];
+      for (const edge of result.project.environments.edges) {
+        if (!isRecord(edge) || !isRecord(edge.node)
+          || typeof edge.node.id !== 'string' || edge.node.id.length === 0) {
+          return { state: 'unknown', error: `Railway returned a partial environment identity for project ${projectId}.` };
+        }
+        ids.push(edge.node.id);
+      }
+      if (new Set(ids).size !== ids.length) {
+        return { state: 'unknown', error: `Railway returned duplicate environment identities for project ${projectId}.` };
+      }
+      const exists = ids.includes(environmentId);
       return { state: exists ? 'present' : 'absent' };
     } catch (error) {
-      const message = this.describeError(error);
-      if (message.toLowerCase().includes('not found')) return { state: 'absent' };
-      return { state: 'unknown', error: message };
+      if (this.isProviderConfirmedNotFound(error, 'project')) return { state: 'absent' };
+      return { state: 'unknown', error: this.describeError(error) };
     }
   }
 
   private async sleep(ms: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  private describeRailwayAuthorizationError(error: unknown, projectId: string, type: ComponentType): string {
-    const message = this.describeError(error);
-    if (!/not authorized/i.test(message)) {
-      return message;
-    }
-
-    return [
-      message,
-      `Not authorized to create ${type} on Railway project ${projectId}.`,
-      'Use an Account token or a Workspace token with write access to this workspace/project.',
-      'If you are using OAuth, ensure project/workspace member scopes were granted.',
-      'Then run hv_connections provider="railway" action="verify" again to refresh connection context.',
-    ].join(' ');
   }
 
   async deploy(
@@ -1845,11 +2643,10 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
 
     const bindings = environment.platformBindings as {
       projectId?: string;
-      environmentId?: string;
       services?: Record<string, { serviceId: string }>;
+      serviceCreateRecovery?: Record<string, unknown>;
     };
     const projectId = bindings.projectId;
-    let environmentId = bindings.environmentId;
 
     if (!projectId) {
       return {
@@ -1879,6 +2676,68 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
       // project-level service that only has instances in another environment
       // cannot be deployed here; create a target-environment service instead.
       const providerServiceName = this.railwayServiceNameForEnvironment(service.name, environment.name);
+      const providerScope = { projectId, environmentId: railwayEnvId };
+      const failedCreateRecovery = (
+        recovery: HostingServiceCreateRecovery,
+        message: string,
+        error: string,
+        mutationAttempted: boolean
+      ): DeployResult => ({
+        serviceId: service.id,
+        ...(recovery.serviceId ? { externalId: recovery.serviceId } : {}),
+        status: 'failed',
+        receipt: {
+          success: false,
+          message,
+          error,
+          data: {
+            provider: this.name,
+            phase: 'serviceCreate',
+            environmentId: railwayEnvId,
+            mutationAttempted,
+            serviceCreateRecovery: recovery,
+          },
+        },
+      });
+      const identifiedCreateRecovery = (serviceId: string): HostingServiceCreateRecovery => (
+        createHostingServiceCreateRecovery({
+          provider: this.name,
+          resourceName: providerServiceName,
+          providerScope,
+          state: 'identified',
+          serviceId,
+          returnedName: providerServiceName,
+        })
+      );
+      const rawPriorRecovery = bindings.serviceCreateRecovery?.[service.name];
+      if (rawPriorRecovery !== undefined) {
+        const priorRecovery = parseHostingServiceCreateRecovery(rawPriorRecovery);
+        const scope = priorRecovery?.providerScope;
+        if (!priorRecovery
+          || priorRecovery.provider !== this.name
+          || priorRecovery.resourceName !== providerServiceName
+          || scope?.projectId !== projectId
+          || scope?.environmentId !== railwayEnvId
+          || Object.keys(scope).length !== 2) {
+          return {
+            serviceId: service.id,
+            status: 'failed',
+            receipt: {
+              success: false,
+              message: `Railway service-create recovery state for ${service.name} is invalid`,
+              error: 'The persisted recovery marker does not match the exact provider, project, environment, and service name. Hypervibe refused to create or mutate a service.',
+            },
+          };
+        }
+        return failedCreateRecovery(
+          priorRecovery,
+          `Railway service creation for ${service.name} is incomplete`,
+          priorRecovery.serviceId
+            ? `Railway service ${priorRecovery.serviceId} must be inspected and explicitly recovered or cleaned up before another deploy.`
+            : `A previous Railway serviceCreate for "${providerServiceName}" may have committed without returning an id. Inspect that exact project/environment before retrying.`,
+          false
+        );
+      }
       const serviceResolution = await this.resolveServiceIdForEnvironment(
         projectId,
         this.railwayServiceNameCandidates(service.name, environment.name),
@@ -1899,18 +2758,104 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           }
         `;
 
-        const createResult = await this.client.request<{ serviceCreate: { id: string; name: string } }>(
-          createMutation,
-          {
+        let createResult: unknown;
+        try {
+          createResult = await this.client.request<unknown>(createMutation, {
             input: {
               projectId,
               environmentId: railwayEnvId,
               name: providerServiceName,
             },
+          });
+        } catch (error) {
+          if (!this.isMutationOutcomeUncertain(error)) throw error;
+          let recovered: { id: string; name: string } | undefined;
+          let recoveryError: string | undefined;
+          try {
+            recovered = await this.recoverServiceIdentityAfterCreate(
+              projectId,
+              providerServiceName,
+              railwayEnvId
+            );
+          } catch (recoveryFailure) {
+            recoveryError = this.describeError(recoveryFailure);
           }
-        );
+          const recovery = createHostingServiceCreateRecovery({
+            provider: this.name,
+            resourceName: providerServiceName,
+            providerScope,
+            state: recovered ? 'identified' : 'unresolved',
+            ...(recovered ? { serviceId: recovered.id, returnedName: recovered.name } : {}),
+          });
+          return failedCreateRecovery(
+            recovery,
+            recovered
+              ? `Railway created service ${providerServiceName}, but the create response was lost`
+              : `Railway service creation for ${providerServiceName} is unresolved`,
+            [this.describeError(error), recoveryError].filter(Boolean).join('; '),
+            true
+          );
+        }
 
-        railwayServiceId = createResult.serviceCreate.id;
+        const payload = isRecord(createResult) && isRecord(createResult.serviceCreate)
+          ? createResult.serviceCreate
+          : null;
+        const returnedId = typeof payload?.id === 'string' && payload.id.trim().length > 0
+          ? payload.id
+          : undefined;
+        const returnedName = typeof payload?.name === 'string' && payload.name.trim().length > 0
+          ? payload.name
+          : undefined;
+        if (!returnedId) {
+          let recovered: { id: string; name: string } | undefined;
+          let recoveryError: string | undefined;
+          try {
+            recovered = await this.recoverServiceIdentityAfterCreate(
+              projectId,
+              providerServiceName,
+              railwayEnvId
+            );
+          } catch (error) {
+            recoveryError = this.describeError(error);
+          }
+          const recovery = createHostingServiceCreateRecovery({
+            provider: this.name,
+            resourceName: providerServiceName,
+            providerScope,
+            state: recovered ? 'identified' : 'unresolved',
+            ...(recovered ? { serviceId: recovered.id, returnedName: recovered.name } : {}),
+            ...(!recovered && returnedName ? { returnedName } : {}),
+          });
+          return failedCreateRecovery(
+            recovery,
+            `Railway serviceCreate returned no valid id for ${providerServiceName}`,
+            [
+              'Hypervibe stopped before service-instance, configuration, variable, redeploy, or domain mutations.',
+              recoveryError,
+            ].filter(Boolean).join(' '),
+            true
+          );
+        }
+        if (returnedName !== providerServiceName) {
+          const recovery = createHostingServiceCreateRecovery({
+            provider: this.name,
+            resourceName: providerServiceName,
+            providerScope,
+            state: 'mismatched',
+            serviceId: returnedId,
+            ...(returnedName ? { returnedName } : {}),
+          });
+          return failedCreateRecovery(
+            recovery,
+            `Railway returned an unexpected service identity for ${service.name}`,
+            returnedName
+              ? `Expected service name "${providerServiceName}" but serviceCreate returned "${returnedName}". The returned id was retained only for recovery.`
+              : `Expected service name "${providerServiceName}" but serviceCreate returned no valid name. The returned id was retained only for recovery.`,
+            true
+          );
+        }
+
+        railwayServiceId = returnedId;
         createdService = true;
       }
 
@@ -1921,6 +2866,14 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           railwayEnvId
         );
       if (!ensuredInstance.success) {
+        if (createdService) {
+          return failedCreateRecovery(
+            identifiedCreateRecovery(railwayServiceId),
+            `Railway created ${service.name}, but its environment instance was not verified`,
+            ensuredInstance.error,
+            true
+          );
+        }
         return {
           serviceId: service.id,
           externalId: railwayServiceId,
@@ -1952,6 +2905,14 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           ...runtimeConfig,
         });
         if (!configReceipt.success) {
+          if (createdService) {
+            return failedCreateRecovery(
+              identifiedCreateRecovery(railwayServiceId),
+              `Railway created ${service.name}, but runtime configuration failed`,
+              configReceipt.error || configReceipt.message,
+              true
+            );
+          }
           return {
             serviceId: service.id,
             externalId: railwayServiceId,
@@ -1965,14 +2926,11 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         }
       }
 
-      // Auto-wire database and cache connections from Railway plugins
-      const pluginVars = await this.getPluginVariableReferences(projectId);
-      const allEnvVars = { ...pluginVars, ...envVars }; // User vars override auto-detected
-
-      // Set environment variables (including auto-wired plugin connections)
+      // Datastore wiring is supplied by apply from the exact declared component.
+      // A service action must never discover or attach unrelated project plugins.
       let rolloutBaseline: Record<string, unknown> | undefined;
       let runtimeRolloutRequired = false;
-      if (Object.keys(allEnvVars).length > 0) {
+      if (Object.keys(envVars).length > 0) {
         const envForVarSync: Environment = {
           ...environment,
           platformBindings: {
@@ -1987,11 +2945,19 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           ? await this.setEnvVars(
             envForVarSync,
             service,
-            allEnvVars,
+            envVars,
             { deferDeployment: true }
           )
-          : await this.setEnvVars(envForVarSync, service, allEnvVars);
+          : await this.setEnvVars(envForVarSync, service, envVars);
         if (!envReceipt.success) {
+          if (createdService) {
+            return failedCreateRecovery(
+              identifiedCreateRecovery(railwayServiceId),
+              `Railway created ${service.name}, but environment-variable configuration failed`,
+              envReceipt.error ?? envReceipt.message,
+              true
+            );
+          }
           return {
             serviceId: service.id,
             externalId: railwayServiceId,
@@ -2024,10 +2990,22 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
             serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId)
           }
         `;
-        await this.client.request(redeployMutation, {
-          serviceId: railwayServiceId,
-          environmentId: railwayEnvId,
-        });
+        try {
+          await this.client.request(redeployMutation, {
+            serviceId: railwayServiceId,
+            environmentId: railwayEnvId,
+          });
+        } catch (error) {
+          if (createdService) {
+            return failedCreateRecovery(
+              identifiedCreateRecovery(railwayServiceId),
+              `Railway created ${service.name}, but redeploy failed`,
+              this.describeError(error),
+              true
+            );
+          }
+          throw error;
+        }
       }
 
       // Public services need a Railway-generated service domain; Railway does
@@ -2930,25 +3908,22 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
     `;
 
     try {
-      const all: RailwayProject[] = [];
-      let after: string | null = null;
-      do {
-        const result: {
-          projects: {
-            edges: Array<{ node: RailwayProject }>;
-            pageInfo: { hasNextPage: boolean; endCursor: string | null };
-          };
-        } = await this.client.request(query, { after });
-        all.push(...result.projects.edges.map((e) => e.node));
-        after = result.projects.pageInfo.hasNextPage ? result.projects.pageInfo.endCursor : null;
-      } while (after);
-      return all;
-    } catch {
-      // Fallback for token types that cannot use the top-level projects query.
+      return await this.listProjectConnection(query, (payload) => {
+        if (!isRecord(payload) || !('projects' in payload)) {
+          throw new RailwayProjectPaginationError('Railway returned an invalid top-level project inventory.');
+        }
+        return payload.projects;
+      });
+    } catch (error) {
+      // Only GraphQL validation proves this query never ran. Authorization,
+      // transport, pagination, and payload failures must remain unknown rather
+      // than falling back to the narrower personal-project inventory.
+      if (!this.isGraphqlSchemaCompatibilityError(error)) throw error;
+
       const legacyQuery = gql`
-        query ListPersonalProjects {
+        query ListPersonalProjects($after: String) {
           me {
-            projects {
+            projects(first: 100, after: $after) {
               edges {
                 node {
                   id
@@ -2958,15 +3933,100 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
                   updatedAt
                 }
               }
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
             }
           }
         }
       `;
-      const result = await this.client.request<{
-        me: { projects: { edges: Array<{ node: RailwayProject }> } };
-      }>(legacyQuery);
-      return result.me.projects.edges.map((e) => e.node);
+      return this.listProjectConnection(legacyQuery, (payload) => {
+        if (!isRecord(payload) || !isRecord(payload.me) || !('projects' in payload.me)) {
+          throw new RailwayProjectPaginationError('Railway returned an invalid personal project inventory.');
+        }
+        return payload.me.projects;
+      });
     }
+  }
+
+  private async listProjectConnection(
+    query: string,
+    extractConnection: (payload: unknown) => unknown
+  ): Promise<RailwayProject[]> {
+    if (!this.client) throw new Error('Not connected. Call connect() first.');
+    const all: RailwayProject[] = [];
+    const seenCursors = new Set<string>();
+    const seenProjectIds = new Set<string>();
+    const configuredPageLimit = Number(process.env.HYPERVIBE_RAILWAY_PROJECT_PAGE_LIMIT ?? 1000);
+    const pageLimit = Number.isFinite(configuredPageLimit) && configuredPageLimit >= 1
+      ? Math.floor(configuredPageLimit)
+      : 1000;
+    let pagesRead = 0;
+    let after: string | null = null;
+
+    do {
+      if (pagesRead >= pageLimit) {
+        throw new RailwayProjectPaginationError(`Railway project pagination exceeded ${pageLimit} pages.`);
+      }
+      let payload: unknown;
+      try {
+        payload = await this.client.request<unknown>(query, { after });
+      } catch (error) {
+        if (pagesRead > 0 && this.isGraphqlSchemaCompatibilityError(error)) {
+          throw new RailwayProjectPaginationError(
+            `Railway project pagination failed schema validation after ${pagesRead} successful page(s): ${this.describeError(error)}`
+          );
+        }
+        throw error;
+      }
+      const connection = extractConnection(payload);
+      if (!isRecord(connection) || !Array.isArray(connection.edges) || !isRecord(connection.pageInfo)
+        || typeof connection.pageInfo.hasNextPage !== 'boolean'
+        || (connection.pageInfo.endCursor !== null && typeof connection.pageInfo.endCursor !== 'string')) {
+        throw new RailwayProjectPaginationError('Railway returned a malformed project connection.');
+      }
+
+      for (const [index, edge] of connection.edges.entries()) {
+        if (!isRecord(edge) || !isRecord(edge.node)
+          || typeof edge.node.id !== 'string' || edge.node.id.length === 0
+          || typeof edge.node.name !== 'string' || edge.node.name.length === 0) {
+          throw new RailwayProjectPaginationError(`Railway returned an invalid project at edge ${index}.`);
+        }
+        if (seenProjectIds.has(edge.node.id)) {
+          throw new RailwayProjectPaginationError(`Railway returned duplicate project id "${edge.node.id}".`);
+        }
+        seenProjectIds.add(edge.node.id);
+        all.push({
+          id: edge.node.id,
+          name: edge.node.name,
+          ...(typeof edge.node.description === 'string' ? { description: edge.node.description } : {}),
+          ...(typeof edge.node.createdAt === 'string' ? { createdAt: edge.node.createdAt } : {}),
+          ...(typeof edge.node.updatedAt === 'string' ? { updatedAt: edge.node.updatedAt } : {}),
+        });
+      }
+      pagesRead += 1;
+
+      if (!connection.pageInfo.hasNextPage) {
+        after = null;
+        continue;
+      }
+      const nextCursor = connection.pageInfo.endCursor;
+      if (!nextCursor) {
+        throw new RailwayProjectPaginationError(
+          'Railway project pagination reported another page without an end cursor.'
+        );
+      }
+      if (seenCursors.has(nextCursor)) {
+        throw new RailwayProjectPaginationError(
+          `Railway project pagination repeated cursor "${nextCursor}".`
+        );
+      }
+      seenCursors.add(nextCursor);
+      after = nextCursor;
+    } while (after);
+
+    return all;
   }
 
   async getProjectDetails(projectId: string): Promise<RailwayProjectDetails | null> {
@@ -3043,6 +4103,10 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
                         numReplicas
                         sleepApplication
                         source { image }
+                        latestDeployment {
+                          id
+                          status
+                        }
                       }
                     }
                   }
@@ -3061,14 +4125,64 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         }
       `;
 
-      const result = await this.client.request<{ project: RailwayProjectDetails }>(query, { id: projectId });
-      return result.project;
+      const result = await this.client.request<unknown>(query, { id: projectId });
+      if (!isRecord(result) || !('project' in result)) {
+        throw new Error(`Railway returned an invalid project-details response for ${projectId}.`);
+      }
+      if (result.project === null) return null;
+      return this.validateProjectDetails(result.project, projectId);
     } catch (error) {
-      if (this.describeError(error).toLowerCase().includes('not found')) {
+      if (this.isProviderConfirmedNotFound(error, 'project')) {
         return null;
       }
       throw error;
     }
+  }
+
+  private validateProjectDetails(value: unknown, expectedProjectId: string): RailwayProjectDetails {
+    if (!isRecord(value)
+      || typeof value.id !== 'string' || value.id !== expectedProjectId
+      || typeof value.name !== 'string' || value.name.length === 0) {
+      throw new Error(`Railway returned partial or mismatched project details for ${expectedProjectId}.`);
+    }
+
+    const requireEdges = (connection: unknown, label: string): Array<Record<string, unknown>> => {
+      if (!isRecord(connection) || !Array.isArray(connection.edges)) {
+        throw new Error(`Railway project ${expectedProjectId} omitted its ${label} inventory.`);
+      }
+      return connection.edges.map((edge, index) => {
+        if (!isRecord(edge) || !isRecord(edge.node)) {
+          throw new Error(`Railway project ${expectedProjectId} returned an invalid ${label} edge at index ${index}.`);
+        }
+        return edge;
+      });
+    };
+    const requireIdentity = (node: Record<string, unknown>, label: string): void => {
+      if (typeof node.id !== 'string' || node.id.length === 0
+        || typeof node.name !== 'string' || node.name.length === 0) {
+        throw new Error(`Railway project ${expectedProjectId} returned a partial ${label} identity.`);
+      }
+    };
+
+    for (const edge of requireEdges(value.environments, 'environment')) {
+      requireIdentity(edge.node as Record<string, unknown>, 'environment');
+    }
+    for (const edge of requireEdges(value.services, 'service')) {
+      const node = edge.node as Record<string, unknown>;
+      requireIdentity(node, 'service');
+      requireEdges(node.repoTriggers, 'service repo-trigger');
+      requireEdges(node.serviceInstances, 'service instance');
+    }
+    for (const edge of requireEdges(value.plugins, 'plugin')) {
+      requireIdentity(edge.node as Record<string, unknown>, 'plugin');
+    }
+    if (value.buckets !== undefined) {
+      for (const edge of requireEdges(value.buckets, 'bucket')) {
+        requireIdentity(edge.node as Record<string, unknown>, 'bucket');
+      }
+    }
+
+    return value as unknown as RailwayProjectDetails;
   }
 
   async getServiceVariables(
@@ -3081,6 +4195,25 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
     }
 
     return this.fetchServiceVariables(projectId, serviceId, environmentId);
+  }
+
+  async readProviderEnvironmentVariables(
+    request: ProviderEnvironmentVariablesRequest
+  ): Promise<ProviderEnvironmentVariablesResult> {
+    const bindings = parseHostingBindings(request.environment);
+    const projectId = bindings.projectId;
+    const environmentId = bindings.environmentId;
+    const serviceId = bindings.services?.[request.service.name]?.serviceId;
+    if (!projectId || !environmentId || !serviceId) {
+      return {
+        success: false,
+        error: `Service ${request.service.name} is missing Railway bindings in ${request.environment.name}`,
+      };
+    }
+    return {
+      success: true,
+      variables: await this.getServiceVariables(projectId, serviceId, environmentId),
+    };
   }
 
   private async fetchServiceVariables(
@@ -3115,12 +4248,8 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
     serviceId: string,
     applicationPort: number
   ): Promise<RailwayTcpProxy | null> {
-    try {
-      const proxies = await this.listTcpProxies(environmentId, serviceId);
-      return proxies.find((proxy) => proxy.applicationPort === applicationPort) ?? null;
-    } catch {
-      return null;
-    }
+    const proxies = await this.listTcpProxies(environmentId, serviceId);
+    return proxies.find((proxy) => proxy.applicationPort === applicationPort) ?? null;
   }
 
   private async listTcpProxies(environmentId: string, serviceId: string): Promise<RailwayTcpProxy[]> {
@@ -4078,70 +5207,10 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
     }
   }
 
-  async findProjectByName(name: string): Promise<RailwayProject | null> {
-    return (await this.findProjectsByName(name))[0] ?? null;
-  }
-
   async findProjectsByName(name: string): Promise<RailwayProject[]> {
     const projects = await this.listProjects();
     const normalized = name.toLowerCase();
     return projects.filter((p) => p.name.toLowerCase() === normalized);
-  }
-
-  /**
-   * Detect Railway Postgres plugins and return variable references
-   * that can be used to auto-wire services to databases
-   */
-  async getPluginVariableReferences(projectId: string): Promise<Record<string, string>> {
-    if (!this.client) {
-      return {};
-    }
-
-    try {
-      const query = gql`
-        query GetProjectPlugins($id: String!) {
-          project(id: $id) {
-            plugins {
-              edges {
-                node {
-                  id
-                  name
-                }
-              }
-            }
-          }
-        }
-      `;
-
-      const result = await this.client.request<{
-        project: { plugins: { edges: Array<{ node: { id: string; name: string } }> } };
-      }>(query, { id: projectId });
-
-      const vars: Record<string, string> = {};
-
-      // Helper to create Railway variable reference syntax: ${{PluginName.VAR}}
-      const ref = (pluginName: string, varName: string) => '${{' + pluginName + '.' + varName + '}}';
-
-      for (const edge of result.project.plugins.edges) {
-        const pluginName = edge.node.name.toLowerCase();
-        const name = edge.node.name;
-
-        // Railway uses variable references like ${{Postgres.DATABASE_URL}}
-        // The plugin name in the reference matches how Railway names them
-        if (pluginName.includes('postgres') || pluginName === 'postgresql') {
-          vars['DATABASE_URL'] = ref(name, 'DATABASE_URL');
-          vars['PGHOST'] = ref(name, 'PGHOST');
-          vars['PGPORT'] = ref(name, 'PGPORT');
-          vars['PGUSER'] = ref(name, 'PGUSER');
-          vars['PGPASSWORD'] = ref(name, 'PGPASSWORD');
-          vars['PGDATABASE'] = ref(name, 'PGDATABASE');
-        }
-      }
-
-      return vars;
-    } catch {
-      return {};
-    }
   }
 
   /**
@@ -4179,6 +5248,88 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
 
       return { id: e.node.id, name: e.node.name, type };
     });
+  }
+
+  async readProviderLogs(request: ProviderRuntimeLogsRequest): Promise<ProviderRuntimeLogsResult> {
+    const bindings = parseHostingBindings(request.environment);
+    const serviceId = bindings.services?.[request.serviceName]?.serviceId;
+    if (!bindings.projectId || !bindings.environmentId || !serviceId) {
+      throw new Error(`Environment/service not fully bound to ${this.name}`);
+    }
+    const deployments = await this.getDeployments(
+      bindings.projectId,
+      bindings.environmentId,
+      serviceId,
+      1
+    );
+    if (deployments.length === 0) {
+      return { logs: [] };
+    }
+
+    const latestDeployment = deployments[0]!;
+    const logs = await this.getDeploymentLogs(latestDeployment.id, request.limit);
+    return {
+      deploymentStatus: latestDeployment.status,
+      deploymentId: latestDeployment.id,
+      logs: logs.map((log) => ({
+        timestamp: log.timestamp,
+        severity: log.severity || 'info',
+        message: log.message,
+      })),
+    };
+  }
+
+  async listProviderDeployments(request: ProviderDeploymentsRequest): Promise<ProviderDeployment[]> {
+    const bindings = parseHostingBindings(request.environment);
+    if (!bindings.projectId || !bindings.environmentId) {
+      throw new Error(`Environment not deployed to ${this.name}`);
+    }
+    const serviceId = request.serviceName
+      ? bindings.services?.[request.serviceName]?.serviceId
+      : undefined;
+    if (request.serviceName && !serviceId) {
+      throw new Error(`Environment/service not fully bound to ${this.name}`);
+    }
+    const deployments = await this.getDeployments(
+      bindings.projectId,
+      bindings.environmentId,
+      serviceId,
+      request.limit
+    );
+    return deployments.map((deployment) => ({
+      id: deployment.id,
+      status: deployment.status,
+      createdAt: deployment.createdAt,
+      url: deployment.staticUrl,
+    }));
+  }
+
+  async readProviderBuildLogs(request: ProviderBuildLogsRequest): Promise<{ deploymentId: string; buildLogs: string }> {
+    const bindings = parseHostingBindings(request.environment);
+    if (!bindings.projectId || !bindings.environmentId) {
+      throw new Error(`Environment not deployed to ${this.name}`);
+    }
+    const serviceId = bindings.services?.[request.serviceName]?.serviceId;
+    if (!serviceId) {
+      throw new Error(`Environment/service not fully bound to ${this.name}`);
+    }
+
+    let deploymentId = request.deploymentId;
+    if (!deploymentId) {
+      const deployments = await this.getDeployments(
+        bindings.projectId,
+        bindings.environmentId,
+        serviceId,
+        1
+      );
+      if (deployments.length === 0) {
+        throw new Error('No deployments found for service');
+      }
+      deploymentId = deployments[0]!.id;
+    }
+
+    const buildLogs = await this.getBuildLogs(deploymentId);
+    return { deploymentId, buildLogs: buildLogs || 'No build logs available' };
   }
 
   async getDeployments(
@@ -4272,47 +5423,170 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
 
   private async getBucketState(projectId: string, environmentId: string): Promise<{
     projectBuckets: Array<{ id: string; name: string }>;
-    environmentBuckets: Record<string, { region?: string; isDeleted?: boolean }>;
+    environmentBuckets: Record<string, { region?: string; isCreated?: boolean; isDeleted?: boolean }>;
     unmergedChangesCount: number;
   }> {
     if (!this.client) throw new Error('Not connected. Call connect() first.');
     const query = gql`
       query GetBucketState($projectId: String!, $environmentId: String!) {
         project(id: $projectId) {
+          id
           buckets { edges { node { id name } } }
           environments { edges { node { id unmergedChangesCount } } }
         }
-        environment(id: $environmentId) { config(decryptVariables: false) }
+        environment(id: $environmentId) { id config(decryptVariables: false) }
       }
     `;
-    const result = await this.client.request<{
-      project: {
-        buckets?: { edges?: Array<{ node: { id: string; name: string } }> };
-        environments?: { edges?: Array<{ node: { id: string; unmergedChangesCount?: number | null } }> };
+    const result = await this.client.request<unknown>(query, { projectId, environmentId });
+    if (!isRecord(result)
+      || !Object.prototype.hasOwnProperty.call(result, 'project')
+      || !Object.prototype.hasOwnProperty.call(result, 'environment')) {
+      throw new Error(`Railway returned an incomplete bucket-state response for project ${projectId} and environment ${environmentId}.`);
+    }
+    if (!isRecord(result.project) || result.project.id !== projectId) {
+      throw new Error(`Railway did not confirm the bound project ${projectId} while observing bucket state.`);
+    }
+    if (!isRecord(result.project.buckets) || !Array.isArray(result.project.buckets.edges)) {
+      throw new Error(`Railway returned an incomplete bucket inventory for project ${projectId}.`);
+    }
+    const projectBuckets: Array<{ id: string; name: string }> = [];
+    const bucketIds = new Set<string>();
+    const bucketNames = new Set<string>();
+    for (const edge of result.project.buckets.edges) {
+      if (!isRecord(edge)
+        || !isRecord(edge.node)
+        || typeof edge.node.id !== 'string'
+        || edge.node.id.trim().length === 0
+        || typeof edge.node.name !== 'string'
+        || edge.node.name.trim().length === 0) {
+        throw new Error(`Railway returned a malformed bucket identity for project ${projectId}.`);
+      }
+      const normalizedName = edge.node.name.toLowerCase();
+      if (bucketIds.has(edge.node.id)) {
+        throw new Error(`Railway returned duplicate bucket id ${edge.node.id} for project ${projectId}.`);
+      }
+      if (bucketNames.has(normalizedName)) {
+        throw new Error(`Railway returned multiple buckets named "${edge.node.name}" for project ${projectId}.`);
+      }
+      bucketIds.add(edge.node.id);
+      bucketNames.add(normalizedName);
+      projectBuckets.push({ id: edge.node.id, name: edge.node.name });
+    }
+
+    if (!isRecord(result.project.environments) || !Array.isArray(result.project.environments.edges)) {
+      throw new Error(`Railway returned an incomplete environment inventory for project ${projectId}.`);
+    }
+    const environmentNodes: Array<{ id: string; unmergedChangesCount: number }> = [];
+    const environmentIds = new Set<string>();
+    for (const edge of result.project.environments.edges) {
+      if (!isRecord(edge)
+        || !isRecord(edge.node)
+        || typeof edge.node.id !== 'string'
+        || edge.node.id.trim().length === 0
+        || typeof edge.node.unmergedChangesCount !== 'number'
+        || !Number.isSafeInteger(edge.node.unmergedChangesCount)
+        || edge.node.unmergedChangesCount < 0) {
+        throw new Error(`Railway returned a malformed environment identity or staged-change count for project ${projectId}.`);
+      }
+      if (environmentIds.has(edge.node.id)) {
+        throw new Error(`Railway returned duplicate environment id ${edge.node.id} for project ${projectId}.`);
+      }
+      environmentIds.add(edge.node.id);
+      environmentNodes.push({ id: edge.node.id, unmergedChangesCount: edge.node.unmergedChangesCount });
+    }
+    const environmentNode = environmentNodes.find((candidate) => candidate.id === environmentId);
+    if (!environmentNode) {
+      throw new Error(`Railway did not confirm bound environment ${environmentId} in project ${projectId}.`);
+    }
+
+    if (!isRecord(result.environment) || result.environment.id !== environmentId) {
+      throw new Error(`Railway did not confirm the exact environment ${environmentId} while observing bucket configuration.`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(result.environment, 'config')
+      || !isRecord(result.environment.config)
+      || !Object.prototype.hasOwnProperty.call(result.environment.config, 'buckets')
+      || !isRecord(result.environment.config.buckets)) {
+      throw new Error(`Railway returned an incomplete bucket configuration for environment ${environmentId}.`);
+    }
+    const environmentBuckets: Record<string, { region?: string; isCreated?: boolean; isDeleted?: boolean }> = {};
+    for (const [bucketId, rawConfig] of Object.entries(result.environment.config.buckets)) {
+      if (bucketId.trim().length === 0 || !isRecord(rawConfig)) {
+        throw new Error(`Railway returned a malformed bucket configuration for environment ${environmentId}.`);
+      }
+      if (Object.prototype.hasOwnProperty.call(rawConfig, 'region')
+        && (typeof rawConfig.region !== 'string' || rawConfig.region.trim().length === 0)) {
+        throw new Error(`Railway returned an invalid region for bucket ${bucketId} in environment ${environmentId}.`);
+      }
+      if (Object.prototype.hasOwnProperty.call(rawConfig, 'isCreated') && typeof rawConfig.isCreated !== 'boolean') {
+        throw new Error(`Railway returned an invalid creation state for bucket ${bucketId} in environment ${environmentId}.`);
+      }
+      if (Object.prototype.hasOwnProperty.call(rawConfig, 'isDeleted') && typeof rawConfig.isDeleted !== 'boolean') {
+        throw new Error(`Railway returned an invalid deletion state for bucket ${bucketId} in environment ${environmentId}.`);
+      }
+      environmentBuckets[bucketId] = {
+        ...(typeof rawConfig.region === 'string' ? { region: rawConfig.region } : {}),
+        ...(typeof rawConfig.isCreated === 'boolean' ? { isCreated: rawConfig.isCreated } : {}),
+        ...(typeof rawConfig.isDeleted === 'boolean' ? { isDeleted: rawConfig.isDeleted } : {}),
       };
-      environment?: { config?: { buckets?: Record<string, { region?: string; isDeleted?: boolean }> } };
-    }>(query, { projectId, environmentId });
-    const environmentNode = result.project.environments?.edges?.find((edge) => edge.node.id === environmentId)?.node;
+    }
     return {
-      projectBuckets: (result.project.buckets?.edges ?? []).map((edge) => edge.node),
-      environmentBuckets: result.environment?.config?.buckets ?? {},
-      unmergedChangesCount: environmentNode?.unmergedChangesCount ?? 0,
+      projectBuckets,
+      environmentBuckets,
+      unmergedChangesCount: environmentNode.unmergedChangesCount,
     };
   }
 
+  private storageVerificationPolicy(): { attempts: number; delayMs: number } {
+    const configuredAttempts = Number(process.env.HYPERVIBE_RAILWAY_STORAGE_VERIFY_ATTEMPTS ?? 10);
+    const configuredDelayMs = Number(process.env.HYPERVIBE_RAILWAY_STORAGE_VERIFY_DELAY_MS ?? 250);
+    return {
+      attempts: Number.isFinite(configuredAttempts) && configuredAttempts >= 1
+        ? Math.min(Math.floor(configuredAttempts), 20)
+        : 10,
+      delayMs: Number.isFinite(configuredDelayMs) && configuredDelayMs >= 0
+        ? configuredDelayMs
+        : 250,
+    };
+  }
+
+  /**
+   * Reconcile a possibly committed bucketCreate without repeating the
+   * mutation. getBucketState proves the exact project and environment scope
+   * before any name match is accepted.
+   */
+  private async recoverBucketIdentityAfterCreate(
+    projectId: string,
+    environmentId: string,
+    requestedName: string
+  ): Promise<{ id: string; name: string } | undefined> {
+    const { attempts, delayMs } = this.storageVerificationPolicy();
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const state = await this.getBucketState(projectId, environmentId);
+        const candidate = state.projectBuckets.find(
+          (bucket) => bucket.name.toLowerCase() === requestedName.toLowerCase()
+        );
+        if (candidate) return candidate;
+      } catch {
+        // An uncertain read cannot prove absence. Keep retrying within the
+        // bounded recovery window, then retain an unresolved marker.
+      }
+      if (attempt < attempts - 1) {
+        await this.sleep(Math.min(delayMs * (2 ** attempt), 2000));
+      }
+    }
+    return undefined;
+  }
+
   private async getBucketUsage(bucketId: string, environmentId: string): Promise<{ objectCount?: number; sizeBytes?: number }> {
-    if (!this.client) return {};
+    if (!this.client) throw new Error('Not connected. Call connect() first.');
     const query = gql`
       query BucketUsage($bucketId: String!, $environmentId: String!) {
         bucketInstanceDetails(bucketId: $bucketId, environmentId: $environmentId) { objectCount sizeBytes }
       }
     `;
-    try {
-      const result = await this.client.request<{ bucketInstanceDetails?: { objectCount?: number; sizeBytes?: number } }>(query, { bucketId, environmentId });
-      return result.bucketInstanceDetails ?? {};
-    } catch {
-      return {};
-    }
+    const result = await this.client.request<{ bucketInstanceDetails?: { objectCount?: number; sizeBytes?: number } }>(query, { bucketId, environmentId });
+    return result.bucketInstanceDetails ?? {};
   }
 
   private async commitBucketPatch(
@@ -4326,7 +5600,10 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         environmentPatchCommit(environmentId: $environmentId, patch: $patch, commitMessage: $commitMessage)
       }
     `;
-    await this.client.request(mutation, { environmentId, patch: { buckets }, commitMessage });
+    const result = await this.client.request<unknown>(mutation, { environmentId, patch: { buckets }, commitMessage });
+    if (!isRecord(result) || result.environmentPatchCommit !== true) {
+      throw new Error(`Railway did not acknowledge the bucket configuration commit for environment ${environmentId}; mutation state is unknown.`);
+    }
   }
 
   async ensureStorageContext(
@@ -4387,20 +5664,116 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
 
   async ensureStorage(environment: Environment, name: string, options: { region: string }): Promise<Receipt> {
     if (!this.client) throw new Error('Not connected. Call connect() first.');
-    const bindings = environment.platformBindings as { projectId?: string; environmentId?: string };
+    const bindings = environment.platformBindings as {
+      projectId?: string;
+      environmentId?: string;
+      storageCreateRecovery?: unknown;
+    };
     if (!bindings.projectId || !bindings.environmentId) {
       return { success: false, message: `Failed to create Railway bucket "${name}"`, error: 'Railway project/environment bindings are missing. Apply project scaffolding first.' };
     }
+    const providerScope = {
+      projectId: bindings.projectId,
+      environmentId: bindings.environmentId,
+    };
+    const failedCreateRecovery = (
+      recovery: StorageCreateRecovery,
+      message: string,
+      error: string,
+      details: Record<string, unknown> = {}
+    ): Receipt => ({
+      success: false,
+      message,
+      error,
+      data: {
+        provider: 'railway',
+        phase: 'bucketCreate',
+        region: options.region,
+        storageCreateRecovery: recovery,
+        ...(recovery.externalId ? { externalId: recovery.externalId } : {}),
+        ...details,
+      },
+    });
+    const markerForObservedCandidate = (
+      candidate: { id: string; name: string } | undefined,
+      returnedId?: string,
+      returnedName?: string
+    ): StorageCreateRecovery => {
+      const exactCandidate = candidate?.name === name ? candidate : undefined;
+      if (returnedId) {
+        if (exactCandidate?.id === returnedId) {
+          return createStorageCreateRecovery({
+            provider: 'railway', resourceName: name, providerScope,
+            state: 'identified', externalId: returnedId, returnedName: name,
+          });
+        }
+        return createStorageCreateRecovery({
+          provider: 'railway', resourceName: name, providerScope,
+          state: 'mismatched', externalId: returnedId,
+          ...(returnedName && returnedName !== name ? { returnedName } : {}),
+        });
+      }
+      if (candidate) {
+        return createStorageCreateRecovery({
+          provider: 'railway', resourceName: name, providerScope,
+          state: candidate.name === name ? 'identified' : 'mismatched',
+          externalId: candidate.id,
+          returnedName: candidate.name,
+        });
+      }
+      return createStorageCreateRecovery({
+        provider: 'railway', resourceName: name, providerScope, state: 'unresolved',
+      });
+    };
+
+    const rawRecoveryMap = bindings.storageCreateRecovery;
+    if (rawRecoveryMap !== undefined) {
+      if (!isRecord(rawRecoveryMap)) {
+        return {
+          success: false,
+          message: `Railway bucket "${name}" has malformed retained create-recovery state`,
+          error: 'Repair or explicitly resolve the retained storage-create blocker before retrying. No bucket mutation was attempted.',
+          data: { provider: 'railway', phase: 'bucketCreate', mutationAttempted: false },
+        };
+      }
+      if (Object.prototype.hasOwnProperty.call(rawRecoveryMap, name)) {
+        const priorRecovery = parseStorageCreateRecovery(rawRecoveryMap[name]);
+        const validScope = priorRecovery
+          && priorRecovery.provider === 'railway'
+          && priorRecovery.resourceName === name
+          && Object.keys(priorRecovery.providerScope).length === 2
+          && priorRecovery.providerScope.projectId === bindings.projectId
+          && priorRecovery.providerScope.environmentId === bindings.environmentId;
+        if (!priorRecovery || !validScope) {
+          return {
+            success: false,
+            message: `Railway bucket "${name}" has inconsistent retained create-recovery state`,
+            error: 'Inspect the exact Railway project/environment and repair the retained storage-create marker before retrying. No bucket mutation was attempted.',
+            data: { provider: 'railway', phase: 'bucketCreate', mutationAttempted: false },
+          };
+        }
+        return failedCreateRecovery(
+          priorRecovery,
+          `Railway bucket "${name}" has retained create-recovery state`,
+          'Use hv_inspect to resolve the exact bucket identity, then explicitly adopt that bucket with hv_import. Hypervibe will not repeat bucketCreate.',
+          { mutationAttempted: false }
+        );
+      }
+    }
+
+    let createdBucket: { id: string; name: string } | undefined;
+    let patchSubmitted = false;
     try {
       const state = await this.getBucketState(bindings.projectId, bindings.environmentId);
-      const existing = state.projectBuckets.find((bucket) => bucket.name.toLowerCase() === name.toLowerCase());
-      const existingInstance = existing ? state.environmentBuckets[existing.id] : undefined;
-      if (existing && existingInstance && existingInstance.isDeleted !== true) {
-        const region = existingInstance.region;
-        if (region && region !== options.region) {
-          return { success: false, message: `Railway bucket "${name}" has immutable region ${region}`, error: `Requested region ${options.region} requires an explicit data migration and replacement.` };
-        }
-        return { success: true, message: `Using existing Railway bucket "${name}"`, data: { externalId: existing.id, region: region ?? options.region, created: false } };
+      const existing = state.projectBuckets.filter((bucket) => bucket.name.toLowerCase() === name.toLowerCase());
+      if (existing.length > 0) {
+        const candidate = existing[0]!;
+        return {
+          success: false,
+          message: `Railway bucket "${candidate.name}" already exists but is not bound locally`,
+          error: `Hypervibe will not silently attach or adopt Railway bucket ${candidate.id}. Use hv_import to adopt that exact bucket, then run hv_plan again.`,
+          data: { adoptionCandidateExternalId: candidate.id, region: state.environmentBuckets[candidate.id]?.region },
+        };
       }
       if (state.unmergedChangesCount > 0) {
         return {
@@ -4409,26 +5782,159 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           error: 'Commit or discard the staged Railway environment changes before Hypervibe creates the bucket, then re-run hv_plan.',
         };
       }
-      let bucket = existing;
-      if (!bucket) {
-        const mutation = gql`
-          mutation CreateBucket($input: BucketCreateInput!) {
-            bucketCreate(input: $input) { id name projectId }
-          }
-        `;
-        const created = await this.client.request<{ bucketCreate: { id: string; name: string; projectId: string } }>(mutation, {
+      const mutation = gql`
+        mutation CreateBucket($input: BucketCreateInput!) {
+          bucketCreate(input: $input) { id name projectId }
+        }
+      `;
+      let created: unknown;
+      try {
+        created = await this.client.request<unknown>(mutation, {
           input: { projectId: bindings.projectId, name },
         });
-        bucket = created.bucketCreate;
+      } catch (error) {
+        if (!this.isMutationOutcomeUncertain(error)) {
+          return {
+            success: false,
+            message: `Railway rejected bucket creation for "${name}"`,
+            error: this.describeError(error),
+            data: { provider: 'railway', phase: 'bucketCreate', mutationAttempted: false, region: options.region },
+          };
+        }
+        const recovered = await this.recoverBucketIdentityAfterCreate(
+          bindings.projectId,
+          bindings.environmentId,
+          name
+        );
+        const recovery = markerForObservedCandidate(recovered);
+        return failedCreateRecovery(
+          recovery,
+          recovered
+            ? `Railway bucket create for "${name}" was recovered but not applied`
+            : `Railway bucket create outcome for "${name}" is unresolved`,
+          recovered
+            ? 'The provider request failed after it may have committed. Hypervibe retained the observed bucket identity for explicit adoption and will not attach or retry it automatically.'
+            : 'The provider request failed after it may have committed, and bounded exact-name recovery did not resolve an identity. Inspect Railway and explicitly adopt or clean up the result before retrying.',
+          { mutationAttempted: true, verification: recovered ? 'present' : 'unknown' }
+        );
       }
+
+      const createdRecord = isRecord(created) && isRecord(created.bucketCreate)
+        ? created.bucketCreate
+        : undefined;
+      const returnedId = typeof createdRecord?.id === 'string' && createdRecord.id.trim().length > 0
+        ? createdRecord.id.trim()
+        : undefined;
+      const returnedName = typeof createdRecord?.name === 'string' && createdRecord.name.trim().length > 0
+        ? createdRecord.name
+        : undefined;
+      const exactAcknowledgement = Boolean(
+        returnedId
+        && returnedName === name
+        && createdRecord?.projectId === bindings.projectId
+      );
+      if (!exactAcknowledgement || !returnedId) {
+        const recovered = await this.recoverBucketIdentityAfterCreate(
+          bindings.projectId,
+          bindings.environmentId,
+          name
+        );
+        const recovery = markerForObservedCandidate(recovered, returnedId, returnedName);
+        return failedCreateRecovery(
+          recovery,
+          `Railway returned a malformed or mismatched acknowledgement for bucket "${name}"`,
+          'The create acknowledgement was not trustworthy, so no bucket attachment was attempted. Hypervibe retained conservative recovery state; inspect the exact Railway project/environment and explicitly adopt the intended bucket before retrying.',
+          { mutationAttempted: true, verification: recovered ? 'present' : 'unknown' }
+        );
+      }
+      const exactBucket = { id: returnedId, name };
+      createdBucket = exactBucket;
+
+      const { attempts, delayMs } = this.storageVerificationPolicy();
+      let creationState: typeof state | undefined;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const observed = await this.getBucketState(bindings.projectId, bindings.environmentId);
+        const observedBucket = observed.projectBuckets.find((bucket) => bucket.id === exactBucket.id);
+        if (observedBucket?.name === exactBucket.name) {
+          creationState = observed;
+          break;
+        }
+        if (attempt < attempts - 1) await this.sleep(Math.min(delayMs * (2 ** attempt), 2000));
+      }
+      if (!creationState) {
+        return failedCreateRecovery(
+          createStorageCreateRecovery({
+            provider: 'railway', resourceName: name, providerScope,
+            state: 'identified', externalId: exactBucket.id, returnedName: name,
+          }),
+          `Created Railway bucket "${name}" but could not verify it`,
+          'Provider bucket creation is not yet confirmed. Inspect and explicitly adopt the exact bucket before retrying.',
+          { mutationAttempted: true, created: true, verification: 'absent' }
+        );
+      }
+      if (creationState.unmergedChangesCount > 0) {
+        return failedCreateRecovery(
+          createStorageCreateRecovery({
+            provider: 'railway', resourceName: name, providerScope,
+            state: 'identified', externalId: exactBucket.id, returnedName: name,
+          }),
+          `Created Railway bucket "${name}" but found ${creationState.unmergedChangesCount} unmerged change(s) before attachment`,
+          'Hypervibe refused to commit a bucket patch alongside staged Railway environment changes. Resolve the staged changes, then explicitly adopt this bucket.',
+          { mutationAttempted: true, created: true, verification: 'present' }
+        );
+      }
+
+      patchSubmitted = true;
       await this.commitBucketPatch(
         bindings.environmentId,
-        { [bucket.id]: { region: options.region, isCreated: true, isDeleted: false } },
-        `Create bucket ${bucket.name}`
+        { [exactBucket.id]: { region: options.region, isCreated: true, isDeleted: false } },
+        `Create bucket ${exactBucket.name}`
       );
-      return { success: true, message: `Created Railway bucket "${bucket.name}" in ${options.region}`, data: { externalId: bucket.id, region: options.region, created: true } };
+
+      let converged = false;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const observed = await this.getBucketState(bindings.projectId, bindings.environmentId);
+        const observedBucket = observed.projectBuckets.find((bucket) => bucket.id === exactBucket.id);
+        const instance = observed.environmentBuckets[exactBucket.id];
+        if (observedBucket?.name === exactBucket.name
+          && instance?.region === options.region
+          && instance.isCreated === true
+          && instance.isDeleted === false
+          && observed.unmergedChangesCount === 0) {
+          converged = true;
+          break;
+        }
+        if (attempt < attempts - 1) await this.sleep(Math.min(delayMs * (2 ** attempt), 2000));
+      }
+      if (!converged) {
+        return failedCreateRecovery(
+          createStorageCreateRecovery({
+            provider: 'railway', resourceName: name, providerScope,
+            state: 'identified', externalId: exactBucket.id, returnedName: name,
+          }),
+          `Railway acknowledged bucket "${name}" but its environment attachment did not converge`,
+          'The exact bucket region and active environment configuration could not be verified. Inspect and explicitly adopt the bucket before retrying.',
+          { mutationAttempted: true, created: true, patchSubmitted: true, verification: 'pending' }
+        );
+      }
+      return { success: true, message: `Created Railway bucket "${exactBucket.name}" in ${options.region}`, data: { externalId: exactBucket.id, region: options.region, created: true } };
     } catch (error) {
-      return { success: false, message: `Failed to ensure Railway bucket "${name}"`, error: this.describeError(error) };
+      if (createdBucket) {
+        return failedCreateRecovery(
+          createStorageCreateRecovery({
+            provider: 'railway', resourceName: name, providerScope,
+            state: 'identified', externalId: createdBucket.id, returnedName: name,
+          }),
+          `Failed to ensure Railway bucket "${name}" after its identity was acknowledged`,
+          this.describeError(error),
+          { mutationAttempted: true, created: true, patchSubmitted, verification: 'unknown' }
+        );
+      }
+      return {
+        success: false,
+        message: `Failed to ensure Railway bucket "${name}"`,
+        error: this.describeError(error),
+      };
     }
   }
 
@@ -4438,10 +5944,23 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
     if (!bindings.projectId || !bindings.environmentId) {
       return { success: false, message: 'Failed to delete Railway bucket', error: 'Railway project/environment bindings are missing.' };
     }
+    let patchSubmitted = false;
     try {
       const state = await this.getBucketState(bindings.projectId, bindings.environmentId);
       const bucket = state.projectBuckets.find((candidate) => candidate.id === externalId);
-      if (!bucket || state.environmentBuckets[externalId]?.isDeleted === true) {
+      const instance = state.environmentBuckets[externalId];
+      if (!bucket) {
+        if (!instance || instance.isDeleted === true) {
+          return { success: true, message: 'Railway bucket is already absent', data: { externalId, deleted: false } };
+        }
+        return {
+          success: false,
+          message: 'Failed to delete Railway bucket',
+          error: `Railway returned an active environment configuration for bucket ${externalId} without the matching project bucket identity. Deletion state is unknown.`,
+          data: { externalId, verification: 'unknown' },
+        };
+      }
+      if (!instance || instance.isDeleted === true) {
         return { success: true, message: 'Railway bucket is already absent', data: { externalId, deleted: false } };
       }
       if (state.unmergedChangesCount > 0) {
@@ -4451,14 +5970,51 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           error: 'Commit or discard the staged Railway environment changes before deleting the bucket, then re-run hv_plan.',
         };
       }
+      patchSubmitted = true;
       await this.commitBucketPatch(bindings.environmentId, { [externalId]: { isDeleted: true } }, `Delete bucket ${bucket.name}`);
+
+      const configuredAttempts = Number(process.env.HYPERVIBE_RAILWAY_STORAGE_VERIFY_ATTEMPTS ?? 10);
+      const configuredDelayMs = Number(process.env.HYPERVIBE_RAILWAY_STORAGE_VERIFY_DELAY_MS ?? 250);
+      const attempts = Number.isFinite(configuredAttempts) && configuredAttempts >= 1
+        ? Math.min(Math.floor(configuredAttempts), 20)
+        : 10;
+      const delayMs = Number.isFinite(configuredDelayMs) && configuredDelayMs >= 0
+        ? configuredDelayMs
+        : 250;
+      let deleted = false;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const observed = await this.getBucketState(bindings.projectId, bindings.environmentId);
+        const observedBucket = observed.projectBuckets.find((candidate) => candidate.id === externalId);
+        const observedInstance = observed.environmentBuckets[externalId];
+        if (!observedBucket && observedInstance && observedInstance.isDeleted !== true) {
+          throw new Error(`Railway returned an active environment configuration for bucket ${externalId} without its project identity.`);
+        }
+        if (!observedInstance || observedInstance.isDeleted === true) {
+          deleted = true;
+          break;
+        }
+        if (attempt < attempts - 1) await this.sleep(Math.min(delayMs * (2 ** attempt), 2000));
+      }
+      if (!deleted) {
+        return {
+          success: false,
+          message: `Railway acknowledged deletion of bucket "${bucket.name}" but terminal absence was not verified`,
+          error: 'The bucket remains active in the bound environment. Re-run hv_plan before retrying deletion.',
+          data: { externalId, deleted: false, patchSubmitted: true, verification: 'pending' },
+        };
+      }
       return {
         success: true,
         message: `Deleted Railway bucket "${bucket.name}" (Railway permanently deletes it after its recovery window)`,
         data: { externalId, deleted: true },
       };
     } catch (error) {
-      return { success: false, message: 'Failed to delete Railway bucket', error: this.describeError(error) };
+      return {
+        success: false,
+        message: 'Failed to delete Railway bucket',
+        error: this.describeError(error),
+        data: { externalId, patchSubmitted, verification: 'unknown' },
+      };
     }
   }
 
@@ -4562,6 +6118,8 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
     const databases: ObservedDatabase[] = [];
     const caches: ObservedCache[] = [];
     const storage: ObservedStorage[] = [];
+    let databaseObservationComplete = true;
+    let cacheObservationComplete = true;
 
     const environmentConfig = projectEnvironments.find((candidate) => candidate.id === environmentId)?.config;
     for (const edge of details.buckets?.edges ?? []) {
@@ -4588,16 +6146,19 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
         continue;
       }
 
-      const engine = this.classifyDatastoreEngine(node.name);
+      const boundServiceName = this.boundServiceNameForId(bindings.services, node.id);
+      const engine = boundServiceName
+        ? null
+        : this.classifyDatastoreImage(instance.source?.image);
       if (engine) {
         if (engine === 'redis') {
           caches.push({
             provider: 'railway',
             engine: 'redis',
             externalId: node.id,
-            providerScope: { projectId },
+            providerScope: { projectId, environmentId },
             name: node.name,
-            status: 'unknown',
+            status: this.toObservedDatastoreStatus(instance.latestDeployment?.status),
           });
         } else {
           databases.push({
@@ -4606,13 +6167,13 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
             externalId: node.id,
             providerScope: { projectId },
             name: node.name,
-            status: 'unknown',
+            status: this.toObservedDatastoreStatus(instance.latestDeployment?.status),
           });
         }
         continue;
       }
 
-      const observedServiceName = this.boundServiceNameForId(bindings.services, node.id)
+      const observedServiceName = boundServiceName
         ?? this.hypervibeServiceNameFromRailwayName(node.name, environment.name);
 
       const serviceDomain = instance?.domains?.serviceDomains?.[0]?.domain;
@@ -4749,10 +6310,12 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
       });
     }
 
+    const serviceObservationComplete = !partial;
     for (const edge of details.plugins?.edges ?? []) {
       const node = edge.node;
       const engine = this.classifyDatastoreEngine(node.name);
       if (engine === 'redis') {
+        cacheObservationComplete = false;
         caches.push({
           provider: 'railway',
           engine: 'redis',
@@ -4762,6 +6325,7 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           status: 'unknown',
         });
       } else {
+        databaseObservationComplete = false;
         databases.push({
           provider: 'railway',
           engine: engine ?? 'unknown',
@@ -4771,6 +6335,12 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
           status: 'unknown',
         });
       }
+    }
+    if (!databaseObservationComplete || !cacheObservationComplete) {
+      partial = true;
+      warnings.push(
+        'Railway legacy plugin inventory does not expose environment-specific readiness; datastore observation remains unknown.'
+      );
     }
 
     return {
@@ -4786,9 +6356,9 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
       completeness: {
         project: 'complete',
         environment: 'complete',
-        services: partial ? 'unknown' : 'complete',
-        databases: 'complete',
-        caches: 'complete',
+        services: serviceObservationComplete ? 'complete' : 'unknown',
+        databases: databaseObservationComplete ? 'complete' : 'unknown',
+        caches: cacheObservationComplete ? 'complete' : 'unknown',
         storage: 'complete',
       },
       partial,
@@ -5022,11 +6592,37 @@ export class RailwayAdapter implements IProviderAdapter, IWorkloadMaintenanceAda
     return null;
   }
 
+  private classifyDatastoreImage(image?: string | null): 'postgres' | 'redis' | null {
+    if (!image) return null;
+    const normalized = image.toLowerCase();
+    if (/(^|\/)postgres(?::|@|$)/.test(normalized)) return 'postgres';
+    if (/(^|\/)(?:redis|valkey)(?::|@|$)/.test(normalized)) return 'redis';
+    return null;
+  }
+
   private toObservedStatus(status?: string): ObservedService['status'] {
     if (!status) return 'unknown';
     const normalized = status.toUpperCase();
     if (normalized.includes('SUCCESS')) return 'running';
     if (normalized.includes('FAIL') || normalized.includes('CRASH')) return 'failed';
+    return 'unknown';
+  }
+
+  private toObservedDatastoreStatus(
+    status?: string
+  ): ObservedDatabase['status'] {
+    if (!status) return 'unknown';
+    const normalized = status.toUpperCase();
+    if (normalized.includes('SUCCESS') || normalized === 'SLEEPING') return 'running';
+    if (normalized.includes('FAIL') || normalized.includes('CRASH')) return 'error';
+    if (normalized.includes('REMOVED') || normalized.includes('CANCEL')) return 'stopped';
+    if (
+      normalized.includes('BUILD')
+      || normalized.includes('DEPLOY')
+      || normalized.includes('QUEUE')
+      || normalized.includes('INITIAL')
+      || normalized.includes('WAIT')
+    ) return 'provisioning';
     return 'unknown';
   }
 }
@@ -5052,6 +6648,7 @@ export interface RailwayServiceInstance {
   numReplicas?: number;
   sleepApplication?: boolean;
   source?: { image?: string | null } | null;
+  latestDeployment?: { id?: string; status?: string } | null;
 }
 
 export interface RailwayTcpProxy {
@@ -5160,10 +6757,25 @@ providerRegistry.register({
     credentials: {
       defaultScalarKey: 'apiToken',
     },
+    maturity: {
+      lifecycle: {
+        hosting: { status: 'ready-for-live' },
+        database: { status: 'ready-for-live' },
+        cache: { status: 'ready-for-live' },
+        storage: { status: 'ready-for-live' },
+        queue: {
+          status: 'ready-for-live',
+          reason: 'Postgres-backed queue wiring is implemented; live promotion evidence has not been recorded.',
+        },
+      },
+    },
     lifecycle: {
-      hosting: { customDomains: 'managed', maintenance: 'managed', teardownBoundary: 'environment' },
+      hosting: { workloadKinds: ['web', 'worker', 'cron'], customDomains: 'managed', maintenance: 'managed', teardownBoundary: 'environment' },
       databaseEngines: ['postgres'],
+      databaseConnectivity: { compatibleHostingProviders: ['railway'] },
       cacheEngines: ['redis'],
+      cacheConnectivity: { compatibleHostingProviders: ['railway'] },
+      queue: { backend: 'postgres', resources: 'application-managed' },
     },
     orchestration: {
       project: {
@@ -5201,26 +6813,27 @@ providerRegistry.register({
       },
     },
   },
-  factory: (credentials) => {
+  factory: async (credentials) => {
     const adapter = new RailwayAdapter();
-    // Note: Railway's connect is async but we can't await in factory
-    // The adapter handles this by checking client state in each method
-    adapter.connect(credentials);
+    await adapter.connect(credentials);
     return adapter;
   },
   inspection: {
     resources: ['project', 'environment', 'database', 'cache', 'storage'],
     defaultResource: 'project',
     selectors: {
-      project: { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true },
+      project: { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, collectionKey: 'projects' },
       environment: { mode: 'environment-forensics', required: ['project', 'env'], optional: ['scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true },
       database: { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, scopeKeys: ['projectId'] },
-      cache: { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, scopeKeys: ['projectId'] },
+      cache: { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, scopeKeys: ['projectId', 'environmentId'] },
       storage: { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, scopeKeys: ['projectId'] },
     },
     inspect: (adapter, request) => inspectRailwayResources(adapter as RailwayAdapter, request),
   },
   adoption: { project: true },
+  databaseRuntime: {
+    project: projectRailwayDatabaseRuntime,
+  },
   derivedAdapters: {
     database: async (adapter, context) => {
       const [{ createRailwayDatabaseAdapter }, { EnvironmentRepository }] = await Promise.all([
