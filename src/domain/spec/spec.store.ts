@@ -1,7 +1,11 @@
 import { ProjectSpecRepository } from '../../adapters/db/repositories/spec.repository.js';
 import type { Project } from '../entities/project.entity.js';
 import { projectSpecSchema, type ProjectSpec, type EnvironmentSpec, type ServiceSpec } from './spec.schema.js';
-import { readRepoSpecFile, writeRepoSpecFile } from './repo-spec-file.js';
+import {
+  preflightRepoSpecWrite,
+  readRepoSpecFile,
+  writePreflightedRepoSpecFile,
+} from './repo-spec-file.js';
 
 /** Shape of the legacy policies.desiredState blob (pre-spec). */
 interface LegacyDesiredState {
@@ -167,7 +171,16 @@ export interface SpecResult {
   spec: ProjectSpec;
   revision: number;
   source?: { kind: 'repo'; path: string } | { kind: 'local' };
-  envTemplate?: { path: string; addedKeys: string[] };
+  envTemplate?: { path: string; addedKeys: string[]; commentedKeys: string[] };
+  localEnv?: {
+    path: string;
+    addedKeys: string[];
+    commentedKeys: string[];
+    activatedKeys?: string[];
+    permissionsUpdated?: boolean;
+    gitignorePath?: string;
+    gitignoreUpdated?: boolean;
+  };
   /**
    * True when `.hypervibe/spec.json` changed outside hypervibe (or was seen
    * for the first time) and was just recorded as a new revision. Callers
@@ -198,14 +211,6 @@ function parseStoredSpec(document: unknown, projectId: string, revision: number)
   return parsed.data;
 }
 
-function writeMatchingRepoSpec(project: Project, spec: ProjectSpec) {
-  const existing = readRepoSpecFile();
-  if (existing && !repoSpecMatchesProject(existing.spec, project)) {
-    return null;
-  }
-  return writeRepoSpecFile(spec);
-}
-
 /**
  * Revisioned storage for project specs. Every write creates a new revision —
  * hv_plan records the revision it planned against, and hv_apply rejects
@@ -216,6 +221,10 @@ function writeMatchingRepoSpec(project: Project, spec: ProjectSpec) {
  * table is the revision journal behind it (stale-plan rejection, history).
  * When the repo file diverges from the latest revision, the repo file wins
  * and is recorded as a new revision with `adopted: true` on the result.
+ * Repo-backed writes prepare dotenv files, atomically replace the repo spec,
+ * and only then append the local journal. Thus an env/template failure advances
+ * neither desired-state copy; if the journal append alone fails, the repo file
+ * remains authoritative and the next read adopts it into a fresh revision.
  * Bindings are the inverse: `environments.platform_bindings` (DB) is
  * authoritative and `.hypervibe/bindings.json` is a sanitized export — see
  * repo-bindings-file.ts.
@@ -253,13 +262,14 @@ export class SpecStore {
 
     const converted = desiredStateToSpec(project);
     if (!converted) return null;
+    const preflight = preflightRepoSpecWrite(converted, undefined, project.gitRemoteUrl);
+    const written = preflight ? writePreflightedRepoSpecFile(converted, preflight) : null;
     const row = this.repo.insert(project.id, 1, converted);
-    const written = writeMatchingRepoSpec(project, converted);
     return {
       spec: converted,
       revision: row.revision,
       source: written ? { kind: 'repo', path: written.path } : { kind: 'local' },
-      ...(written ? { envTemplate: written.envTemplate } : {}),
+      ...(written ? { envTemplate: written.envTemplate, localEnv: written.localEnv } : {}),
     };
   }
 
@@ -275,19 +285,18 @@ export class SpecStore {
     if (parsed.project !== project.name) {
       throw new Error(`Spec project "${parsed.project}" does not match target project "${project.name}".`);
     }
-    // Validate any repository source of truth before appending a local
-    // revision. Otherwise a corrupt repo file could make the write fail only
-    // after the journal had already accepted a divergent desired state.
-    const repoSpec = readRepoSpecFile();
-    const shouldWriteRepoSpec = !repoSpec || repoSpecMatchesProject(repoSpec.spec, project);
+    // Validate the repository source of truth and local-env safety boundary
+    // before appending a revision. A failed repo write must not leave the
+    // journal claiming desired state that never reached the checkout.
+    const preflight = preflightRepoSpecWrite(parsed, undefined, project.gitRemoteUrl);
     const latest = this.repo.findLatest(project.id);
+    const written = preflight ? writePreflightedRepoSpecFile(parsed, preflight) : null;
     const row = this.repo.insert(project.id, (latest?.revision ?? 0) + 1, parsed);
-    const written = shouldWriteRepoSpec ? writeRepoSpecFile(parsed) : null;
     return {
       spec: parsed,
       revision: row.revision,
       source: written ? { kind: 'repo', path: written.path } : { kind: 'local' },
-      ...(written ? { envTemplate: written.envTemplate } : {}),
+      ...(written ? { envTemplate: written.envTemplate, localEnv: written.localEnv } : {}),
     };
   }
 

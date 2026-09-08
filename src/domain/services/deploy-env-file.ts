@@ -1,7 +1,8 @@
-import { copyFileSync, existsSync, readFileSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, lstatSync, readFileSync, writeFileSync } from 'fs';
 import path from 'path';
 import { parseEnvFile } from '../../utils/env-parser.js';
 import { findRepoRoot } from '../spec/repo-spec-file.js';
+import { ensureRepoEnvFilesIgnored } from '../spec/repo-env-file.js';
 import { primaryWorkspaceDirectory } from '../../lib/workspace-context.js';
 
 export interface DeployEnvFileResult {
@@ -12,11 +13,15 @@ export interface DeployEnvFileResult {
   divergentFromBaseKeys?: string[];
   missingEnvSpecificPath?: string;
   usedBaseEnvFallback?: boolean;
+  /** True when Hypervibe removed group/world access from its existing default private file. */
+  permissionsUpdated?: boolean;
   vars: Record<string, string>;
   skippedKeys: string[];
   ignoredKeys: string[];
   excludedKeys: string[];
   localValueKeys: string[];
+  /** Selected keys whose assignment exists but has no usable value. */
+  emptyKeys: string[];
 }
 
 export type DeployEnvFileMode = 'runtime' | 'all' | 'explicit' | 'off';
@@ -32,6 +37,7 @@ const PROVIDER_ONLY_EXACT_KEYS = new Set([
   'CLOUDFLARE_ACCOUNT_ID',
   'CLOUDFLARE_API_TOKEN',
   'CLOUDFLARE_EMAIL',
+  'CLOUDFLARE_REGISTRAR_API_TOKEN',
   'CLOUDFLARE_ZONE_ID',
   'CODECOV_TOKEN',
   'DOPPLER_TOKEN',
@@ -53,6 +59,7 @@ const PROVIDER_ONLY_EXACT_KEYS = new Set([
   'IMAGE_REGISTRY_TOKEN',
   'IMAGE_REGISTRY_USERNAME',
   'NETLIFY_AUTH_TOKEN',
+  'NODE_AUTH_TOKEN',
   'NPM_CONFIG_TOKEN',
   'NPM_TOKEN',
   'OP_SERVICE_ACCOUNT_TOKEN',
@@ -150,6 +157,21 @@ function ensureTrailingNewline(content: string): string {
   return content.endsWith('\n') ? content : `${content}\n`;
 }
 
+function restrictExistingEnvFileMode(filePath: string): boolean {
+  if (process.platform === 'win32') return false;
+  const stat = lstatSync(filePath);
+  if (!stat.isFile()) {
+    throw new Error(
+      `Refusing to prepare ${filePath} because it is not a regular file. Remove the symlink or other special file and retry Hypervibe.`
+    );
+  }
+  const currentMode = stat.mode & 0o777;
+  const restrictedMode = currentMode & 0o600;
+  if (restrictedMode === currentMode) return false;
+  chmodSync(filePath, restrictedMode);
+  return true;
+}
+
 function assignmentLinesByKey(content: string): Map<string, string> {
   const lines = content.split(/\r?\n/);
   const byKey = new Map<string, string>();
@@ -163,39 +185,69 @@ function assignmentLinesByKey(content: string): Map<string, string> {
   return byKey;
 }
 
+function filteredBaseEnvContent(baseContent: string, copyableKeys: Set<string>): string {
+  const eol = baseContent.includes('\r\n') ? '\r\n' : '\n';
+  const lines = baseContent.split(/\r?\n/);
+  return lines
+    .filter((line, index) => {
+      const key = assignmentKeyFromLine(line);
+      if (key) return copyableKeys.has(key);
+      if (/^\s*#\s*Hypervibe:/.test(line)) {
+        const nextKey = assignmentKeyFromLine(lines[index + 1] ?? '');
+        if (nextKey && !copyableKeys.has(nextKey)) return false;
+      }
+      return true;
+    })
+    .join(eol);
+}
+
 function syncEnvSpecificFromBase(basePath: string, envSpecificPath: string, excludedKeys = new Set<string>()): {
   created: boolean;
   syncedKeys: string[];
   divergentKeys: string[];
+  emptyKeys: string[];
+  skippedProviderKeys: string[];
 } {
   const baseContent = readFileSync(basePath, 'utf-8');
-  if (!existsSync(envSpecificPath)) {
-    if (excludedKeys.size === 0) {
-      copyFileSync(basePath, envSpecificPath);
-    } else {
-      const filtered = baseContent
-        .split(/\r?\n/)
-        .filter((line) => {
-          const key = assignmentKeyFromLine(line);
-          return !key || !excludedKeys.has(key);
-        })
-        .join('\n');
-      writeFileSync(envSpecificPath, filtered, 'utf-8');
-    }
+  const baseVars = parseEnvFile(basePath);
+  const envSpecificExists = existsSync(envSpecificPath);
+  const envSpecificVars = envSpecificExists ? parseEnvFile(envSpecificPath) : {};
+  const absentBaseKeys = Object.keys(baseVars)
+    .filter((key) => !excludedKeys.has(key) && !(key in envSpecificVars));
+  const skippedProviderKeys = absentBaseKeys
+    .filter((key) => isProviderOnlyDeployEnvKey(key))
+    .sort();
+  const emptyKeys = absentBaseKeys
+    .filter((key) => !isProviderOnlyDeployEnvKey(key) && baseVars[key].trim() === '')
+    .sort();
+  const copyableKeys = absentBaseKeys
+    .filter((key) => !isProviderOnlyDeployEnvKey(key) && baseVars[key].trim() !== '')
+    .sort();
+
+  if (!envSpecificExists) {
+    writeFileSync(
+      envSpecificPath,
+      filteredBaseEnvContent(baseContent, new Set(copyableKeys)),
+      { encoding: 'utf-8', mode: 0o600 }
+    );
     return {
       created: true,
-      syncedKeys: Object.keys(parseEnvFile(basePath)).filter((key) => !excludedKeys.has(key)).sort(),
+      syncedKeys: copyableKeys,
       divergentKeys: [],
+      emptyKeys,
+      skippedProviderKeys,
     };
   }
 
-  const baseVars = parseEnvFile(basePath);
-  const envSpecificVars = parseEnvFile(envSpecificPath);
-  const syncedKeys = Object.keys(baseVars)
-    .filter((key) => !excludedKeys.has(key) && !(key in envSpecificVars))
-    .sort();
+  const syncedKeys = copyableKeys;
   const divergentKeys = Object.keys(baseVars)
-    .filter((key) => !excludedKeys.has(key) && key in envSpecificVars && envSpecificVars[key] !== baseVars[key])
+    .filter((key) =>
+      !excludedKeys.has(key)
+      && !isProviderOnlyDeployEnvKey(key)
+      && baseVars[key].trim() !== ''
+      && key in envSpecificVars
+      && envSpecificVars[key] !== baseVars[key]
+    )
     .sort();
 
   if (syncedKeys.length > 0) {
@@ -213,7 +265,7 @@ function syncEnvSpecificFromBase(basePath: string, envSpecificPath: string, excl
     }
   }
 
-  return { created: false, syncedKeys, divergentKeys };
+  return { created: false, syncedKeys, divergentKeys, emptyKeys, skippedProviderKeys };
 }
 
 function hostLooksLocal(host: string): boolean {
@@ -277,26 +329,60 @@ function resolveDefaultDeployEnvFile(startDir = primaryWorkspaceDirectory(), env
   divergentFromBaseKeys?: string[];
   missingEnvSpecificPath?: string;
   usedBaseEnvFallback?: boolean;
+  permissionsUpdated?: boolean;
+  emptyFromBaseKeys?: string[];
+  skippedFromBaseKeys?: string[];
 } {
   const root = findRepoRoot(startDir);
   if (!root) return { path: null };
   const suffix = envFileSuffix(envName);
   const basePath = path.join(root, '.env');
   const envSpecificPath = suffix ? path.join(root, `.env.${suffix}`) : null;
+  if (
+    options.syncEnvSpecific
+    && (existsSync(basePath) || (envSpecificPath !== null && existsSync(envSpecificPath)))
+  ) {
+    ensureRepoEnvFilesIgnored(root, [
+      '.env',
+      ...(envSpecificPath ? [path.basename(envSpecificPath)] : []),
+    ]);
+  }
+  const basePermissionsUpdated = options.syncEnvSpecific && existsSync(basePath)
+    ? restrictExistingEnvFileMode(basePath)
+    : false;
   if (envSpecificPath && existsSync(envSpecificPath)) {
+    const envSpecificPermissionsUpdated = options.syncEnvSpecific
+      ? restrictExistingEnvFileMode(envSpecificPath)
+      : false;
+    const permissionsUpdated = basePermissionsUpdated || envSpecificPermissionsUpdated;
     if (options.syncEnvSpecific && existsSync(basePath)) {
       const sync = syncEnvSpecificFromBase(basePath, envSpecificPath, new Set(options.excludedKeys ?? []));
-      if (sync.syncedKeys.length === 0) {
+      if (
+        sync.syncedKeys.length === 0
+        && sync.emptyKeys.length === 0
+        && sync.skippedProviderKeys.length === 0
+        && !permissionsUpdated
+      ) {
         return { path: envSpecificPath };
       }
       return {
         path: envSpecificPath,
-        baseEnvPath: basePath,
-        syncedFromBaseKeys: sync.syncedKeys,
-        ...(sync.divergentKeys.length > 0 ? { divergentFromBaseKeys: sync.divergentKeys } : {}),
+        ...(permissionsUpdated ? { permissionsUpdated: true } : {}),
+        ...(sync.syncedKeys.length > 0
+          ? {
+              baseEnvPath: basePath,
+              syncedFromBaseKeys: sync.syncedKeys,
+              ...(sync.divergentKeys.length > 0 ? { divergentFromBaseKeys: sync.divergentKeys } : {}),
+            }
+          : {}),
+        ...(sync.emptyKeys.length > 0 ? { emptyFromBaseKeys: sync.emptyKeys } : {}),
+        ...(sync.skippedProviderKeys.length > 0 ? { skippedFromBaseKeys: sync.skippedProviderKeys } : {}),
       };
     }
-    return { path: envSpecificPath };
+    return {
+      path: envSpecificPath,
+      ...(permissionsUpdated ? { permissionsUpdated: true } : {}),
+    };
   }
   if (existsSync(basePath)) {
     if (envSpecificPath && options.syncEnvSpecific) {
@@ -304,12 +390,16 @@ function resolveDefaultDeployEnvFile(startDir = primaryWorkspaceDirectory(), env
       return {
         path: envSpecificPath,
         baseEnvPath: basePath,
+        ...(basePermissionsUpdated ? { permissionsUpdated: true } : {}),
         ...(sync.created ? { createdEnvSpecificPath: envSpecificPath } : {}),
         ...(sync.syncedKeys.length > 0 ? { syncedFromBaseKeys: sync.syncedKeys } : {}),
+        ...(sync.emptyKeys.length > 0 ? { emptyFromBaseKeys: sync.emptyKeys } : {}),
+        ...(sync.skippedProviderKeys.length > 0 ? { skippedFromBaseKeys: sync.skippedProviderKeys } : {}),
       };
     }
     return {
       path: basePath,
+      ...(basePermissionsUpdated ? { permissionsUpdated: true } : {}),
       ...(envSpecificPath ? { missingEnvSpecificPath: envSpecificPath, usedBaseEnvFallback: true } : {}),
     };
   }
@@ -342,30 +432,42 @@ export function loadDeployEnvFile(options: {
 
   const parsed = parseEnvFile(filePath);
   const vars: Record<string, string> = {};
-  const skippedKeys: string[] = [];
-  const ignoredKeys: string[] = [];
-  const excludedKeys: string[] = [];
-  const localValueKeys: string[] = [];
+  const candidates = new Map(Object.entries(parsed));
+  for (const key of resolvedDefault.emptyFromBaseKeys ?? []) {
+    if (!candidates.has(key)) candidates.set(key, '');
+  }
+  for (const key of resolvedDefault.skippedFromBaseKeys ?? []) {
+    if (!candidates.has(key)) candidates.set(key, '');
+  }
+  const skippedKeys = new Set<string>();
+  const ignoredKeys = new Set<string>();
+  const excludedKeys = new Set<string>();
+  const localValueKeys = new Set<string>();
+  const emptyKeys = new Set<string>();
   const includeKeys = new Set(options.includeKeys ?? []);
-  const excludeKeys = new Set(options.excludeKeys ?? []);
-  for (const [key, value] of Object.entries(parsed)) {
+  const excludedKeySet = new Set(options.excludeKeys ?? []);
+  for (const [key, value] of candidates) {
     if (!isValidEnvKey(key) || isProviderOnlyDeployEnvKey(key)) {
-      skippedKeys.push(key);
+      skippedKeys.add(key);
       continue;
     }
-    if (excludeKeys.has(key)) {
-      excludedKeys.push(key);
+    if (excludedKeySet.has(key)) {
+      excludedKeys.add(key);
       continue;
     }
     const selected = includeKeys.has(key)
       || mode === 'all'
       || (mode === 'runtime' && isRuntimeDeployEnvKey(key));
     if (!selected) {
-      ignoredKeys.push(key);
+      ignoredKeys.add(key);
+      continue;
+    }
+    if (value.trim() === '') {
+      emptyKeys.add(key);
       continue;
     }
     if (mode === 'runtime' && !includeKeys.has(key) && valueLooksLocal(value)) {
-      localValueKeys.push(key);
+      localValueKeys.add(key);
       continue;
     }
     vars[key] = value;
@@ -379,10 +481,12 @@ export function loadDeployEnvFile(options: {
     ...(resolvedDefault.divergentFromBaseKeys ? { divergentFromBaseKeys: resolvedDefault.divergentFromBaseKeys } : {}),
     ...(resolvedDefault.missingEnvSpecificPath ? { missingEnvSpecificPath: resolvedDefault.missingEnvSpecificPath } : {}),
     ...(resolvedDefault.usedBaseEnvFallback ? { usedBaseEnvFallback: true } : {}),
+    ...(resolvedDefault.permissionsUpdated ? { permissionsUpdated: true } : {}),
     vars,
-    skippedKeys: skippedKeys.sort(),
-    ignoredKeys: ignoredKeys.sort(),
-    excludedKeys: excludedKeys.sort(),
-    localValueKeys: localValueKeys.sort(),
+    skippedKeys: [...skippedKeys].sort(),
+    ignoredKeys: [...ignoredKeys].sort(),
+    excludedKeys: [...excludedKeys].sort(),
+    localValueKeys: [...localValueKeys].sort(),
+    emptyKeys: [...emptyKeys].sort(),
   };
 }

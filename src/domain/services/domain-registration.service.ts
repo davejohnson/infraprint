@@ -64,7 +64,20 @@ function registrationBinding(environment: Environment | null, domain: string): D
   return asRecord(registrations?.[domain]) as DomainRegistrationBinding | null;
 }
 
-export function cloudflareRegistrarCredentialProblem(domain: string): string | null {
+export interface CloudflareRegistrarCredentialRequirement {
+  reason: string;
+  requiredCredentialKeys: Array<'apiToken' | 'accountId' | 'registrarApiToken'>;
+}
+
+/**
+ * Return the value-free credential roles needed to replace a Cloudflare
+ * connection without dropping the already-working DNS identity. Connection
+ * adds replace the complete credential object, so a Registrar-only map is not
+ * executable even though registrarApiToken is the newly missing role.
+ */
+export function cloudflareRegistrarCredentialRequirement(
+  domain: string
+): CloudflareRegistrarCredentialRequirement | null {
   const connection = new ConnectionRepository().findBestVerifiedMatchFromHints(
     'cloudflare',
     cloudflareScopeHintsForDomain(domain)
@@ -74,24 +87,41 @@ export function cloudflareRegistrarCredentialProblem(domain: string): string | n
   const credentials = getSecretStore().decryptObject<{
     apiToken?: string;
     apiTokenKind?: 'user' | 'account' | 'unknown';
+    accountId?: string;
     registrarApiToken?: string;
   }>(connection.credentialsEncrypted);
+  const apiTokenIsAccountOwned = Boolean(credentials.apiToken) && (
+    cloudflareTokenKind(credentials.apiToken!) === 'account'
+    || credentials.apiTokenKind === 'account'
+  );
+  const requiredCredentialKeys: CloudflareRegistrarCredentialRequirement['requiredCredentialKeys'] = [
+    'apiToken',
+    ...(apiTokenIsAccountOwned && credentials.accountId?.trim() ? ['accountId' as const] : []),
+    'registrarApiToken',
+  ];
   const registrarToken = credentials.registrarApiToken?.trim();
   if (registrarToken) {
     if (cloudflareTokenKind(registrarToken) === 'account') {
-      return `Cloudflare domain registration for ${domain} requires a Cloudflare User API Token (usually cfut_), but the stored registrarApiToken is an Account API Token (usually cfat_). Start from the pre-filled Hypervibe User API Token template at ${CLOUDFLARE_TOKEN_URLS.user}, narrow it to the target account/zone, and add Registrar write permissions before creating it. Then either use it as apiToken/CLOUDFLARE_API_TOKEN for a single-token setup, or keep the Account API Token as apiToken and store the User API Token as registrarApiToken/CLOUDFLARE_REGISTRAR_API_TOKEN.`;
+      return {
+        reason: `Cloudflare domain registration for ${domain} requires a Cloudflare User API Token (usually cfut_), but the stored registrarApiToken is an Account API Token (usually cfat_). Start from the pre-filled Hypervibe User API Token template at ${CLOUDFLARE_TOKEN_URLS.user}, narrow it to the target account/zone, and add Registrar write permissions before creating it. Then either use it as apiToken/CLOUDFLARE_API_TOKEN for a single-token setup, or keep the Account API Token as apiToken and store the User API Token as registrarApiToken/CLOUDFLARE_REGISTRAR_API_TOKEN.`,
+        requiredCredentialKeys,
+      };
     }
     return null;
   }
 
-  if (
-    credentials.apiToken
-    && (cloudflareTokenKind(credentials.apiToken) === 'account' || credentials.apiTokenKind === 'account')
-  ) {
-    return `Cloudflare domain registration for ${domain} cannot use the stored apiToken because it is an Account API Token (usually cfat_). Account API Tokens are correct for durable DNS/custom-domain/email automation, but Cloudflare Registrar requires a User API Token (usually cfut_). Start from the pre-filled Hypervibe User API Token template at ${CLOUDFLARE_TOKEN_URLS.user}, narrow it to the target account/zone, and add Registrar write permissions before creating it. Then either use it as apiToken/CLOUDFLARE_API_TOKEN for a single-token setup, or keep the Account API Token as apiToken and store the User API Token as registrarApiToken/CLOUDFLARE_REGISTRAR_API_TOKEN.`;
+  if (apiTokenIsAccountOwned) {
+    return {
+      reason: `Cloudflare domain registration for ${domain} cannot use the stored apiToken because it is an Account API Token (usually cfat_). Account API Tokens are correct for durable DNS/custom-domain/email automation, but Cloudflare Registrar requires a User API Token (usually cfut_). Start from the pre-filled Hypervibe User API Token template at ${CLOUDFLARE_TOKEN_URLS.user}, narrow it to the target account/zone, and add Registrar write permissions before creating it. Then either use it as apiToken/CLOUDFLARE_API_TOKEN for a single-token setup, or keep the Account API Token as apiToken and store the User API Token as registrarApiToken/CLOUDFLARE_REGISTRAR_API_TOKEN.`,
+      requiredCredentialKeys,
+    };
   }
 
   return null;
+}
+
+export function cloudflareRegistrarCredentialProblem(domain: string): string | null {
+  return cloudflareRegistrarCredentialRequirement(domain)?.reason ?? null;
 }
 
 function workflowActionResult(domain: string, workflow: RegistrarWorkflowStatus, action: 'started' | 'polled'): ActionResult {

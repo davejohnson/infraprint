@@ -42,7 +42,7 @@ import { CACHE_OPERATIONS, planCache } from '../services/cache-plan.service.js';
 import { planDatabaseResilience, DATABASE_RESILIENCE_OPERATIONS } from '../services/database-resilience-plan.service.js';
 import {
   addDomainRegistrationDependency,
-  cloudflareRegistrarCredentialProblem,
+  cloudflareRegistrarCredentialRequirement,
   planCloudflareDomainRegistration,
 } from '../services/domain-registration.service.js';
 import {
@@ -66,7 +66,7 @@ import {
   planStorage,
   storageEnvKeys,
 } from '../services/storage-plan.service.js';
-import { formatConnectionGuidance } from '../services/connection-guidance.js';
+import { credentialFieldsFromSchema, formatConnectionGuidance } from '../services/connection-guidance.js';
 import { defaultDeployEnvFilePath, loadDeployEnvFile } from '../services/deploy-env-file.js';
 import { cloudflareScopeHintsForDomain } from '../services/domain-scope.js';
 import {
@@ -137,10 +137,19 @@ export interface EnvironmentPlan {
   /** Delegated values that must be supplied in a new hv_plan call before apply. */
   inputRequired: DelegatedSecretInputRequirement[];
   /** Missing/unverified provider connections that block apply. */
-  blocked: Array<{ provider: string; reason: string; scope?: string; policy?: 'hard' | 'action-scoped-if-independent-actions'; actionIds?: string[] }>;
+  blocked: Array<{ provider: string; reason: string; scope?: string; policy?: 'hard' | 'action-scoped-if-independent-actions'; actionIds?: string[]; requiredCredentialKeys?: string[] }>;
 }
 
 export const HOSTING_ENVIRONMENT_ENSURE_OPERATION = 'hostingEnvironmentEnsure';
+
+function providerRequiredCredentialKeys(provider: string): string[] {
+  const metadata = providerRegistry.getMetadata(provider);
+  return metadata
+    ? credentialFieldsFromSchema(metadata.credentialsSchema)
+      ?.filter((field) => field.required)
+      .map((field) => field.name) ?? []
+    : [];
+}
 
 function projectWithSpecGitRemoteUrl(project: Project, spec: ProjectSpec): Project {
   const gitRemoteUrl = spec.gitRemoteUrl?.trim();
@@ -761,8 +770,8 @@ export class PlanService {
   }
 
   /** Connections that must exist+verify before apply can run. */
-  preflight(environmentSpec: EnvironmentSpec, environmentName?: string, projectSpec?: ProjectSpec): Array<{ provider: string; reason: string; scope?: string; policy?: 'hard' | 'action-scoped-if-independent-actions' }> {
-    const blocked: Array<{ provider: string; reason: string; scope?: string; policy?: 'hard' | 'action-scoped-if-independent-actions' }> = [];
+  preflight(environmentSpec: EnvironmentSpec, environmentName?: string, projectSpec?: ProjectSpec): Array<{ provider: string; reason: string; scope?: string; policy?: 'hard' | 'action-scoped-if-independent-actions'; requiredCredentialKeys?: string[] }> {
+    const blocked: Array<{ provider: string; reason: string; scope?: string; policy?: 'hard' | 'action-scoped-if-independent-actions'; requiredCredentialKeys?: string[] }> = [];
     const required: Array<{ provider: string; scopeHints?: string[] }> = [
       { provider: environmentSpec.hosting.provider },
     ];
@@ -824,6 +833,7 @@ export class PlanService {
         const scope = requirement.scopeHints?.[0];
         blocked.push({
           provider: requirement.provider,
+          requiredCredentialKeys: providerRequiredCredentialKeys(requirement.provider),
           reason: `No verified ${requirement.provider}${scope ? ` connection for ${scope}` : ' connection'}. ${formatConnectionGuidance(requirement.provider, { scope })}`,
           policy: providerRegistry.getMetadata(requirement.provider)?.orchestration?.connections?.missingConnectionPolicy ?? 'hard',
           ...(scope ? { scope } : {}),
@@ -831,12 +841,13 @@ export class PlanService {
       }
     }
     if (environmentSpec.domainRegistration?.register && environmentSpec.domain) {
-      const registrarProblem = cloudflareRegistrarCredentialProblem(environmentSpec.domain);
-      if (registrarProblem) {
+      const registrarRequirement = cloudflareRegistrarCredentialRequirement(environmentSpec.domain);
+      if (registrarRequirement) {
         const scope = cloudflareScopeHintsForDomain(environmentSpec.domain)[0];
         blocked.push({
           provider: 'cloudflare',
-          reason: registrarProblem,
+          requiredCredentialKeys: registrarRequirement.requiredCredentialKeys,
+          reason: registrarRequirement.reason,
           policy: 'hard',
           ...(scope ? { scope } : {}),
         });
@@ -847,8 +858,8 @@ export class PlanService {
 
   /** Provider connections needed by an isolated cross-environment data copy.
    * Unrelated hosting, email, DNS, and CI connections cannot block this stage. */
-  providerPreflight(providers: string[]): Array<{ provider: string; reason: string; policy: 'hard' }> {
-    const blocked: Array<{ provider: string; reason: string; policy: 'hard' }> = [];
+  providerPreflight(providers: string[]): Array<{ provider: string; reason: string; policy: 'hard'; requiredCredentialKeys?: string[] }> {
+    const blocked: Array<{ provider: string; reason: string; policy: 'hard'; requiredCredentialKeys?: string[] }> = [];
     for (const provider of [...new Set(providers)].sort()) {
       const verified = providerRegistry.connectionProviders(provider).some((connectionProvider) =>
         this.connectionRepo.findAllByProvider(connectionProvider).some((connection) => connection.status === 'verified')
@@ -856,6 +867,7 @@ export class PlanService {
       if (!verified) {
         blocked.push({
           provider,
+          requiredCredentialKeys: providerRequiredCredentialKeys(provider),
           reason: `No verified ${provider} connection. ${formatConnectionGuidance(provider)}`,
           policy: 'hard',
         });
@@ -2589,6 +2601,9 @@ export class PlanService {
       }
       if (envFile.localValueKeys.length > 0) {
         envFileWarnings.push(`Skipped ${envFile.localValueKeys.length} .env key(s) with local-only values in runtime mode: ${envFile.localValueKeys.join(', ')}.`);
+      }
+      if (envFile.emptyKeys.length > 0) {
+        envFileWarnings.push(`Missing values for ${envFile.emptyKeys.length} selected .env key(s): ${envFile.emptyKeys.join(', ')}. Fill them before apply.`);
       }
       if (shadowedByManaged.length > 0) {
         envFileWarnings.push(`Ignored ${shadowedByManaged.length} .env key(s) because Hypervibe manages them from infrastructure: ${shadowedByManaged.join(', ')}.`);

@@ -1945,6 +1945,23 @@ providerRegistry.register({
     setupHelpUrl: CLOUDFLARE_USER_TOKEN_URL,
     credentials: {
       defaultScalarKey: 'apiToken',
+      localEnvInputs: [
+        {
+          envKey: 'CLOUDFLARE_API_TOKEN',
+          credentialKeys: ['apiToken'],
+          comment: 'Cloudflare API token for DNS, custom-domain, and account automation',
+        },
+        {
+          envKey: 'CLOUDFLARE_ACCOUNT_ID',
+          credentialKeys: ['accountId'],
+          comment: 'Cloudflare account ID required when the API token is account-owned',
+        },
+        {
+          envKey: 'CLOUDFLARE_REGISTRAR_API_TOKEN',
+          credentialKeys: ['registrarApiToken'],
+          comment: 'Cloudflare User API Token with Registrar write permission for domain purchases',
+        },
+      ],
     },
     maturity: {
       lifecycle: {

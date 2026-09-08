@@ -128,6 +128,33 @@ export const standardDatabaseRuntimeProjection: ProviderDatabaseRuntimeProjectio
   project: (_component, standard) => standard,
 };
 
+function credentialSchemaKeys(schema: z.ZodTypeAny): Set<string> | null {
+  let current = schema;
+  while (true) {
+    if (current instanceof z.ZodEffects) {
+      current = current.innerType();
+      continue;
+    }
+    if (
+      current instanceof z.ZodOptional
+      || current instanceof z.ZodNullable
+      || current instanceof z.ZodDefault
+      || current instanceof z.ZodCatch
+    ) {
+      current = current._def.innerType;
+      continue;
+    }
+    if (current instanceof z.ZodBranded) {
+      current = current._def.type;
+      continue;
+    }
+    break;
+  }
+  return current instanceof z.ZodObject
+    ? new Set(Object.keys(current.shape))
+    : null;
+}
+
 export interface ProviderMetadata {
   name: string;
   displayName: string;
@@ -143,6 +170,16 @@ export interface ProviderMetadata {
      * Exact requested names win; aliases are only fallbacks.
      */
     environmentVariableAliases?: string[][];
+    /**
+     * Preferred local dotenv slots Hypervibe can prepare when this exact
+     * provider connection is required. These are distinct credential roles,
+     * not same-value aliases, and never carry values.
+     */
+    localEnvInputs?: Array<{
+      envKey: string;
+      credentialKeys: string[];
+      comment: string;
+    }>;
   };
   /** Existing provider connections whose authentication shape this adapter can reuse. */
   connectionAliases?: string[];
@@ -299,10 +336,50 @@ export class ProviderRegistry {
     if (this.providers.has(provider.metadata.name)) {
       throw new Error(`Provider "${provider.metadata.name}" is already registered`);
     }
+    this.assertCredentialMetadata(provider);
     this.assertCapabilityMaturity(provider);
     this.assertDatabaseRuntimeProjection(provider);
     this.assertInspectionContract(provider);
     this.providers.set(provider.metadata.name, provider);
+  }
+
+  private assertCredentialMetadata(provider: RegisteredProvider): void {
+    const inputs = provider.metadata.credentials?.localEnvInputs ?? [];
+    const schemaKeys = inputs.length > 0
+      ? credentialSchemaKeys(provider.metadata.credentialsSchema)
+      : null;
+    const keys = inputs.map((input) => input.envKey);
+    if (new Set(keys).size !== keys.length) {
+      throw new Error(`Provider "${provider.metadata.name}" local env input keys must be unique.`);
+    }
+    const credentialRoleOwners = new Map<string, string>();
+    for (const input of inputs) {
+      if (
+        !/^[A-Za-z_][A-Za-z0-9_]*$/.test(input.envKey)
+        || input.credentialKeys.length === 0
+        || new Set(input.credentialKeys).size !== input.credentialKeys.length
+        || input.credentialKeys.some((key) => !key.trim())
+        || !input.comment.trim()
+        || /[\r\n]/.test(input.comment)
+      ) {
+        throw new Error(`Provider "${provider.metadata.name}" has an invalid local env input contract.`);
+      }
+      const unknownCredentialKey = input.credentialKeys.find((key) => !schemaKeys?.has(key));
+      if (unknownCredentialKey) {
+        throw new Error(
+          `Provider "${provider.metadata.name}" local env input "${input.envKey}" references unknown credential key "${unknownCredentialKey}".`
+        );
+      }
+      for (const credentialKey of input.credentialKeys) {
+        const existingOwner = credentialRoleOwners.get(credentialKey);
+        if (existingOwner) {
+          throw new Error(
+            `Provider "${provider.metadata.name}" local env credential role "${credentialKey}" is assigned to both "${existingOwner}" and "${input.envKey}".`
+          );
+        }
+        credentialRoleOwners.set(credentialKey, input.envKey);
+      }
+    }
   }
 
   private assertDatabaseRuntimeProjection(provider: RegisteredProvider): void {

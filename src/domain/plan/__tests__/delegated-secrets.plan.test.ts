@@ -114,7 +114,9 @@ describe('PlanService delegated secret inputs', () => {
   });
 
   it('persists an inspectable but non-executable plan when required input is absent', async () => {
-    const result = await new PlanService().plan(project, 'production', { includeEnvFile: false });
+    const envFile = path.join(tempDir, '.env');
+    fs.writeFileSync(envFile, 'ANTHROPIC_API_KEY=\n', 'utf8');
+    const result = await new PlanService().plan(project, 'production', { envFile });
     expect(result).not.toHaveProperty('error');
     const plan = result as Exclude<typeof result, { error: string }>;
     expect(plan.inputRequired).toEqual([

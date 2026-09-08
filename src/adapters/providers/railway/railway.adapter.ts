@@ -6756,6 +6756,13 @@ providerRegistry.register({
     setupHelpUrl: 'https://railway.com/account/tokens',
     credentials: {
       defaultScalarKey: 'apiToken',
+      localEnvInputs: [
+        {
+          envKey: 'HYPERVIBE_RAILWAY_TOKEN',
+          credentialKeys: ['apiToken'],
+          comment: 'Railway API token for the selected workspace and project infrastructure',
+        },
+      ],
     },
     maturity: {
       lifecycle: {

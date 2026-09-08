@@ -24,16 +24,17 @@ import type { Project } from '../domain/entities/project.entity.js';
 import type { CommandContext } from '../application/context.js';
 import { projectField, envField } from './schemas.js';
 import { commandSuccess, commandError, wrapCommandHandler, HvError } from '../application/results.js';
-import { connectionSetupDetails } from '../domain/services/connection-guidance.js';
 import {
   actionScopedBlocksAllowedDuringApply,
   actionScopedBlocksRequiringConnectBeforeApply,
+  connectionLocalEnvInputs,
   connectionProviders,
   connectionRecoveryDetails,
   connectionRecoveryHint,
   executePlanApply,
   splitActionScopedConnectionBlocks,
   syncProjectGitRemoteUrl,
+  type ConnectionBlock,
 } from '../application/apply-plan.js';
 import { cloudflareScopeHintsForDomain } from '../domain/services/domain-scope.js';
 import {
@@ -43,8 +44,19 @@ import {
   shouldPlanGitHubInfrastructure,
   unresolvedGitHubCheckRuntimeIssues,
 } from '../domain/services/github-infrastructure.service.js';
-import { detectGitRemoteUrl, parseGitHubRepoFromRemote } from '../lib/git-remote.js';
-import { findRepoRoot } from '../domain/spec/repo-spec-file.js';
+import { parseGitHubRepoFromRemote } from '../lib/git-remote.js';
+import {
+  findRepoRoot,
+  readRepoSpecFile,
+  repositoryMatchesProjectIdentity,
+  repositoryProjectIdentity,
+} from '../domain/spec/repo-spec-file.js';
+import {
+  ensureRepoLocalEnv,
+  specLocalEnvRequirements,
+  type LocalEnvRequirement,
+  type RepoEnvFileWrite,
+} from '../domain/spec/repo-env-file.js';
 import {
   analyzeRepositoryRuntime,
   reviewRepositoryRuntime,
@@ -246,10 +258,7 @@ function freshProjectCandidate(projectRef?: string): {
   const repoRoot = findRepoRoot();
   if (!repoRoot) return null;
   const requestedProject = projectRef?.trim();
-  const gitRemoteUrl = detectGitRemoteUrl() ?? undefined;
-  const githubRepo = parseGitHubRepoFromRemote(gitRemoteUrl);
-  const repositoryProject = githubRepo?.split('/').at(-1)
-    ?? repoRoot.split(/[\\/]/).filter(Boolean).at(-1);
+  const { gitRemoteUrl, projectName: repositoryProject } = repositoryProjectIdentity(repoRoot);
   if (
     requestedProject
     && repositoryProject
@@ -284,6 +293,76 @@ function commandEnvironment(spec: ProjectSpec, requested: string | undefined): s
   return Object.keys(spec.environments).length === 0
     ? githubCanonicalEnvironment(spec) ?? 'staging'
     : 'staging';
+}
+
+function mergeLocalEnvWrites(
+  ...writes: Array<RepoEnvFileWrite | undefined>
+): RepoEnvFileWrite | undefined {
+  const present = writes.filter((write): write is RepoEnvFileWrite => Boolean(write));
+  if (present.length === 0) return undefined;
+  return {
+    path: present[0].path,
+    addedKeys: [...new Set(present.flatMap((write) => write.addedKeys))].sort(),
+    commentedKeys: [...new Set(present.flatMap((write) => write.commentedKeys))].sort(),
+    ...(present.some((write) => (write.activatedKeys?.length ?? 0) > 0)
+      ? { activatedKeys: [...new Set(present.flatMap((write) => write.activatedKeys ?? []))].sort() }
+      : {}),
+    ...(present.some((write) => write.permissionsUpdated === true)
+      ? { permissionsUpdated: true }
+      : {}),
+    ...(present.find((write) => write.gitignorePath)?.gitignorePath
+      ? { gitignorePath: present.find((write) => write.gitignorePath)!.gitignorePath }
+      : {}),
+    ...(present.some((write) => write.gitignoreUpdated !== undefined)
+      ? { gitignoreUpdated: present.some((write) => write.gitignoreUpdated === true) }
+      : {}),
+  };
+}
+
+function ensureProjectLocalEnv(params: {
+  source?: { kind: 'repo'; path: string } | { kind: 'local' };
+  projectName?: string;
+  projectGitRemoteUrl?: string;
+  spec?: ProjectSpec;
+  connectionBlocks?: ConnectionBlock[];
+  /** Validate the repository secret-file boundary even before any slots are known. */
+  verifyRepoSafety?: boolean;
+}): RepoEnvFileWrite | undefined {
+  const candidateRoot = params.source?.kind === 'repo'
+    ? findRepoRoot(params.source.path)
+    : findRepoRoot();
+  const root = candidateRoot && (
+    params.source?.kind === 'repo'
+    || (
+      params.projectName
+      && repositoryMatchesProjectIdentity(
+        candidateRoot,
+        params.projectName,
+        params.projectGitRemoteUrl
+      )
+    )
+  )
+    ? candidateRoot
+    : null;
+  if (!root) return undefined;
+  if (params.source?.kind !== 'repo' && params.projectName) {
+    const checkoutSpec = readRepoSpecFile(root);
+    if (checkoutSpec && checkoutSpec.spec.project !== params.projectName) {
+      // Folder/remote matching is only a fallback for local-only projects. A
+      // conflicting committed spec owns this checkout, so never add the
+      // selected local project's credential slots to its dotenv files.
+      return undefined;
+    }
+  }
+  const requirements = [
+    ...(params.spec ? specLocalEnvRequirements(params.spec) : []),
+    ...connectionLocalEnvInputs(params.connectionBlocks ?? []).map((input): LocalEnvRequirement => ({
+      key: input.envKey,
+      comment: `${input.comment}; add the value locally, then reference this key with hv_connections.`,
+    })),
+  ];
+  if (requirements.length === 0 && !params.verifyRepoSafety) return undefined;
+  return ensureRepoLocalEnv(root, requirements);
 }
 
 function requiredConnectionChecklist(ctx: CommandContext, spec: ProjectSpec) {
@@ -373,6 +452,11 @@ function requiredConnectionChecklist(ctx: CommandContext, spec: ProjectSpec) {
       } else if (scopeHints.length === 0 && connections.length > 0) {
         status = 'unverified';
       }
+      const connectionBlock = {
+        provider: entry.provider,
+        reason: Array.from(entry.reasons).join(', '),
+        ...(scope ? { scope } : {}),
+      };
       return {
         provider: entry.provider,
         status,
@@ -380,19 +464,15 @@ function requiredConnectionChecklist(ctx: CommandContext, spec: ProjectSpec) {
         reasons: Array.from(entry.reasons).sort(),
         ...(scope ? { scope } : {}),
         ...(!verified ? {
-          connectionSetup: connectionSetupDetails(entry.provider, {
-            scope,
+          connectionSetup: connectionRecoveryDetails([connectionBlock], {
             project: spec.project,
-          }),
+            gitRemoteUrl: spec.gitRemoteUrl,
+          }).connectionSetup[0],
         } : {}),
         hint: verified
           ? undefined
           : connectionRecoveryHint(
-            [{
-              provider: entry.provider,
-              reason: Array.from(entry.reasons).join(', '),
-              ...(scope ? { scope } : {}),
-            }],
+            [connectionBlock],
             { after: 'Then run hv_plan.' }
           ),
       };
@@ -599,6 +679,16 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
       }
       project = syncProjectGitRemoteUrl(ctx, project, result.spec);
       const connections = requiredConnectionChecklist(ctx, result.spec);
+      const localEnv = mergeLocalEnvWrites(
+        result.localEnv,
+        ensureProjectLocalEnv({
+          source: result.source,
+          projectName: project.name,
+          projectGitRemoteUrl: project.gitRemoteUrl,
+          spec: result.spec,
+          connectionBlocks: connections.missing,
+        })
+      );
       const repositoryRuntime = analyzeRepositoryRuntime(repositoryRootForProject(project.name));
       const runtimeReview = reviewRepositoryRuntime(result.spec.runtime, repositoryRuntime);
       const checkRuntimeIssues = result.spec.github
@@ -620,6 +710,7 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
           revision: result.revision,
           specSource: result.source ?? { kind: 'local' },
           envTemplate: result.envTemplate ?? null,
+          localEnv: localEnv ?? null,
           spec: result.spec,
           repositoryRuntime,
           runtimeReview,
@@ -671,9 +762,24 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
           );
         }
       }
-      const currentSpec = specStore.get(project)?.spec;
+      const currentSpecResult = specStore.get(project);
+      const currentSpec = currentSpecResult?.spec;
       if (currentSpec) validateInstalledProviders(currentSpec);
-      const result = await planService.plan(project, currentSpec ? commandEnvironment(currentSpec, env) : env?.trim() || 'staging', {
+      const plannedEnvironment = currentSpec ? commandEnvironment(currentSpec, env) : env?.trim() || 'staging';
+      // Local dotenv preparation is part of the hv_plan contract. Establish
+      // its git-safety and filesystem boundary before PlanService persists an
+      // executable plan, so an unsafe tracked .env cannot leave an undisclosed
+      // authorization record behind.
+      const preparedLocalEnv = currentSpec
+        ? ensureProjectLocalEnv({
+          source: currentSpecResult?.source,
+          projectName: project.name,
+          projectGitRemoteUrl: project.gitRemoteUrl,
+          ...(scope === 'retained-cleanup' ? {} : { spec: currentSpec }),
+          verifyRepoSafety: true,
+        })
+        : undefined;
+      const result = await planService.plan(project, plannedEnvironment, {
         ...(scope ? { scope } : {}),
         ...(services?.length ? { serviceFilter: services } : {}),
         ...(envVars && Object.keys(envVars).length > 0 ? { envVarOverrides: envVars } : {}),
@@ -692,6 +798,38 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
       const { hardBlocked, actionScopedBlocked } = splitActionScopedConnectionBlocks(result.blocked, result.actions);
       const connectBeforeApply = actionScopedBlocksRequiringConnectBeforeApply(actionScopedBlocked);
       const softActionScopedBlocked = actionScopedBlocksAllowedDuringApply(actionScopedBlocked);
+      let localEnv: RepoEnvFileWrite | undefined;
+      try {
+        localEnv = mergeLocalEnvWrites(
+          preparedLocalEnv,
+          ensureProjectLocalEnv({
+            source: currentSpecResult?.source,
+            projectName: project.name,
+            projectGitRemoteUrl: project.gitRemoteUrl,
+            spec: currentSpec,
+            connectionBlocks: [...hardBlocked, ...actionScopedBlocked],
+          })
+        );
+      } catch (error) {
+        // The safety preflight above makes this a narrow race (for example,
+        // the checkout changed while provider observation was running). Keep
+        // the already-persisted authorization visible and explicitly unusable
+        // instead of returning an error that hides the plan id.
+        return commandError(
+          'INTERNAL',
+          `Plan "${result.planRunId}" was saved, but Hypervibe could not finish preparing the local .env file: ${error instanceof Error ? error.message : String(error)}`,
+          {
+            details: {
+              planId: result.planRunId,
+              environment: result.environmentName,
+              scope: result.scope,
+              persisted: true,
+            },
+            hint: 'Do not apply this plan. Fix the local .env tracking or filesystem problem, then rerun hv_plan to create a fresh disclosed plan.',
+            next: ['hv_plan'],
+          }
+        );
+      }
       const actionScopedWarnings = [
         ...connectBeforeApply.map((entry) =>
           `${entry.reason} Connect this provider before applying the plan.`
@@ -748,6 +886,7 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
             : {}),
           specRevision: result.specRevision,
           specSource: result.specSource ?? { kind: 'local' },
+          ...(localEnv ? { localEnv } : {}),
           verified: result.verified,
           summary: summarizeActions(result.actions),
           totalActionCount: result.actions.length,

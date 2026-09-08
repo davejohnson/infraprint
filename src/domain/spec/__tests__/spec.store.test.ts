@@ -1,9 +1,11 @@
-import { beforeEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
+import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import path from 'path';
 import { SqliteAdapter } from '../../../adapters/db/sqlite.adapter.js';
 import { ProjectRepository } from '../../../adapters/db/repositories/project.repository.js';
+import { ProjectSpecRepository } from '../../../adapters/db/repositories/spec.repository.js';
 import { SpecStore, desiredStateToSpec, deepMergeSpec } from '../spec.store.js';
 import { projectSpecSchema } from '../spec.schema.js';
 import { writeRepoSpecFile } from '../repo-spec-file.js';
@@ -14,6 +16,18 @@ function freshDb() {
   const dir = mkdtempSync(path.join(tmpdir(), 'hypervibe-spec-'));
   const adapter = SqliteAdapter.getInstance(path.join(dir, 'test.db'));
   adapter.migrate();
+}
+
+function initGitRepo(repoDir: string): void {
+  execFileSync('git', ['init', '--quiet'], { cwd: repoDir, stdio: 'ignore' });
+}
+
+function identifyGitRepo(repoDir: string, projectName: string): void {
+  execFileSync(
+    'git',
+    ['remote', 'add', 'origin', `git@github.com:hypervibe-tests/${projectName}.git`],
+    { cwd: repoDir, stdio: 'ignore' }
+  );
 }
 
 function makeProject(policies: Record<string, unknown> = {}): Project {
@@ -182,30 +196,71 @@ describe('SpecStore', () => {
     const oldCwd = process.cwd();
     const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
     const repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-repo-spec-')));
-    mkdirSync(path.join(repoDir, '.git'));
+    initGitRepo(repoDir);
 
     try {
       process.env.HYPERVIBE_DISABLE_REPO_SPEC = '0';
       process.chdir(repoDir);
       const project = makeProject();
+      identifyGitRepo(repoDir, project.name);
       const store = new SpecStore();
 
       const v1 = store.replace(project, {
         version: 1,
         project: project.name,
-        environments: { staging: { hosting: { provider: 'railway' }, services: { web: {} } } },
+        secrets: {
+          RECAPTCHA_V3_SITE_KEY: {
+            principal: 'github:dave',
+            environments: ['staging'],
+          },
+          RECAPTCHA_V3_SECRET_KEY: {
+            principal: 'github:dave',
+            environments: ['staging'],
+          },
+        },
+        environments: {
+          staging: {
+            hosting: { provider: 'railway' },
+            services: { web: {} },
+            envVars: { NODE_ENV: 'staging' },
+            envFile: { mode: 'explicit', include: ['SESSION_SECRET'] },
+          },
+        },
       });
 
       const specPath = path.join(repoDir, '.hypervibe', 'spec.json');
       const envTemplatePath = path.join(repoDir, '.env.example');
+      const localEnvPath = path.join(repoDir, '.env');
+      const expectedKeys = [
+        'RECAPTCHA_V3_SECRET_KEY',
+        'RECAPTCHA_V3_SITE_KEY',
+        'SESSION_SECRET',
+      ];
       expect(v1.source).toEqual({ kind: 'repo', path: specPath });
       expect(v1.envTemplate).toEqual({
         path: envTemplatePath,
-        addedKeys: ['RECAPTCHA_SITE_KEY', 'RECAPTCHA_SECRET_KEY'],
+        addedKeys: expectedKeys,
+        commentedKeys: [],
       });
+      expect(v1.localEnv).toEqual({
+        path: localEnvPath,
+        addedKeys: expectedKeys,
+        commentedKeys: [],
+        gitignorePath: path.join(repoDir, '.gitignore'),
+        gitignoreUpdated: true,
+      });
+      expect(readFileSync(path.join(repoDir, '.gitignore'), 'utf8')).toContain('/.env');
       expect(JSON.parse(readFileSync(specPath, 'utf8')).project).toBe(project.name);
-      expect(readFileSync(envTemplatePath, 'utf8')).toContain('RECAPTCHA_SITE_KEY=');
-      expect(readFileSync(envTemplatePath, 'utf8')).toContain('RECAPTCHA_SECRET_KEY=');
+      for (const envPath of [envTemplatePath, localEnvPath]) {
+        const content = readFileSync(envPath, 'utf8');
+        for (const key of expectedKeys) {
+          expect(content).toMatch(new RegExp(`# Hypervibe: [^\\n]+\\n${key}=`));
+        }
+        expect(content).not.toContain('RECAPTCHA_SITE_KEY=');
+        expect(content).not.toContain('RECAPTCHA_SECRET_KEY=');
+        expect(content).not.toContain('NODE_ENV=');
+        expect(content).not.toContain('staging-site');
+      }
 
       const edited = {
         ...v1.spec,
@@ -258,7 +313,7 @@ describe('SpecStore', () => {
     const oldCwd = process.cwd();
     const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
     const repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-cross-project-spec-')));
-    mkdirSync(path.join(repoDir, '.git'));
+    initGitRepo(repoDir);
 
     try {
       process.env.HYPERVIBE_DISABLE_REPO_SPEC = '0';
@@ -268,6 +323,7 @@ describe('SpecStore', () => {
         project: 'checkout-project',
         environments: {},
       });
+      identifyGitRepo(repoDir, checkoutSpec.project);
       const specPath = writeRepoSpecFile(checkoutSpec)!.path;
       const secondProject = new ProjectRepository().create({
         name: 'domain-conformance-project',
@@ -303,7 +359,7 @@ describe('SpecStore', () => {
     const oldCwd = process.cwd();
     const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
     const repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-corrupt-repo-spec-write-')));
-    mkdirSync(path.join(repoDir, '.git'));
+    initGitRepo(repoDir);
     mkdirSync(path.join(repoDir, '.hypervibe'));
     const specPath = path.join(repoDir, '.hypervibe', 'spec.json');
     const malformed = '{"apiToken":"must-not-be-overwritten",';
@@ -334,13 +390,223 @@ describe('SpecStore', () => {
     }
   });
 
-  it('preserves existing env template content and adds only missing reCAPTCHA slots', () => {
+  it('leaves the repo spec and revision journal unchanged when git tracks the local env file', () => {
+    const oldCwd = process.cwd();
+    const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+    const repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-tracked-env-spec-write-')));
+    initGitRepo(repoDir);
+
+    try {
+      process.env.HYPERVIBE_DISABLE_REPO_SPEC = '0';
+      process.chdir(repoDir);
+      const project = makeProject();
+      identifyGitRepo(repoDir, project.name);
+      const store = new SpecStore();
+      const initial = store.replace(project, {
+        version: 1,
+        project: project.name,
+        environments: {
+          production: {
+            hosting: { provider: 'railway' },
+            services: { web: {} },
+          },
+        },
+      });
+      const specPath = path.join(repoDir, '.hypervibe', 'spec.json');
+      const initialDocument = readFileSync(specPath, 'utf8');
+      writeFileSync(path.join(repoDir, '.env'), 'OWNER_SECRET=keep-me\n', 'utf8');
+      execFileSync('git', ['add', '--force', '--', '.env'], { cwd: repoDir, stdio: 'ignore' });
+
+      const replacement = projectSpecSchema.parse({
+        ...initial.spec,
+        environments: {
+          ...initial.spec.environments,
+          production: {
+            ...initial.spec.environments.production,
+            services: {
+              ...initial.spec.environments.production.services,
+              worker: { workloadKind: 'worker' },
+            },
+          },
+        },
+      });
+
+      expect(() => writeRepoSpecFile(replacement)).toThrow(/git already tracks \.env/);
+      expect(() => store.replace(project, replacement)).toThrow(/git already tracks \.env/);
+      expect(readFileSync(specPath, 'utf8')).toBe(initialDocument);
+      expect(store.getRevision(project.id, 1)).toEqual(initial.spec);
+      expect(store.getRevision(project.id, 2)).toBeNull();
+      const count = SqliteAdapter.getInstance().getDb()
+        .prepare('SELECT COUNT(*) AS count FROM project_specs WHERE project_id = ?')
+        .get(project.id) as { count: number };
+      expect(count.count).toBe(1);
+    } finally {
+      process.chdir(oldCwd);
+      if (oldDisable === undefined) delete process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+      else process.env.HYPERVIBE_DISABLE_REPO_SPEC = oldDisable;
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not publish a replacement spec or revision when the env template cannot be prepared', () => {
+    const oldCwd = process.cwd();
+    const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+    const repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-env-template-failure-')));
+    initGitRepo(repoDir);
+
+    try {
+      process.env.HYPERVIBE_DISABLE_REPO_SPEC = '0';
+      process.chdir(repoDir);
+      const project = makeProject();
+      identifyGitRepo(repoDir, project.name);
+      const store = new SpecStore();
+      const initial = store.replace(project, {
+        version: 1,
+        project: project.name,
+        environments: {
+          production: {
+            hosting: { provider: 'railway' },
+            services: { web: {} },
+          },
+        },
+      });
+      const specPath = path.join(repoDir, '.hypervibe', 'spec.json');
+      const initialDocument = readFileSync(specPath, 'utf8');
+      mkdirSync(path.join(repoDir, '.env.example'));
+      const replacement = projectSpecSchema.parse({
+        ...initial.spec,
+        secrets: {
+          BROKEN_WRITE_SECRET: {
+            principal: 'github:owner',
+            environments: ['production'],
+          },
+        },
+      });
+
+      expect(() => store.replace(project, replacement)).toThrow(/\.env\.example.*not a regular file/);
+      expect(readFileSync(specPath, 'utf8')).toBe(initialDocument);
+      expect(store.getRevision(project.id, 1)).toEqual(initial.spec);
+      expect(store.getRevision(project.id, 2)).toBeNull();
+      // A failed template write may leave only the safe, value-free local
+      // placeholder prepared before it; desired state itself stays unchanged.
+      expect(readFileSync(path.join(repoDir, '.env'), 'utf8'))
+        .toMatch(/# Hypervibe: [^\n]+\nBROKEN_WRITE_SECRET=\n/);
+    } finally {
+      process.chdir(oldCwd);
+      if (oldDisable === undefined) delete process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+      else process.env.HYPERVIBE_DISABLE_REPO_SPEC = oldDisable;
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not publish a legacy conversion or revision when the local env file cannot be prepared', () => {
+    const oldCwd = process.cwd();
+    const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+    const repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-legacy-env-failure-')));
+    initGitRepo(repoDir);
+    mkdirSync(path.join(repoDir, '.env'));
+
+    try {
+      process.env.HYPERVIBE_DISABLE_REPO_SPEC = '0';
+      process.chdir(repoDir);
+      const project = makeProject({
+        desiredState: { environmentName: 'staging', services: ['api'] },
+      });
+      identifyGitRepo(repoDir, project.name);
+      const store = new SpecStore();
+
+      expect(() => store.get(project)).toThrow(/\.env.*not a regular file/);
+      expect(existsSync(path.join(repoDir, '.hypervibe', 'spec.json'))).toBe(false);
+      expect(store.getRevision(project.id, 1)).toBeNull();
+      const count = SqliteAdapter.getInstance().getDb()
+        .prepare('SELECT COUNT(*) AS count FROM project_specs WHERE project_id = ?')
+        .get(project.id) as { count: number };
+      expect(count.count).toBe(0);
+    } finally {
+      process.chdir(oldCwd);
+      if (oldDisable === undefined) delete process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+      else process.env.HYPERVIBE_DISABLE_REPO_SPEC = oldDisable;
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers from a journal append failure by adopting the authoritative repo spec on the next read', () => {
+    const oldCwd = process.cwd();
+    const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+    const repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-spec-journal-failure-')));
+    initGitRepo(repoDir);
+    let insertSpy: ReturnType<typeof vi.spyOn> | undefined;
+
+    try {
+      process.env.HYPERVIBE_DISABLE_REPO_SPEC = '0';
+      process.chdir(repoDir);
+      const project = makeProject();
+      identifyGitRepo(repoDir, project.name);
+      const store = new SpecStore();
+      const initial = store.replace(project, {
+        version: 1,
+        project: project.name,
+        environments: {
+          production: {
+            hosting: { provider: 'railway' },
+            services: { web: {} },
+          },
+        },
+      });
+      const replacement = projectSpecSchema.parse({
+        ...initial.spec,
+        environments: {
+          production: {
+            ...initial.spec.environments.production,
+            services: {
+              ...initial.spec.environments.production.services,
+              worker: { workloadKind: 'worker' },
+            },
+          },
+        },
+      });
+      insertSpy = vi.spyOn(ProjectSpecRepository.prototype, 'insert')
+        .mockImplementationOnce(() => {
+          throw new Error('injected journal append failure');
+        });
+
+      expect(() => store.replace(project, replacement)).toThrow('injected journal append failure');
+      expect(JSON.parse(readFileSync(path.join(repoDir, '.hypervibe', 'spec.json'), 'utf8')))
+        .toEqual(replacement);
+      expect(store.getRevision(project.id, 2)).toBeNull();
+
+      insertSpy.mockRestore();
+      insertSpy = undefined;
+      const recovered = store.get(project)!;
+      expect(recovered).toMatchObject({
+        revision: 2,
+        spec: replacement,
+        adopted: true,
+        source: { kind: 'repo' },
+      });
+      expect(store.getRevision(project.id, 2)).toEqual(replacement);
+    } finally {
+      insertSpy?.mockRestore();
+      process.chdir(oldCwd);
+      if (oldDisable === undefined) delete process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+      else process.env.HYPERVIBE_DISABLE_REPO_SPEC = oldDisable;
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves existing local env values and adds comments and missing spec inputs idempotently', () => {
     const oldCwd = process.cwd();
     const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
     const repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-env-template-')));
-    mkdirSync(path.join(repoDir, '.git'));
-    const envTemplatePath = path.join(repoDir, '.env.example');
-    writeFileSync(envTemplatePath, 'CUSTOM_RUNTIME_KEY=\n# RECAPTCHA_SITE_KEY=\n', 'utf8');
+    initGitRepo(repoDir);
+    const localEnvPath = path.join(repoDir, '.env');
+    const gitignorePath = path.join(repoDir, '.gitignore');
+    writeFileSync(gitignorePath, 'dist/\n!/.env\n', 'utf8');
+    writeFileSync(
+      localEnvPath,
+      '# Owner-maintained setting\nCUSTOM_RUNTIME_KEY=keep-me\nRECAPTCHA_V3_SITE_KEY=existing-site-value\n',
+      'utf8'
+    );
 
     try {
       process.env.HYPERVIBE_DISABLE_REPO_SPEC = '0';
@@ -348,22 +614,48 @@ describe('SpecStore', () => {
       const spec = projectSpecSchema.parse({
         version: 1,
         project: 'env-template-app',
-        environments: {},
+        secrets: {
+          RECAPTCHA_V3_SITE_KEY: {
+            principal: 'github:dave',
+            environments: ['production'],
+          },
+          RECAPTCHA_V3_SECRET_KEY: {
+            principal: 'github:dave',
+            environments: ['production'],
+          },
+        },
+        environments: {
+          production: {
+            hosting: { provider: 'railway' },
+            services: { web: {} },
+          },
+        },
       });
+      identifyGitRepo(repoDir, spec.project);
       const first = writeRepoSpecFile(spec)!;
-      const afterFirst = readFileSync(envTemplatePath, 'utf8');
+      const afterFirst = readFileSync(localEnvPath, 'utf8');
 
-      expect(first.envTemplate).toEqual({
-        path: envTemplatePath,
-        addedKeys: ['RECAPTCHA_SECRET_KEY'],
+      expect(first.localEnv).toEqual({
+        path: localEnvPath,
+        addedKeys: ['RECAPTCHA_V3_SECRET_KEY'],
+        commentedKeys: ['RECAPTCHA_V3_SITE_KEY'],
+        permissionsUpdated: true,
+        gitignorePath,
+        gitignoreUpdated: true,
       });
-      expect(afterFirst).toContain('CUSTOM_RUNTIME_KEY=');
-      expect(afterFirst.match(/RECAPTCHA_SITE_KEY=/g)).toHaveLength(1);
-      expect(afterFirst).toContain('RECAPTCHA_SECRET_KEY=');
+      expect(afterFirst).toContain('# Owner-maintained setting\nCUSTOM_RUNTIME_KEY=keep-me');
+      expect(afterFirst).toContain('RECAPTCHA_V3_SITE_KEY=existing-site-value');
+      expect(afterFirst).toMatch(/# Hypervibe: [^\n]+\nRECAPTCHA_V3_SITE_KEY=existing-site-value/);
+      expect(afterFirst).toMatch(/# Hypervibe: [^\n]+\nRECAPTCHA_V3_SECRET_KEY=/);
+      expect(afterFirst.match(/RECAPTCHA_V3_SITE_KEY=/g)).toHaveLength(1);
 
       const second = writeRepoSpecFile(spec)!;
+      expect(second.localEnv.addedKeys).toEqual([]);
+      expect(second.localEnv.commentedKeys).toEqual([]);
+      expect(second.localEnv.gitignoreUpdated).toBe(false);
       expect(second.envTemplate.addedKeys).toEqual([]);
-      expect(readFileSync(envTemplatePath, 'utf8')).toBe(afterFirst);
+      expect(readFileSync(localEnvPath, 'utf8')).toBe(afterFirst);
+      expect(readFileSync(gitignorePath, 'utf8').match(/^\/\.env$/gm)).toHaveLength(1);
     } finally {
       process.chdir(oldCwd);
       if (oldDisable === undefined) {

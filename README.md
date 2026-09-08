@@ -591,9 +591,9 @@ If a machine or local Hypervibe database is lost, recloning the committed `.hype
 
 ### Deploy env from `.env`
 
-When `.env.<environment>` or repo `.env` exists, `hv_plan` considers it as a local deploy input. Environment-specific files such as `.env.production` and `.env.staging` win over `.env`. Hypervibe does **not** blindly publish every key. The default policy is `envFile.mode: "runtime"`: Hypervibe syncs high-confidence app runtime keys such as `SENDGRID_API_KEY`, `SESSION_SECRET`, `*_URL`, `*_TOKEN`, `*_SECRET`, `APP_*`, `VITE_*`, and similar names; it skips provider/control-plane credentials such as `RAILWAY_API_TOKEN`, `GITHUB_TOKEN`, and `CLOUDFLARE_API_TOKEN`; it skips local-looking runtime values such as `localhost`, `127.0.0.1`, `0.0.0.0`, `host.docker.internal`, `.local`, and `.internal`; and it reports ignored key names in the plan.
+When `.env.<environment>` or repo `.env` exists, `hv_plan` considers it as a local deploy input. Environment-specific files such as `.env.production` and `.env.staging` win over `.env`. Hypervibe does **not** blindly publish every key. The default policy is `envFile.mode: "runtime"`: Hypervibe syncs high-confidence app runtime keys such as `SENDGRID_API_KEY`, `SESSION_SECRET`, `*_URL`, `*_TOKEN`, `*_SECRET`, `APP_*`, `VITE_*`, and similar names; it treats blank assignments as missing; it skips provider/control-plane credentials such as `HYPERVIBE_*`, `RAILWAY_API_TOKEN`, `GITHUB_TOKEN`, and `CLOUDFLARE_API_TOKEN`; it skips local-looking runtime values such as `localhost`, `127.0.0.1`, `0.0.0.0`, `host.docker.internal`, `.local`, and `.internal`; and it reports affected key names in the plan.
 
-Every repo-backed spec write also creates or non-destructively extends `.env.example` with `RECAPTCHA_SITE_KEY=` and `RECAPTCHA_SECRET_KEY=`. Hypervibe does not connect to reCAPTCHA or validate/store those values. Put the real environment-specific values in `.env.staging`, `.env.production`, or another selected env file; `hv_plan` encrypts them into the persisted plan and `hv_apply` performs the hosting sync. The site key is public, while the secret key must remain server-side.
+When a spec is written from its matching checkout, Hypervibe non-destructively prepares both `.env` and `.env.example` with the exact delegated-secret and `envFile.include` names declared by that project—for example, `RECAPTCHA_V3_SITE_KEY=` and `RECAPTCHA_V3_SECRET_KEY=`. Every slot gets a short comment; existing values, owner comments, and ordering are preserved, while stale Hypervibe-owned comments are refreshed. The tracked `.env.example` stays value-free and points people to the private file. Actual missing connections add only their provider-declared local inputs, such as `HYPERVIBE_RAILWAY_TOKEN`, rather than every credential Hypervibe supports. Hypervibe first proves each exact private path is a regular, untracked, repository-ignored file (adding root rules such as `/.env` or `/.env.production`, plus `!/.env.example` only when needed), refuses symlinks and tracked secret files, creates new private env files with mode `0600`, and removes group/world access from an existing private file without adding owner permissions. The receipt reports when permissions changed.
 
 Tune this per environment in `.hypervibe/spec.json`:
 
@@ -1173,68 +1173,32 @@ GitHub Pages with custom-domain DNS, exact token permissions, and the
 infrastructure PR flow—see
 [GitHub infrastructure for beginners](docs/github-infrastructure.md).
 
-Recommended for a one-token setup: create a classic PAT with `repo`,
-`workflow`, and `read:packages` from the
-[pre-filled combined-token link](https://github.com/settings/tokens/new?scopes=repo,workflow,read:packages&description=Hypervibe%20CI%20deploys),
-then export it under npm's required variable name:
-
-```bash
-export NODE_AUTH_TOKEN=ghp_...
-```
-
-Then call `hv_connections provider=github credentialsRef="env:NODE_AUTH_TOKEN"`.
-For existing `.env` files, use
-`credentialsRef="dotenv:/absolute/path/.env#NODE_AUTH_TOKEN"`. For JSON
-credentials, save the JSON to a local file and use
-`credentialsRef="file:/absolute/path/to/credentials.json"`. If the user
-intentionally wants to enter credentials in chat, `credentials={...}` is still
-accepted.
-
-For GitHub connections, `NODE_AUTH_TOKEN`, `HYPERVIBE_GITHUB_TOKEN`, and
-`HYPERVIBE_GITHUB_PACKAGES_TOKEN` are aliases. An explicitly referenced
-variable wins. If that variable is absent, Hypervibe accepts one distinct value
-from either alias; if different fallback values exist, it blocks instead of
-guessing. Prefer `NODE_AUTH_TOKEN` for the combined token because npm itself
-does not know Hypervibe's aliases.
-
-**Recommended for CI deploys: a classic PAT with `repo`, `workflow`, and `read:packages`**, created by a user with access to the target repositories. Create it from:
-
-```text
-https://github.com/settings/tokens/new?scopes=repo,workflow,read:packages&description=Hypervibe%20CI%20deploys
-```
-
-That one token can be used for both:
-
-- `apiToken`: GitHub API work such as writing `.github/workflows/*`, reading Actions runs/jobs/logs, triggering workflows, and creating repository secrets.
-- `packageReadToken`: durable GHCR image-pull credentials for Railway image deploys.
-
-For an existing `.env` file with one token:
-
-```text
-NODE_AUTH_TOKEN=ghp_...
-```
-
-Connect it like this:
-
-```text
-hv_connections provider=github scope="owner/repo" credentialsRef="dotenv:/absolute/path/.env#NODE_AUTH_TOKEN"
-```
-
-For split credentials, create the repository-management token from the
+Hypervibe prepares one clear local slot per credential role. Create the
+repository-management token from the
 [pre-filled fine-grained link](https://github.com/settings/personal-access-tokens/new?name=Hypervibe%20repository&description=Manage%20one%20repository%20with%20Hypervibe&expires_in=90&actions=write&administration=write&contents=write&environments=write&issues=write&pull_requests=write&secrets=write&actions_variables=write&workflows=write) (or the
 [pre-filled classic API link](https://github.com/settings/tokens/new?scopes=repo,workflow&description=Hypervibe%20GitHub%20API)), and create the classic package token
 from the [pre-filled `read:packages` link](https://github.com/settings/tokens/new?scopes=read:packages&description=Hypervibe%20GHCR%20pull):
 
 ```text
-HYPERVIBE_GITHUB_TOKEN=github_pat_...      # fine-grained repository permissions above
-HYPERVIBE_GITHUB_PACKAGES_TOKEN=ghp_...    # scopes: read:packages
+HYPERVIBE_GITHUB_TOKEN=github_pat_...  # fine-grained repository permissions above
+NODE_AUTH_TOKEN=ghp_...                # scopes: read:packages; npm also reads this name
 ```
 
 Then connect:
 
 ```text
-hv_connections provider=github scope="owner/repo" credentialsRef="dotenv:/absolute/path/.env" credentialsMap={"apiToken":"HYPERVIBE_GITHUB_TOKEN","packageReadToken":"HYPERVIBE_GITHUB_PACKAGES_TOKEN"}
+hv_connections provider=github scope="owner/repo" credentialsRef="dotenv:/absolute/path/.env" credentialsMap={"apiToken":"HYPERVIBE_GITHUB_TOKEN","packageReadToken":"NODE_AUTH_TOKEN"}
 ```
+
+If one classic PAT intentionally has `repo`, `workflow`, and `read:packages`,
+the same value may fill both roles. Hypervibe keeps the slots separate so a
+package-read credential does not silently become a repository-writing token.
+`HYPERVIBE_GITHUB_PACKAGES_TOKEN` remains accepted when explicitly referenced
+for compatibility, but Hypervibe does not generate it as a third field. Exact
+references win; ambiguous fallback alias values block instead of being guessed.
+For JSON credentials, use `credentialsRef="file:/absolute/path/to/credentials.json"`.
+Raw `credentials={...}` remains available only when the user intentionally
+chooses to enter a credential in chat.
 
 A token with only `read:packages` is **not** enough for Hypervibe CI deploy setup. It can be used as `packageReadToken`, but the `apiToken` still needs `repo` + `workflow` for classic PATs so Hypervibe can manage workflows and repository secrets.
 

@@ -1221,6 +1221,18 @@ providerRegistry.register({
         'HYPERVIBE_GITHUB_TOKEN',
         'HYPERVIBE_GITHUB_PACKAGES_TOKEN',
       ]],
+      localEnvInputs: [
+        {
+          envKey: 'HYPERVIBE_GITHUB_TOKEN',
+          credentialKeys: ['apiToken'],
+          comment: 'GitHub API token for repository and workflow management; use repo and workflow permissions',
+        },
+        {
+          envKey: 'NODE_AUTH_TOKEN',
+          credentialKeys: ['packageReadToken'],
+          comment: 'GitHub Packages read token for dependency and image access; npm reads this canonical name',
+        },
+      ],
     },
   },
   factory: (credentials) => {

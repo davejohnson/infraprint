@@ -536,14 +536,16 @@ or rotation, the operator reruns that destination `hv_connections` call. This
 read-only local credential-source exception does not weaken the provider-CLI
 prohibition for infrastructure operations.
 
-Provider-declared environment-variable aliases may simplify local credential
-references without duplicating secret values. Exact requested names win. When
-an exact name is absent, all populated aliases must contain one distinct value
-or resolution blocks without returning any value. GitHub declares
-`NODE_AUTH_TOKEN`, `HYPERVIBE_GITHUB_TOKEN`, and
-`HYPERVIBE_GITHUB_PACKAGES_TOKEN` as one alias group; `NODE_AUTH_TOKEN` is the
-recommended combined-token name because npm must resolve it before Hypervibe
-starts.
+Provider-declared environment-variable aliases may simplify explicit local
+credential references without duplicating secret values. Exact requested names
+win. When an exact name is absent, all populated aliases must contain one
+distinct value or resolution blocks without returning any value. Generated
+placeholders are stricter: each credential role has one canonical slot, and
+compatibility aliases never become extra fields. GitHub uses
+`HYPERVIBE_GITHUB_TOKEN` for repository/workflow API access and
+`NODE_AUTH_TOKEN` for package reads because npm consumes that name;
+`HYPERVIBE_GITHUB_PACKAGES_TOKEN` remains accepted only as a compatibility
+alias when explicitly referenced.
 
 Connection guidance is part of the product contract, not incidental copy. Every provider or secret-manager connection should have a `ConnectionGuidance` entry in `src/domain/services/connection-guidance.ts`, and token/permission errors should route through `formatConnectionGuidance(...)` whenever possible.
 
@@ -614,19 +616,39 @@ In the no-service model, `principal` is declarative attribution, not authenticat
 
 Local `.env` files are deploy input candidates, not a raw publish list. Prefer `.env.<environment>` over `.env` when present. When an environment deploy/plan uses the default repo convention and `.env` exists but `.env.<environment>` does not, Hypervibe creates `.env.<environment>` from `.env` before loading deploy vars. When both files exist, Hypervibe may copy newly added base `.env` keys into `.env.<environment>`, but it must preserve environment-specific values instead of overwriting them.
 
-Repo-backed spec writes create or non-destructively extend `.env.example` with
-the value-free product convention `RECAPTCHA_SITE_KEY=` and
-`RECAPTCHA_SECRET_KEY=`. The template is never a deploy input. Hypervibe does
-not own a reCAPTCHA provider connection; actual per-environment values remain
-ordinary `.env.<environment>` inputs and reach hosting only through a persisted
-plan and apply.
+Spec writes in the matching checkout use one shared, non-destructive updater for
+the private `.env` and value-free `.env.example`. It derives exact project input
+names from delegated `secrets` and `envFile.include`, so names such as
+`RECAPTCHA_V3_SITE_KEY` and `RECAPTCHA_V3_SECRET_KEY` come from the spec rather
+than a hard-coded product list. It never copies values or turns ordinary
+`envVars`, generated database/queue/storage outputs, or every possible provider
+credential into local inputs. Each managed assignment has an immediately
+preceding purpose comment; missing assignments are empty, existing values and
+ordering are preserved, and an empty commented placeholder may be activated in
+the private `.env` without activating a commented example value.
+
+`hv_spec` and `hv_plan` also add value-free connection inputs only for providers
+that are actually blocked. Provider-owned registry metadata maps each dotenv
+name to an exact credential role, so GitHub API, GitHub package-read, and Railway
+tokens remain distinct and aliases are not modeled as separate requirements.
+Before any repo-backed write, Hypervibe proves the checkout belongs to the
+selected project from its committed spec or normalized repository identity.
+It then refuses each tracked or non-regular private env path, proves an exact
+repository ignore rule (or appends one for `.env` and the selected
+`.env.<environment>`), and creates secret-bearing files with mode `0600` while
+removing group/world access from existing default files. It adds an
+`.env.example` exception only after proving every existing assignment there is
+empty. Spec mutations prepare these derived files first, atomically replace the
+repo spec, and append its revision journal last; a journal-only failure is
+recovered by adopting the authoritative repo file on the next read.
 
 Keep env-file handling policy-driven through the environment spec (`envFile.mode`, `include`, `exclude`):
 
 - default to high-confidence runtime keys,
-- skip provider/control-plane credentials,
+- treat blank selected assignments as missing rather than deployable values,
+- skip provider/control-plane credentials, including all `HYPERVIBE_*` connection inputs, when creating or syncing `.env.<environment>`,
 - skip local-looking values such as `localhost`, `127.0.0.1`, `0.0.0.0`, `host.docker.internal`, `.local`, and `.internal`,
-- warn with key names for ignored, excluded, or skipped keys,
+- warn with key names for missing, ignored, excluded, or skipped keys,
 - surface the env file path in plan previews,
 - never let stale local values override Hypervibe-managed infrastructure env vars such as database or queue URLs.
 

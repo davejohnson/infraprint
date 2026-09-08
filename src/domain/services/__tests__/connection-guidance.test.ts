@@ -162,16 +162,30 @@ describe('connection guidance', () => {
       scope: 'davejohnson/livetrainer',
     });
 
-    expect(setup.recommendedSetupUrl).toBe(GITHUB_TOKEN_URLS.combined);
+    expect(setup.recommendedSetupUrl).toBe(GITHUB_TOKEN_URLS.api);
     expect(setup.setupUrls).toEqual(expect.arrayContaining([
       `Create recommended combined classic token: ${GITHUB_TOKEN_URLS.combined}`,
+      `Create pre-filled classic API token: ${GITHUB_TOKEN_URLS.api}`,
       `Create pre-filled fine-grained repository token: ${GITHUB_TOKEN_URLS.fineGrained}`,
       `Create optional classic GHCR package token: ${GITHUB_TOKEN_URLS.packageRead}`,
     ]));
     expect(setup.credentialExample).toBe(
-      'hv_connections project="livetrainer" provider="github" scope="davejohnson/livetrainer" credentialsRef="dotenv:/absolute/path/.env#NODE_AUTH_TOKEN"'
+      'hv_connections project="livetrainer" provider="github" scope="davejohnson/livetrainer" credentialsRef="dotenv:/absolute/path/.env#HYPERVIBE_GITHUB_TOKEN"'
     );
-    expect(setup.notes).toContainEqual(expect.stringContaining('Save the PAT as NODE_AUTH_TOKEN'));
+    expect(setup.notes).toContainEqual(expect.stringContaining('HYPERVIBE_GITHUB_TOKEN'));
+  });
+
+  it('keeps GitHub API and package-read credentials separate when both roles are required', () => {
+    const setup = connectionSetupDetails('github', {
+      project: 'livetrainer',
+      scope: 'davejohnson/livetrainer',
+      requiredCredentialKeys: ['apiToken', 'packageReadToken'],
+    });
+
+    expect(setup.recommendedSetupUrl).toBe(GITHUB_TOKEN_URLS.combined);
+    expect(setup.credentialExample).toBe(
+      'hv_connections project="livetrainer" provider="github" scope="davejohnson/livetrainer" credentialsRef="dotenv:/absolute/path/.env" credentialsMap={"apiToken":"HYPERVIBE_GITHUB_TOKEN","packageReadToken":"NODE_AUTH_TOKEN"}'
+    );
   });
 
   it('keeps every GitHub PAT creation link pre-filled for its role', () => {

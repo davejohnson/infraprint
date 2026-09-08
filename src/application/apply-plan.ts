@@ -66,6 +66,7 @@ import {
   DOMAIN_DETACH_OPERATION,
 } from '../domain/services/domain-attach-policy.js';
 import {
+  credentialFieldsFromSchema,
   connectionSetupDetails,
   GITHUB_TOKEN_URLS,
 } from '../domain/services/connection-guidance.js';
@@ -295,13 +296,15 @@ export type ConnectionBlock = {
   scope?: string;
   policy?: 'hard' | 'action-scoped-if-independent-actions';
   actionIds?: string[];
+  /** Exact provider credential roles required by this block. */
+  requiredCredentialKeys?: string[];
 };
 
 function uniqueConnectionBlocks(blocks: ConnectionBlock[]): ConnectionBlock[] {
   const seen = new Set<string>();
   const output: ConnectionBlock[] = [];
   for (const block of blocks) {
-    const key = `${block.provider}:${block.scope ?? ''}:${block.reason ?? ''}`;
+    const key = `${block.provider}:${block.scope ?? ''}:${block.reason ?? ''}:${[...(block.requiredCredentialKeys ?? [])].sort().join(',')}`;
     if (seen.has(key)) {
       continue;
     }
@@ -315,13 +318,62 @@ export function connectionProviders(blocks: ConnectionBlock[]): string[] {
   return Array.from(new Set(blocks.map((block) => block.provider))).sort();
 }
 
+export interface ConnectionLocalEnvInput {
+  envKey: string;
+  credentialKeys: string[];
+  comment: string;
+}
+
+function requiredCredentialKeys(block: ConnectionBlock): string[] {
+  if (block.requiredCredentialKeys) return block.requiredCredentialKeys;
+  const metadata = providerRegistry.getMetadata(block.provider);
+  return metadata
+    ? credentialFieldsFromSchema(metadata.credentialsSchema)
+      ?.filter((field) => field.required)
+      .map((field) => field.name) ?? []
+    : [];
+}
+
+/** Select only dotenv inputs relevant to the exact missing credential roles. */
+export function connectionLocalEnvInputs(
+  blocks: ConnectionBlock[]
+): ConnectionLocalEnvInput[] {
+  const byKey = new Map<string, ConnectionLocalEnvInput>();
+  for (const block of uniqueConnectionBlocks(blocks)) {
+    const required = new Set(requiredCredentialKeys(block));
+    if (required.size === 0) continue;
+    for (const provider of providerRegistry.connectionProviders(block.provider)) {
+      for (const input of providerRegistry.getMetadata(provider)?.credentials?.localEnvInputs ?? []) {
+        if (!input.credentialKeys.some((key) => required.has(key))) continue;
+        if (!byKey.has(input.envKey)) {
+          byKey.set(input.envKey, {
+            envKey: input.envKey,
+            credentialKeys: [...input.credentialKeys],
+            comment: input.comment,
+          });
+        }
+      }
+    }
+  }
+  return [...byKey.values()].sort((left, right) => left.envKey.localeCompare(right.envKey));
+}
+
 function providerConnectionSetup(
   block: ConnectionBlock,
   options: { project?: string; gitRemoteUrl?: string } = {}
 ) {
   const scope = block.scope
     ?? (block.provider === 'github' ? parseGitHubRepoFromRemote(options.gitRemoteUrl) ?? undefined : undefined);
-  return connectionSetupDetails(block.provider, { scope, project: options.project });
+  const details = connectionSetupDetails(block.provider, {
+    scope,
+    project: options.project,
+    requiredCredentialKeys: requiredCredentialKeys(block),
+  });
+  const localEnvInputs = connectionLocalEnvInputs([block]);
+  return {
+    ...details,
+    ...(localEnvInputs.length > 0 ? { localEnvInputs } : {}),
+  };
 }
 
 export function connectionRecoveryHint(
@@ -337,7 +389,7 @@ export function connectionRecoveryHint(
     .join('; ');
   const commands = setup.map((entry) => entry.credentialExample).join('; ');
   const packageReadNeeded = options.includePackageRead
-    || uniqueBlocks.some((block) => /packageReadToken|IMAGE_REGISTRY_|GHCR|GitHub Actions/i.test(block.reason ?? ''));
+    || uniqueBlocks.some((block) => requiredCredentialKeys(block).includes('packageReadToken'));
   const packageReadHint = packageReadNeeded
     ? ' For GitHub Actions image deploys, the recommended combined classic PAT link preselects repo, workflow, and read:packages. A read:packages-only token cannot manage repository workflows.'
     : '';
@@ -349,7 +401,7 @@ export function connectionRecoveryDetails(
   blocks: ConnectionBlock[],
   options: { project?: string; gitRemoteUrl?: string } = {}
 ): {
-  connectionSetup: ReturnType<typeof connectionSetupDetails>[];
+  connectionSetup: ReturnType<typeof providerConnectionSetup>[];
 } {
   return {
     connectionSetup: uniqueConnectionBlocks(blocks)
@@ -442,6 +494,9 @@ export function splitActionScopedConnectionBlocks(
     const hasImageRegistrySecret = missing.some((name) => name.startsWith('IMAGE_REGISTRY_'));
     return [{
       provider: hasImageRegistrySecret ? 'github' : String(action.metadata?.provider ?? action.resource.provider),
+      ...(hasImageRegistrySecret
+        ? { requiredCredentialKeys: ['apiToken', 'packageReadToken'] }
+        : {}),
       reason: hasImageRegistrySecret
         ? `GitHub Actions deploy ${action.resource.name} is missing GHCR image pull credentials (${missing.join(', ')}). Connect GitHub with apiToken for repo/workflow API access plus packageReadToken for read:packages (create: ${GITHUB_TOKEN_URLS.packageRead}) before relying on push-to-deploy.`
         : `GitHub Actions deploy ${action.resource.name} is missing provider secrets (${missing.join(', ')}). Connect and verify ${String(action.metadata?.provider ?? action.resource.provider)} before relying on push-to-deploy.`,
