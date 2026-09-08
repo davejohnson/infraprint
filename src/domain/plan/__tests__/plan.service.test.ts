@@ -6,6 +6,7 @@ import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { SqliteAdapter } from '../../../adapters/db/sqlite.adapter.js';
 import '../../../adapters/providers/railway/railway.adapter.js';
+import { createRailwayDatabaseAdapter } from '../../../adapters/providers/railway/railway-database.factory.js';
 import '../../../adapters/providers/gcp/cloudrun.adapter.js';
 import '../../../adapters/providers/aws/s3.adapter.js';
 import '../../../adapters/providers/azure/azure-container-apps.adapter.js';
@@ -950,7 +951,7 @@ describe('PlanService.plan', () => {
     });
   });
 
-  it('uses a derived datastore observer when same-provider hosting marks that resource class unknown', async () => {
+  it('uses a derived datastore observer when same-provider hosting service observation is incomplete', async () => {
     new SpecStore().replace(project, {
       version: 1,
       project: project.name,
@@ -977,6 +978,7 @@ describe('PlanService.plan', () => {
       externalId: 'database-1',
       bindings: {
         provider: 'railway',
+        projectId: 'tea-owner-1',
         instanceId: 'database-1',
       },
     });
@@ -1014,13 +1016,19 @@ describe('PlanService.plan', () => {
           projectExists: true,
           projectId: 'tea-owner-1',
           services: [],
-          databases: [],
+          databases: [{
+            provider: 'railway',
+            engine: 'postgres',
+            externalId: 'database-extra',
+            name: 'unmanaged-postgres',
+            status: 'running',
+          }],
           caches: [],
           completeness: {
             project: 'complete',
             environment: 'complete',
-            services: 'complete',
-            databases: 'unknown',
+            services: 'unknown',
+            databases: 'complete',
             caches: 'unknown',
             storage: 'complete',
           },
@@ -1069,6 +1077,105 @@ describe('PlanService.plan', () => {
     expect(plan.actions.find((action) => action.id === 'database:railway'))
       .toMatchObject({ type: 'noop', verified: true });
     expect(observeDatabase).toHaveBeenCalledOnce();
+    expect(plan.unmanaged).toContainEqual(expect.objectContaining({
+      kind: 'database',
+      detail: expect.stringContaining('database-extra'),
+    }));
+  });
+
+  it('reconciles a bound Railway database when hosting reports its provider service as a workload', async () => {
+    const databaseId = '6b5f-railway-postgres-service';
+    const seedCommand = 'npm run db:seed';
+    new SpecStore().replace(project, {
+      version: 1,
+      project: project.name,
+      environments: {
+        staging: {
+          hosting: { provider: 'railway' },
+          services: {},
+          database: { provider: 'railway', engine: 'postgres', seedCommand },
+        },
+      },
+    });
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'staging',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'rail-project-1',
+        environmentId: 'rail-environment-1',
+        services: {},
+      },
+    });
+    new ComponentRepository().create({
+      environmentId: environment.id,
+      type: 'postgres',
+      externalId: databaseId,
+      bindings: {
+        provider: 'railway',
+        projectId: 'rail-project-1',
+        environmentId: 'rail-environment-1',
+        serviceId: databaseId,
+        resourceKind: 'service',
+        pluginName: 'Postgres',
+        seed: {
+          commandHash: sha256(seedCommand),
+          seededAt: '2026-09-07T12:00:00.000Z',
+        },
+      },
+    });
+    const observedState: ObservedState = {
+      provider: 'railway',
+      observedAt: new Date().toISOString(),
+      projectExists: true,
+      projectId: 'rail-project-1',
+      environmentId: 'rail-environment-1',
+      services: [{
+        name: 'Postgres',
+        externalId: databaseId,
+        workloadKind: 'web',
+        customDomains: [],
+        config: {},
+        envVarKeys: [],
+        envVarHashes: {},
+        status: 'running',
+      }],
+      databases: [],
+      completeness: {
+        project: 'complete',
+        environment: 'complete',
+        services: 'complete',
+        databases: 'complete',
+      },
+      partial: false,
+      warnings: [],
+    };
+    mockObservingAdapter(structuredClone(observedState));
+    vi.spyOn(adapterFactory, 'getDatabaseAdapter').mockResolvedValue({
+      success: true,
+      adapter: createRailwayDatabaseAdapter({
+        hostingAdapter: { observe: async () => structuredClone(observedState) } as never,
+        envRepo: new EnvironmentRepository(),
+      }),
+    });
+
+    const result = await new PlanService().plan(project, 'staging');
+
+    expect(result).not.toHaveProperty('error');
+    const plan = result as Exclude<typeof result, { error: string }>;
+    expect({
+      database: plan.actions.find((action) => action.id === 'database:railway')?.type,
+      seed: plan.actions.find((action) => action.id === 'database:railway:seed')?.type,
+      unmanaged: plan.unmanaged.filter((item) => item.name === 'Postgres'),
+    }).toEqual({ database: 'noop', seed: 'noop', unmanaged: [] });
+
+    new EnvironmentRepository().updatePlatformBindings(environment.id, {
+      services: { web: { serviceId: databaseId } },
+    });
+    const conflicted = await new PlanService().plan(project, 'staging');
+    expect(conflicted).toEqual({
+      error: expect.stringContaining('bound as both the database and application service web'),
+    });
   });
 
   it('plans Railway environment scaffolding before storage when a shared project has no target environment', async () => {

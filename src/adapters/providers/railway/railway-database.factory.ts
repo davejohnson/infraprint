@@ -78,11 +78,14 @@ export function createRailwayDatabaseAdapter(params: {
 
   const componentProjectId = (component?: Component | null): string | undefined => {
     const providerScope = component?.bindings.providerScope;
-    if (!providerScope || typeof providerScope !== 'object' || Array.isArray(providerScope)) {
-      return undefined;
+    if (providerScope && typeof providerScope === 'object' && !Array.isArray(providerScope)) {
+      const projectId = (providerScope as Record<string, unknown>).projectId;
+      if (typeof projectId === 'string' && projectId.length > 0) return projectId;
     }
-    const projectId = (providerScope as Record<string, unknown>).projectId;
-    return typeof projectId === 'string' && projectId.length > 0 ? projectId : undefined;
+    const legacyProjectId = component?.bindings.projectId;
+    return typeof legacyProjectId === 'string' && legacyProjectId.length > 0
+      ? legacyProjectId
+      : undefined;
   };
 
   const environmentProjectId = (environment: Environment): string | undefined => {
@@ -251,7 +254,39 @@ export function createRailwayDatabaseAdapter(params: {
           `Railway database ${component.externalId} was observed outside the current environment project scope.`
         );
       }
-      return match ?? null;
+      if (match) return match;
+
+      if (
+        observed.completeness?.services !== 'complete'
+        || !currentProjectId
+        || observed.projectId !== currentProjectId
+      ) {
+        throw new Error(
+          `Railway database service ${component.externalId} was not completely observed in its durable project scope.`
+        );
+      }
+      const serviceMatches = observed.services.filter((service) =>
+        service.externalId === component.externalId
+      );
+      if (serviceMatches.length > 1) {
+        throw new Error(`Multiple Railway services match durable database id ${component.externalId}`);
+      }
+      const service = serviceMatches[0];
+      if (!service) return null;
+      return {
+        provider: 'railway',
+        engine: 'postgres',
+        externalId: service.externalId,
+        providerScope: { projectId: currentProjectId },
+        name: service.name,
+        status: service.status === 'running'
+          ? 'running'
+          : service.status === 'failed'
+            ? 'error'
+            : service.status === 'empty'
+              ? 'stopped'
+              : 'unknown',
+      };
     }
     const expectedName = options?.resourceName?.trim().toLowerCase();
     const named = expectedName
