@@ -353,6 +353,58 @@ destination mailbox accepts its verification email; forwarding rules run only
 afterward. Because SendGrid exposes one delivery-event webhook per account, the
 project spec may declare `deliveryEvents` in only one environment.
 
+#### SendGrid-backed CI email journeys
+
+A staging application can use the same inbound-email lifecycle as a CI test
+inbox without a separate mailbox service. Give the CI traffic its own inbound
+hostname and leave `aliases` empty because per-run recipient local parts are
+temporary application state, not durable provider configuration:
+
+```json
+{
+  "domain": "staging.example.com",
+  "services": {
+    "api": { "workloadKind": "web", "public": true }
+  },
+  "email": {
+    "enabled": true,
+    "sender": {
+      "address": "canary@staging.example.com",
+      "name": "Example Canary"
+    },
+    "inbound": {
+      "hostname": "ci-mail.staging.example.com",
+      "service": "api",
+      "path": "/api/webhooks/canary-email-receipts",
+      "aliases": [],
+      "spamCheck": true,
+      "sendRaw": false
+    }
+  }
+}
+```
+
+Hypervibe owns the SendGrid authorization and Inbound Parse route, Cloudflare
+MX record, and hosting runtime projection. The application owns the test-inbox
+behavior: it can issue a short-lived recipient from a protected endpoint or let
+CI derive one from an application canary secret, the webhook accepts only valid
+recipients and stores the minimum verification result, and a protected polling
+endpoint returns that result to CI. The CI job may need that application canary
+credential and the non-secret inbound hostname, but it never needs the SendGrid
+API key.
+
+An unguessable recipient is staging isolation, not proof that SendGrid sent the
+request. Apply strict request-size limits, short recipient expiry, and
+capability-aware rate limits rather than one small shared provider-IP bucket.
+SendGrid stops retrying only after a `2xx` response, so permanently invalid or
+over-limit payloads should be acknowledged and discarded; reserve `5xx` for
+transient failures that can succeed on retry.
+Applications that require provider-origin authentication must verify SendGrid's
+signed multipart request without changing its raw bytes, or put SendGrid OAuth
+in front of the webhook. Signature keys, OAuth tokens, message storage, and
+receipt APIs remain application-owned; Hypervibe does not currently provision
+or rotate those credentials.
+
 ### Declarative Twilio messaging
 
 Twilio support deliberately covers the shared setup most applications need: a

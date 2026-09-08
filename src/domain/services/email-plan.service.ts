@@ -19,8 +19,8 @@ import {
   type EmailInboundSpec,
   type EnvironmentSpec,
 } from '../spec/spec.schema.js';
-import { getCloudflareAdapter } from './cloudflare-ops.service.js';
-import { dnsZoneScopeForDomain, normalizeDomainName } from './domain-scope.js';
+import { findCloudflareZone, getCloudflareAdapterFromHints } from './cloudflare-ops.service.js';
+import { cloudflareScopeHintsForDomain, normalizeDomainName } from './domain-scope.js';
 import { getProjectScopeHints } from './project-scope.js';
 import { getSendGridAdapter, getSendGridApiKeyHash } from './sendgrid-ops.service.js';
 import {
@@ -279,13 +279,12 @@ export async function resolveEmailIntegrationState(params: {
 
   if (wantsDns && environmentSpec.domain) {
     const domain = normalizeDomainName(environmentSpec.domain);
-    const cloudflare = getCloudflareAdapter(domain);
+    const cloudflare = getCloudflareAdapterFromHints(cloudflareScopeHintsForDomain(domain));
     if ('error' in cloudflare) {
       dnsRecords = unknown(cloudflare.error);
     } else {
       try {
-        const zone = (await cloudflare.adapter.findZoneByName(domain))
-          ?? (await cloudflare.adapter.findZoneByName(dnsZoneScopeForDomain(domain)));
+        const zone = await findCloudflareZone(cloudflare.adapter, domain);
         if (!zone) {
           dnsRecords = known();
         } else {

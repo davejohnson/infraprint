@@ -818,6 +818,32 @@ Cloudflare forwarding destinations, routing DNS, aliases, and the catch-all are
 explicit actions with destination-verification dependencies; provider-global
 destination addresses are never deleted implicitly.
 
+A SendGrid-backed CI email journey reuses this lifecycle rather than adding a
+Hypervibe-hosted inbox. The desired state declares a dedicated staging Inbound
+Parse hostname and may intentionally use `aliases: []`; dynamic local parts for
+individual test runs are application data and must not become desired-state
+aliases. Hypervibe owns SendGrid authorization and route reconciliation,
+Cloudflare MX records, and the existing runtime-variable projection. The
+application owns issuing and expiring recipient capabilities, validating and
+storing inbound messages, and exposing a protected polling API. It may issue a
+recipient through an API or let CI derive one from an application canary secret;
+CI never receives provider credentials.
+
+Inbound Parse delivery semantics are part of the application boundary. A
+permanently invalid or over-limit message is acknowledged with `2xx` and
+dropped, while retryable storage failures may return `5xx`. Rate limits should
+key valid recipient capabilities independently so unrelated SendGrid delivery
+traffic cannot exhaust one shared provider-IP bucket.
+
+A recipient capability is application-level staging hardening, not provider
+origin authentication. SendGrid signature verification requires preserving the
+exact raw multipart request for verification before parsing, while OAuth adds an
+application token endpoint and token lifecycle. Both policies remain explicit
+application concerns until Hypervibe can model their credentials, provider
+configuration, runtime projection, observation, and rotation through the full
+spec -> plan -> apply lifecycle. Hypervibe does not store CI messages,
+verification links, or receipt state.
+
 ## Messaging Desired State
 
 Twilio messaging configuration lives under each environment's `messaging`

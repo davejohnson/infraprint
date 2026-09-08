@@ -1,8 +1,10 @@
 import { ConnectionRepository } from '../../adapters/db/repositories/connection.repository.js';
 import { getSecretStore } from '../../adapters/secrets/secret-store.js';
 import { CloudflareAdapter } from '../../adapters/providers/cloudflare/cloudflare.adapter.js';
+import type { CloudflareZone } from '../../adapters/providers/cloudflare/cloudflare.adapter.js';
 import type { CloudflareCredentials } from '../entities/connection.entity.js';
 import { formatConnectionGuidance } from './connection-guidance.js';
+import { dnsZoneScopeForDomain, normalizeDomainName } from './domain-scope.js';
 
 const connectionRepo = new ConnectionRepository();
 
@@ -20,12 +22,24 @@ function adapterFromConnection(connection: NonNullable<ReturnType<ConnectionRepo
  * @param scopeHint - Optional domain hint (e.g., "example.com") for finding scoped tokens
  */
 export function getCloudflareAdapter(scopeHint?: string): { adapter: CloudflareAdapter; scope: string | null } | { error: string } {
-  const connection = connectionRepo.findBestMatch('cloudflare', scopeHint);
+  return getCloudflareAdapterFromHints(scopeHint ? [scopeHint] : []);
+}
+
+/** Resolve the first exact, wildcard, or global Cloudflare connection matching the ordered scope hints. */
+export function getCloudflareAdapterFromHints(scopeHints: string[]): { adapter: CloudflareAdapter; scope: string | null } | { error: string } {
+  const connection = connectionRepo.findBestMatchFromHints('cloudflare', scopeHints);
   if (!connection) {
-    return { error: `No Cloudflare connection found. ${formatConnectionGuidance('cloudflare', { scope: scopeHint })}` };
+    return { error: `No Cloudflare connection found. ${formatConnectionGuidance('cloudflare', { scope: scopeHints[0] })}` };
   }
 
   return adapterFromConnection(connection);
+}
+
+export async function findCloudflareZone(adapter: CloudflareAdapter, domain: string): Promise<CloudflareZone | null> {
+  const normalizedDomain = normalizeDomainName(domain);
+  const direct = await adapter.findZoneByName(normalizedDomain);
+  const zoneScope = dnsZoneScopeForDomain(normalizedDomain);
+  return direct ?? (zoneScope === normalizedDomain ? null : adapter.findZoneByName(zoneScope));
 }
 
 /**
