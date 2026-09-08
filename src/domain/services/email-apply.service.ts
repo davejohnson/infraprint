@@ -14,8 +14,8 @@ import type { Project } from '../entities/project.entity.js';
 import type { ActionResult } from '../plan/converge.executor.js';
 import type { PlanAction } from '../plan/plan.types.js';
 import { SENDGRID_DELIVERY_EVENTS, type EnvironmentSpec } from '../spec/spec.schema.js';
-import { getCloudflareAdapter } from './cloudflare-ops.service.js';
-import { normalizeDomainName, dnsZoneScopeForDomain } from './domain-scope.js';
+import { findCloudflareZone, getCloudflareAdapterFromHints } from './cloudflare-ops.service.js';
+import { cloudflareScopeHintsForDomain, normalizeDomainName } from './domain-scope.js';
 import {
   EMAIL_OPERATIONS,
   deliveryEventsUrl,
@@ -489,12 +489,11 @@ async function applyDns(params: {
     });
   }
 
-  const cloudflare = getCloudflareAdapter(domain);
+  const cloudflare = getCloudflareAdapterFromHints(cloudflareScopeHintsForDomain(domain));
   if ('error' in cloudflare) {
     return { success: false, status: 'blocked', message: 'Cloudflare connection unavailable', error: cloudflare.error };
   }
-  const zone = (await cloudflare.adapter.findZoneByName(domain))
-    ?? (await cloudflare.adapter.findZoneByName(dnsZoneScopeForDomain(domain)));
+  const zone = await findCloudflareZone(cloudflare.adapter, domain);
   if (!zone) {
     return { success: false, status: 'blocked', message: `Cloudflare zone not found for ${domain}`, error: 'Connect the DNS zone that owns this domain.' };
   }

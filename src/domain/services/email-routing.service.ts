@@ -1,14 +1,11 @@
-import { ConnectionRepository } from '../../adapters/db/repositories/connection.repository.js';
-import { getSecretStore } from '../../adapters/secrets/secret-store.js';
-import { CloudflareAdapter } from '../../adapters/providers/cloudflare/cloudflare.adapter.js';
 import type {
-  CloudflareCredentials,
+  CloudflareAdapter,
   CloudflareEmailRoutingRule,
   CloudflareZone,
 } from '../../adapters/providers/cloudflare/cloudflare.adapter.js';
+import { findCloudflareZone, getCloudflareAdapterFromHints } from './cloudflare-ops.service.js';
 import { formatConnectionGuidance } from './connection-guidance.js';
-
-const connectionRepo = new ConnectionRepository();
+import { cloudflareScopeHintsForDomain } from './domain-scope.js';
 
 type CloudflareEmailContext = {
   adapter: CloudflareAdapter;
@@ -17,25 +14,11 @@ type CloudflareEmailContext = {
   provider: 'cloudflare';
 };
 
-function getCloudflareAdapter(domain: string): { adapter: CloudflareAdapter } | { error: string } {
-  const connection = connectionRepo.findBestMatch('cloudflare', domain);
-  if (!connection) {
-    return { error: `No Cloudflare connection found. ${formatConnectionGuidance('cloudflare', { scope: domain })}` };
-  }
-
-  const secretStore = getSecretStore();
-  const credentials = secretStore.decryptObject<CloudflareCredentials>(connection.credentialsEncrypted);
-  const adapter = new CloudflareAdapter();
-  adapter.connect(credentials);
-
-  return { adapter };
-}
-
 export async function resolveCloudflareEmailContext(domain: string): Promise<CloudflareEmailContext | { error: string }> {
-  const adapterResult = getCloudflareAdapter(domain);
+  const adapterResult = getCloudflareAdapterFromHints(cloudflareScopeHintsForDomain(domain));
   if ('error' in adapterResult) return { error: adapterResult.error };
 
-  const zone = await adapterResult.adapter.findZoneByName(domain);
+  const zone = await findCloudflareZone(adapterResult.adapter, domain);
   if (!zone) {
     return {
       error: `Domain "${domain}" was not found in Cloudflare. Add the domain to Cloudflare or create a scoped Cloudflare connection for it.`,

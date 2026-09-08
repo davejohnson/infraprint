@@ -1,4 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ConnectionRepository } from '../../../adapters/db/repositories/connection.repository.js';
+import { initializeDatabase, SqliteAdapter } from '../../../adapters/db/sqlite.adapter.js';
+import { CloudflareAdapter } from '../../../adapters/providers/cloudflare/cloudflare.adapter.js';
+import { SendGridAdapter } from '../../../adapters/providers/sendgrid/sendgrid.adapter.js';
+import { getSecretStore } from '../../../adapters/secrets/secret-store.js';
 import type { Environment } from '../../entities/environment.entity.js';
 import type { Project } from '../../entities/project.entity.js';
 import type { ObservedState } from '../../ports/observe.port.js';
@@ -10,6 +18,7 @@ import {
   emailInboundConfigHash,
   emailRuntimeConfigHash,
   planEmail,
+  resolveEmailIntegrationState,
   type EmailIntegrationState,
 } from '../email-plan.service.js';
 
@@ -35,6 +44,24 @@ function spec() {
         service: 'api',
         path: '/webhooks/sendgrid/inbound',
         aliases: ['support', 'replies'],
+      },
+    },
+  });
+}
+
+function ciInboxSpec() {
+  return environmentSpecSchema.parse({
+    hosting: { provider: 'railway' },
+    services: { api: { workloadKind: 'web', public: true } },
+    domain: 'staging.example.com',
+    email: {
+      enabled: true,
+      sender: { address: 'canary@staging.example.com', name: 'Example Canary' },
+      inbound: {
+        hostname: 'ci-mail.staging.example.com',
+        service: 'api',
+        path: '/api/webhooks/canary-email-receipts',
+        aliases: [],
       },
     },
   });
@@ -152,6 +179,45 @@ describe('planEmail', () => {
       'email:cloudflare:dns',
       'email:sendgrid:inbound:inbound.example.com',
     ]);
+  });
+
+  it('keeps dynamic CI recipients application-owned while planning their dedicated inbound hostname', async () => {
+    const result = await planEmail({
+      project,
+      environmentName: 'staging',
+      environmentSpec: ciInboxSpec(),
+      environment: environment(),
+      observed: observed(),
+      serviceDependencies: ['service:api'],
+      integrationState: state(),
+    });
+
+    expect(result.actions.find((action) => action.id === 'email:runtime')).toMatchObject({
+      type: 'update',
+      dependsOn: ['service:api'],
+      metadata: {
+        operation: EMAIL_OPERATIONS.runtimeSync,
+        services: ['api'],
+      },
+    });
+    expect(result.actions.find((action) => action.id === 'email:sendgrid:inbound:ci-mail.staging.example.com'))
+      .toMatchObject({
+        type: 'create',
+        resource: {
+          kind: 'email',
+          name: 'ci-mail.staging.example.com',
+          provider: 'sendgrid',
+        },
+        dependsOn: ['email:cloudflare:dns', 'service:api'],
+        metadata: {
+          operation: EMAIL_OPERATIONS.inboundEnsure,
+          hostname: 'ci-mail.staging.example.com',
+          service: 'api',
+          path: '/api/webhooks/canary-email-receipts',
+          aliases: [],
+          expectedUrl: 'https://api.example.com/api/webhooks/canary-email-receipts',
+        },
+      });
   });
 
   it('plans explicit adoption when matching live identities are not locally bound', async () => {
@@ -340,5 +406,75 @@ describe('planEmail', () => {
       'email:cloudflare:forwarding-dns',
       'email:cloudflare:destination:owner@example.net',
     ]);
+  });
+});
+
+describe('email provider scope resolution', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hypervibe-email-plan-scope-'));
+    SqliteAdapter.resetInstance();
+    initializeDatabase(path.join(tempDir, 'hypervibe.db'));
+
+    const connections = new ConnectionRepository();
+    const sendgrid = connections.create({
+      provider: 'sendgrid',
+      credentialsEncrypted: getSecretStore().encryptObject({ apiKey: 'SG.secret-runtime-value' }),
+    });
+    connections.updateStatus(sendgrid.id, 'verified');
+    const cloudflare = connections.create({
+      provider: 'cloudflare',
+      scope: 'invoiceperfect.com',
+      credentialsEncrypted: getSecretStore().encryptObject({ apiToken: 'cloudflare-token' }),
+    });
+    connections.updateStatus(cloudflare.id, 'verified');
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    SqliteAdapter.resetInstance();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('observes a staging email domain through its parent-zone Cloudflare connection', async () => {
+    vi.spyOn(SendGridAdapter.prototype, 'listDomainAuthentications').mockResolvedValue([]);
+    vi.spyOn(SendGridAdapter.prototype, 'listInboundParseWebhooks').mockResolvedValue([]);
+    const findZone = vi.spyOn(CloudflareAdapter.prototype, 'findZoneByName')
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'zone-1',
+        name: 'invoiceperfect.com',
+        status: 'active',
+        paused: false,
+        type: 'full',
+        name_servers: [],
+        account: { id: 'account-1' },
+      });
+    const listDnsRecords = vi.spyOn(CloudflareAdapter.prototype, 'listDnsRecords').mockResolvedValue([]);
+    const environmentSpec = environmentSpecSchema.parse({
+      hosting: { provider: 'railway' },
+      services: { api: { workloadKind: 'web', public: true } },
+      domain: 'staging.invoiceperfect.com',
+      email: {
+        enabled: true,
+        sender: { address: 'canary@staging.invoiceperfect.com' },
+        inbound: {
+          hostname: 'ci-mail.staging.invoiceperfect.com',
+          service: 'api',
+          aliases: [],
+        },
+      },
+    });
+
+    const result = await resolveEmailIntegrationState({ project, environmentSpec });
+
+    expect(result.dnsRecords).toEqual({ status: 'known', items: [] });
+    expect(result.warnings).not.toEqual(expect.arrayContaining([
+      expect.stringContaining('No Cloudflare connection found'),
+    ]));
+    expect(findZone).toHaveBeenNthCalledWith(1, 'staging.invoiceperfect.com');
+    expect(findZone).toHaveBeenNthCalledWith(2, 'invoiceperfect.com');
+    expect(listDnsRecords).toHaveBeenCalledWith('zone-1');
   });
 });

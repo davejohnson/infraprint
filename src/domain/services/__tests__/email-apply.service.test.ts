@@ -18,6 +18,7 @@ import { applyEmailAction } from '../email-apply.service.js';
 import {
   EMAIL_OPERATIONS,
   emailDeliveryEventsConfigHash,
+  emailDnsConfigHash,
   emailInboundConfigHash,
   emailRuntimeConfigHash,
 } from '../email-plan.service.js';
@@ -50,6 +51,24 @@ function emailSpec() {
         service: 'api',
         path: '/webhooks/sendgrid/inbound',
         aliases: ['support', 'replies'],
+      },
+    },
+  });
+}
+
+function ciInboxSpec() {
+  return environmentSpecSchema.parse({
+    hosting: { provider: 'railway' },
+    services: { api: { workloadKind: 'web', public: true } },
+    domain: 'staging.example.com',
+    email: {
+      enabled: true,
+      sender: { address: 'canary@staging.example.com', name: 'Example Canary' },
+      inbound: {
+        hostname: 'ci-mail.staging.example.com',
+        service: 'api',
+        path: '/api/webhooks/canary-email-receipts',
+        aliases: [],
       },
     },
   });
@@ -155,6 +174,239 @@ describe('declarative email apply', () => {
         services: ['api'],
       },
     });
+  });
+
+  it('projects the CI inbox with empty aliases without leaking the SendGrid credential', async () => {
+    const setEnvVars = vi.fn().mockResolvedValue({ success: true, message: 'synced' });
+    vi.spyOn(adapterFactory, 'getProviderAdapter').mockResolvedValue({
+      success: true,
+      adapter: {
+        name: 'railway',
+        capabilities: { supportsDeferredDeploy: true },
+        setEnvVars,
+      } as never,
+    });
+    const spec = ciInboxSpec();
+    const action: PlanAction = {
+      id: 'email:runtime',
+      type: 'update',
+      resource: { kind: 'email', name: 'production', provider: 'railway' },
+      verified: false,
+      reason: 'sync',
+      metadata: {
+        operation: EMAIL_OPERATIONS.runtimeSync,
+        services: ['api'],
+        configHash: emailRuntimeConfigHash(spec),
+        credentialHash: createHash('sha256').update('SG.secret-runtime-value', 'utf8').digest('hex'),
+      },
+    };
+
+    const result = await applyEmailAction({
+      project,
+      environmentName: 'production',
+      environmentSpec: spec,
+      action,
+    });
+
+    expect(result.success).toBe(true);
+    expect(setEnvVars).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ name: 'api' }),
+      {
+        SENDGRID_API_KEY: 'SG.secret-runtime-value',
+        SENDGRID_FROM_EMAIL: 'canary@staging.example.com',
+        SENDGRID_FROM_NAME: 'Example Canary',
+        SENDGRID_INBOUND_HOSTNAME: 'ci-mail.staging.example.com',
+        SENDGRID_INBOUND_ALIASES: '[]',
+      }
+    );
+    expect(JSON.stringify(result)).not.toContain('SG.secret-runtime-value');
+    expect(result.data).toMatchObject({
+      services: ['api'],
+      keys: [
+        'SENDGRID_API_KEY',
+        'SENDGRID_FROM_EMAIL',
+        'SENDGRID_FROM_NAME',
+        'SENDGRID_INBOUND_ALIASES',
+        'SENDGRID_INBOUND_HOSTNAME',
+      ],
+    });
+  });
+
+  it('creates the dedicated CI inbound route without provider-managed local parts', async () => {
+    const route = {
+      hostname: 'ci-mail.staging.example.com',
+      url: 'https://api.example.com/api/webhooks/canary-email-receipts',
+      spam_check: true,
+      send_raw: false,
+    };
+    vi.spyOn(SendGridAdapter.prototype, 'listInboundParseWebhooks')
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([route]);
+    const create = vi.spyOn(SendGridAdapter.prototype, 'createInboundParseWebhook')
+      .mockResolvedValue(route);
+    const spec = ciInboxSpec();
+    const action: PlanAction = {
+      id: 'email:sendgrid:inbound:ci-mail.staging.example.com',
+      type: 'create',
+      resource: { kind: 'email', name: 'ci-mail.staging.example.com', provider: 'sendgrid' },
+      verified: false,
+      reason: 'create',
+      metadata: {
+        operation: EMAIL_OPERATIONS.inboundEnsure,
+        hostname: 'ci-mail.staging.example.com',
+        service: 'api',
+        path: '/api/webhooks/canary-email-receipts',
+        aliases: [],
+        spamCheck: true,
+        sendRaw: false,
+        configHash: emailInboundConfigHash(spec),
+        expectedUrl: 'https://api.example.com/api/webhooks/canary-email-receipts',
+      },
+    };
+
+    const result = await applyEmailAction({
+      project,
+      environmentName: 'production',
+      environmentSpec: spec,
+      action,
+    });
+
+    expect(result).toMatchObject({
+      success: true,
+      data: {
+        hostname: 'ci-mail.staging.example.com',
+        service: 'api',
+        path: '/api/webhooks/canary-email-receipts',
+        aliases: [],
+      },
+    });
+    expect(create).toHaveBeenCalledWith(
+      'ci-mail.staging.example.com',
+      'https://api.example.com/api/webhooks/canary-email-receipts',
+      { spam_check: true, send_raw: false }
+    );
+    const environment = new EnvironmentRepository().findByProjectAndName(project.id, 'production')!;
+    expect(environment.platformBindings.email).toMatchObject({
+      inbound: {
+        hostname: 'ci-mail.staging.example.com',
+        aliases: [],
+      },
+    });
+  });
+
+  it('applies staging email DNS through a Cloudflare connection scoped to the parent zone', async () => {
+    const connections = new ConnectionRepository();
+    const cloudflare = connections.create({
+      provider: 'cloudflare',
+      scope: 'invoiceperfect.com',
+      credentialsEncrypted: getSecretStore().encryptObject({ apiToken: 'cloudflare-token' }),
+    });
+    connections.updateStatus(cloudflare.id, 'verified');
+    const spec = environmentSpecSchema.parse({
+      hosting: { provider: 'railway' },
+      services: { api: { workloadKind: 'web', public: true } },
+      domain: 'staging.invoiceperfect.com',
+      email: {
+        enabled: true,
+        sender: { address: 'canary@staging.invoiceperfect.com' },
+        inbound: {
+          hostname: 'ci-mail.staging.invoiceperfect.com',
+          service: 'api',
+          aliases: [],
+        },
+      },
+    });
+    vi.spyOn(SendGridAdapter.prototype, 'listDomainAuthentications').mockResolvedValue([{
+      id: 42,
+      domain: 'staging.invoiceperfect.com',
+      subdomain: 'em',
+      username: 'user',
+      valid: true,
+      default: false,
+      legacy: false,
+      dns: {
+        dkim1: {
+          host: 's1._domainkey.staging.invoiceperfect.com',
+          type: 'CNAME',
+          data: 's1.sendgrid.net',
+          valid: true,
+        },
+        dkim2: {
+          host: 's2._domainkey.staging.invoiceperfect.com',
+          type: 'CNAME',
+          data: 's2.sendgrid.net',
+          valid: true,
+        },
+        mail_cname: {
+          host: 'em.staging.invoiceperfect.com',
+          type: 'CNAME',
+          data: 'u.sendgrid.net',
+          valid: true,
+        },
+      },
+    }]);
+    const findZone = vi.spyOn(CloudflareAdapter.prototype, 'findZoneByName')
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'zone-1',
+        name: 'invoiceperfect.com',
+        status: 'active',
+        paused: false,
+        type: 'full',
+        name_servers: [],
+        account: { id: 'account-1' },
+      });
+    vi.spyOn(CloudflareAdapter.prototype, 'listDnsRecords').mockResolvedValue([]);
+    const upsertDnsRecord = vi.spyOn(CloudflareAdapter.prototype, 'upsertDnsRecord')
+      .mockImplementation(async (zoneId, name, type, content, options) => ({
+        action: 'created',
+        record: {
+          id: `dns-${name}`,
+          zone_id: zoneId,
+          zone_name: 'invoiceperfect.com',
+          name,
+          type,
+          content,
+          proxiable: type === 'CNAME',
+          proxied: false,
+          ttl: 1,
+          created_on: '',
+          modified_on: '',
+          ...(options?.priority !== undefined ? { priority: options.priority } : {}),
+        },
+      }));
+
+    const result = await applyEmailAction({
+      project,
+      environmentName: 'production',
+      environmentSpec: spec,
+      action: {
+        id: 'email:cloudflare:dns',
+        type: 'update',
+        resource: { kind: 'domain', name: 'staging.invoiceperfect.com', provider: 'cloudflare' },
+        verified: false,
+        reason: 'sync',
+        metadata: {
+          operation: EMAIL_OPERATIONS.dnsSync,
+          domain: 'staging.invoiceperfect.com',
+          inboundHostname: 'ci-mail.staging.invoiceperfect.com',
+          configHash: emailDnsConfigHash(spec),
+        },
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(findZone).toHaveBeenNthCalledWith(1, 'staging.invoiceperfect.com');
+    expect(findZone).toHaveBeenNthCalledWith(2, 'invoiceperfect.com');
+    expect(upsertDnsRecord).toHaveBeenCalledTimes(4);
+    expect(upsertDnsRecord).toHaveBeenCalledWith(
+      'zone-1',
+      'ci-mail.staging.invoiceperfect.com',
+      'MX',
+      'mx.sendgrid.net',
+      { proxied: false, priority: 10 }
+    );
   });
 
   it('creates and verifies the exact service-targeted inbound parse route', async () => {
@@ -302,22 +554,24 @@ describe('declarative email apply', () => {
     }));
   });
 
-  it('creates a declared forwarding destination and stops pending verification', async () => {
+  it('creates a forwarding destination through a parent-zone Cloudflare connection and stops pending verification', async () => {
     const connection = new ConnectionRepository().create({
       provider: 'cloudflare',
-      scope: 'example.com',
+      scope: 'invoiceperfect.com',
       credentialsEncrypted: getSecretStore().encryptObject({ apiToken: 'cloudflare-token' }),
     });
     new ConnectionRepository().updateStatus(connection.id, 'verified');
-    vi.spyOn(CloudflareAdapter.prototype, 'findZoneByName').mockResolvedValue({
-      id: 'zone-1',
-      name: 'example.com',
-      status: 'active',
-      paused: false,
-      type: 'full',
-      name_servers: [],
-      account: { id: 'account-1' },
-    });
+    const findZone = vi.spyOn(CloudflareAdapter.prototype, 'findZoneByName')
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'zone-1',
+        name: 'invoiceperfect.com',
+        status: 'active',
+        paused: false,
+        type: 'full',
+        name_servers: [],
+        account: { id: 'account-1' },
+      });
     vi.spyOn(CloudflareAdapter.prototype, 'listEmailRoutingAddresses').mockResolvedValue([]);
     const create = vi.spyOn(CloudflareAdapter.prototype, 'createEmailRoutingAddress').mockResolvedValue({
       id: 'destination-1',
@@ -327,7 +581,7 @@ describe('declarative email apply', () => {
     const spec = environmentSpecSchema.parse({
       hosting: { provider: 'railway' },
       services: { api: { workloadKind: 'web', public: true } },
-      domain: 'example.com',
+      domain: 'staging.invoiceperfect.com',
       email: {
         enabled: true,
         forwarding: { aliases: { support: 'owner@example.net' } },
@@ -345,12 +599,14 @@ describe('declarative email apply', () => {
         reason: 'create',
         metadata: {
           operation: EMAIL_OPERATIONS.forwardingDestinationEnsure,
-          domain: 'example.com',
+          domain: 'staging.invoiceperfect.com',
           destination: 'owner@example.net',
         },
       },
     });
     expect(result).toMatchObject({ success: false, status: 'pending' });
+    expect(findZone).toHaveBeenNthCalledWith(1, 'staging.invoiceperfect.com');
+    expect(findZone).toHaveBeenNthCalledWith(2, 'invoiceperfect.com');
     expect(create).toHaveBeenCalledWith('account-1', 'owner@example.net');
     const environment = new EnvironmentRepository().findByProjectAndName(project.id, 'production')!;
     expect(environment.platformBindings.email).toMatchObject({
