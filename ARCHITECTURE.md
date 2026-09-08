@@ -1328,6 +1328,16 @@ creation, and credential derivation remain inside the reviewed apply action.
 Temporary CLI sessions may provision, observe, and migrate storage, but are not
 projected into deployed workloads as long-lived secrets.
 
+An ambiguous bucket-create outcome is retained as scoped recovery evidence and
+blocks retries. If complete provider observation later proves that an unresolved
+requested name is absent, planning may emit a separately confirmation-gated
+recovery-clear action followed by the normal billable create. Apply must
+re-observe the exact provider scope immediately before clearing the marker and
+must preserve it if a matching bucket appears or observation becomes unknown.
+Known preflight failures must report that no mutation was attempted and must not
+create recovery state. Identified or mismatched provider ids still require
+explicit adoption or cleanup; absence recovery is never deletion authority.
+
 ## Database Tasks And Seed Data
 
 Do not use temporary release-command changes to run one-off data operations. Release commands are durable deploy-time schema configuration.

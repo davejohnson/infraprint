@@ -19,6 +19,7 @@ import { adapterFactory } from './adapter.factory.js';
 
 export const STORAGE_OPERATIONS = {
   ensure: 'storageEnsure',
+  clearCreateRecovery: 'storageCreateRecoveryClear',
   wire: 'storageWire',
   unwire: 'storageUnwire',
   destroy: 'storageDestroy',
@@ -123,6 +124,16 @@ function recoveryMatchesTarget(
     && (!context || scopesMatch(recovery.providerScope, context));
 }
 
+function recoveriesMatch(left: StorageCreateRecovery, right: StorageCreateRecovery): boolean {
+  return left.provider === right.provider
+    && left.operation === right.operation
+    && left.resourceName === right.resourceName
+    && left.state === right.state
+    && left.externalId === right.externalId
+    && left.returnedName === right.returnedName
+    && scopesMatch(left.providerScope, right.providerScope);
+}
+
 function storageRecoveryGuidance(): string {
   return 'Use hv_inspect to identify the exact bucket and provider scope, then use the provider\'s hv_import storage-adoption workflow to bind that exact resource. The recovery marker is not deletion authority.';
 }
@@ -225,6 +236,7 @@ export function planStorage(params: {
 
   for (const [name, spec] of Object.entries(desired)) {
     const recovery = recoveries.parsed[name];
+    let recoveryClearActionId: string | undefined;
     if (recovery) {
       const context = currentStorageContext(
         params.environment,
@@ -232,24 +244,55 @@ export function planStorage(params: {
         params.environmentSpec.hosting.provider
       );
       const exactTarget = recoveryMatchesTarget(recovery, name, spec.provider, context);
-      actions.push(action({
-        id: `storage:${name}`,
-        type: 'update',
-        name,
-        provider: spec.provider,
-        operation: STORAGE_OPERATIONS.ensure,
-        verified: false,
-        reason: exactTarget
-          ? `Storage "${name}" has a retained create outcome that requires explicit resolution`
-          : `Storage "${name}" has create-recovery state that does not match its current provider or scope`,
-        metadata: {
-          blockedReason: exactTarget
-            ? 'storage_create_recovery_required'
-            : 'storage_create_recovery_target_mismatch',
-          storageCreateRecovery: recovery,
-        },
-      }));
-      continue;
+      const observationKnown = storageObservationKnown(params.observed, spec.provider);
+      const sameNameCandidates = live.filter((item) => (
+        item.provider === spec.provider
+        && item.name.toLowerCase() === name.toLowerCase()
+      ));
+      const providerConfirmedAbsent = Boolean(
+        exactTarget
+        && recovery.state === 'unresolved'
+        && !bindings[name]
+        && params.observed
+        && observationKnown
+        && sameNameCandidates.length === 0
+      );
+      if (providerConfirmedAbsent) {
+        recoveryClearActionId = `storage:${name}:create-recovery:clear`;
+        actions.push(action({
+          id: recoveryClearActionId,
+          type: 'update',
+          name,
+          provider: spec.provider,
+          operation: STORAGE_OPERATIONS.clearCreateRecovery,
+          verified: true,
+          requiresConfirm: true,
+          reason: `Clear retained create-recovery state after complete provider observation confirmed storage "${name}" is absent`,
+          metadata: {
+            instanceScope: recovery.providerScope,
+            storageCreateRecovery: recovery,
+          },
+        }));
+      } else {
+        actions.push(action({
+          id: `storage:${name}`,
+          type: 'update',
+          name,
+          provider: spec.provider,
+          operation: STORAGE_OPERATIONS.ensure,
+          verified: false,
+          reason: exactTarget
+            ? `Storage "${name}" has a retained create outcome that requires explicit resolution`
+            : `Storage "${name}" has create-recovery state that does not match its current provider or scope`,
+          metadata: {
+            blockedReason: exactTarget
+              ? 'storage_create_recovery_required'
+              : 'storage_create_recovery_target_mismatch',
+            storageCreateRecovery: recovery,
+          },
+        }));
+        continue;
+      }
     }
     const binding = bindings[name];
     const observationKnown = storageObservationKnown(params.observed, spec.provider);
@@ -319,6 +362,7 @@ export function planStorage(params: {
       operation: STORAGE_OPERATIONS.ensure,
       verified: Boolean(params.observed && observationKnown),
       billable: !binding && nameCandidates.length === 0,
+      ...(recoveryClearActionId ? { dependsOn: [recoveryClearActionId] } : {}),
       reason: providerDrift
         ? `Storage provider changed from ${binding?.provider} to ${spec.provider}; declare a one-use dataMigration before replacing durable data`
         : conflict
@@ -632,6 +676,103 @@ export async function applyStorageAction(params: {
     : '';
   const operation = String(params.action.metadata?.operation ?? '');
   const recoveryState = storageCreateRecoveryState(environment);
+  if (operation === STORAGE_OPERATIONS.clearCreateRecovery) {
+    const retainedRecovery = recoveryState.parsed[name];
+    const plannedRecovery = parseStorageCreateRecovery(params.action.metadata?.storageCreateRecovery);
+    const plannedContext = storageContext(params.action.metadata?.instanceScope);
+    const desired = params.environmentSpec.storage?.[name];
+    const currentContext = desired
+      ? currentStorageContext(environment, desired.provider, params.environmentSpec.hosting.provider)
+      : undefined;
+    if (
+      recoveryState.malformed
+      || !retainedRecovery
+      || !plannedRecovery
+      || !plannedContext
+      || !desired
+      || params.action.type !== 'update'
+      || params.action.requiresConfirm !== true
+      || params.action.resource.name !== name
+      || params.action.resource.provider !== desired.provider
+      || retainedRecovery.state !== 'unresolved'
+      || !recoveriesMatch(retainedRecovery, plannedRecovery)
+      || !scopesMatch(retainedRecovery.providerScope, plannedContext)
+      || !scopesMatch(currentContext, plannedContext)
+    ) {
+      return {
+        success: false,
+        status: 'blocked',
+        message: `Storage create-recovery clear for "${name}" has stale mutation authority`,
+        error: 'The retained marker, desired storage target, or exact provider scope changed after planning. Re-run hv_plan.',
+      };
+    }
+    const storageResult = await adapterFactory.getStorageAdapter(desired.provider, params.project);
+    if (!storageResult.success || !storageResult.adapter) {
+      return { success: false, message: 'Storage adapter unavailable', error: storageResult.error };
+    }
+    const adapter = storageResult.adapter;
+    if (adapter.name !== desired.provider) {
+      return {
+        success: false,
+        status: 'blocked',
+        message: `Storage recovery action "${params.action.id}" resolved the wrong provider adapter`,
+        error: `Plan targets ${desired.provider}, but the resolved adapter is ${adapter.name}.`,
+      };
+    }
+    let observed: Awaited<ReturnType<typeof adapter.observe>>;
+    try {
+      observed = await adapter.observe(environment, plannedContext);
+    } catch (error) {
+      return {
+        success: false,
+        status: 'blocked',
+        message: `Could not re-observe storage "${name}" before clearing recovery state`,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+    const candidates = observed.filter((item) => (
+      item.name.toLowerCase() === name.toLowerCase()
+      || (retainedRecovery.externalId !== undefined && item.externalId === retainedRecovery.externalId)
+    ));
+    if (candidates.length > 0) {
+      return {
+        success: false,
+        status: 'blocked',
+        message: `Storage "${name}" appeared during create-recovery verification`,
+        error: 'The provider now reports a matching bucket. Inspect its exact identity and explicitly adopt it; Hypervibe preserved the recovery marker.',
+      };
+    }
+    const latest = envRepo.findById(environment.id);
+    const latestState = storageCreateRecoveryState(latest);
+    const latestRecovery = latestState.parsed[name];
+    if (!latest || latestState.malformed || !latestRecovery || !recoveriesMatch(latestRecovery, retainedRecovery)) {
+      return {
+        success: false,
+        status: 'blocked',
+        message: `Storage create-recovery state changed while verifying "${name}"`,
+        error: 'Hypervibe preserved the latest recovery state. Re-run hv_plan.',
+      };
+    }
+    const remainingRecoveries = { ...latestState.parsed };
+    delete remainingRecoveries[name];
+    const updated = envRepo.updatePlatformBindings(latest.id, {
+      storageCreateRecovery: Object.keys(remainingRecoveries).length > 0
+        ? remainingRecoveries
+        : undefined,
+    });
+    if (!updated) {
+      return {
+        success: false,
+        message: `Could not persist create-recovery resolution for storage "${name}"`,
+        error: `Environment "${params.envName}" disappeared after provider absence was verified.`,
+      };
+    }
+    return {
+      success: true,
+      message: `Cleared provider-confirmed absent create-recovery state for storage "${name}"`,
+      data: { cleared: true, instanceScope: plannedContext },
+    };
+  }
   const retainedRecovery = recoveryState.parsed[name];
   if (recoveryState.malformed || retainedRecovery) {
     return {

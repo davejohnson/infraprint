@@ -610,13 +610,24 @@ const authorized: AuthorizedCase[] = [
       operation,
       billable: operation === STORAGE_OPERATIONS.ensure,
       dataBearing: operation === STORAGE_OPERATIONS.destroy,
-      requiresConfirm: operation === STORAGE_OPERATIONS.destroy,
+      requiresConfirm: operation === STORAGE_OPERATIONS.destroy
+        || operation === STORAGE_OPERATIONS.clearCreateRecovery,
       metadata: {
         storageName: 'documents',
         ...(operation === STORAGE_OPERATIONS.destroy
           ? {
               externalId: 'bucket-1',
               instanceScope: { projectId: 'railway-project', environmentId: 'railway-environment' },
+            }
+          : {}),
+        ...(operation === STORAGE_OPERATIONS.clearCreateRecovery
+          ? {
+              instanceScope: { projectId: 'railway-project', environmentId: 'railway-environment' },
+              storageCreateRecovery: {
+                provider: 'railway', operation: 'create', resourceName: 'documents',
+                providerScope: { projectId: 'railway-project', environmentId: 'railway-environment' },
+                state: 'unresolved',
+              },
             }
           : {}),
         ...(
@@ -1346,6 +1357,13 @@ describe('plan action mutation-authority contract', () => {
       type: 'update',
       metadata: { ...candidate.metadata, blockedReason: 'queue_observation_unknown' },
     })).toBeNull();
+  });
+
+  it('rejects storage create-recovery clearing when confirmation is stripped', () => {
+    const candidate = authorized.find(
+      (entry) => entry.label === STORAGE_OPERATIONS.clearCreateRecovery
+    )!.action;
+    expect(resolvePlanActionAuthority({ ...candidate, requiresConfirm: undefined })).toBeNull();
   });
 
   it('authorizes exact desired cache reconciliation and rejects unpinned config', () => {
