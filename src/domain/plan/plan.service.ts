@@ -159,6 +159,18 @@ function recordMapValue(record: Record<string, unknown> | undefined, key: string
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
+function componentProviderId(component: Component | null | undefined): string | undefined {
+  return component?.externalId
+    ?? recordValue(component?.bindings, 'instanceId')
+    ?? recordValue(component?.bindings, 'serviceId');
+}
+
+function componentProjectId(component: Component | null | undefined): string | undefined {
+  if (!component) return undefined;
+  return recordValue(recordMapValue(component.bindings, 'providerScope'), 'projectId')
+    ?? recordValue(component.bindings, 'projectId');
+}
+
 function hasProviderResourceBindings(bindings: Record<string, unknown> | undefined): boolean {
   if (recordValue(bindings, 'environmentId')) return true;
   const services = recordMapValue(bindings, 'services');
@@ -330,11 +342,49 @@ export class PlanService {
           : undefined;
       const dbProvider =
         environmentSpec.database?.provider ?? localDatabaseProvider;
-      if (
+      const localDatabaseExternalId = componentProviderId(localDatabase);
+      const databaseHostingBindings = parseHostingBindings(environment);
+      const localDatabaseProjectId = componentProjectId(localDatabase);
+      const databaseSharesHostingScope =
+        localDatabaseProvider === provider
+        && Boolean(localDatabaseProjectId)
+        && Boolean(databaseHostingBindings.projectId)
+        && localDatabaseProjectId === databaseHostingBindings.projectId;
+      const databaseServiceBindingNames = databaseSharesHostingScope
+        ? Object.entries(databaseHostingBindings.services ?? {})
+          .filter(([, binding]) => (
+            typeof binding.serviceId === 'string'
+            && binding.serviceId === localDatabaseExternalId
+          ))
+          .map(([name]) => name)
+        : [];
+      const observedBoundDatabaseServices =
+        databaseSharesHostingScope && localDatabaseExternalId
+          ? observed.services.filter((service) => service.externalId === localDatabaseExternalId)
+          : [];
+      if (databaseServiceBindingNames.length > 0) {
+        observed.completeness.databases = 'unknown';
+        observed.partial = true;
+        observed.warnings.push(
+          `Provider id ${localDatabaseExternalId} is bound as both the database and application service ${databaseServiceBindingNames.join(', ')}; database reconciliation is blocked.`
+        );
+      } else if (observedBoundDatabaseServices.length > 1) {
+        observed.completeness.databases = 'unknown';
+        observed.partial = true;
+        observed.warnings.push(
+          `Multiple hosting services matched durable database id ${localDatabaseExternalId}; database reconciliation is blocked.`
+        );
+      } else if (
         dbProvider
         && (
           dbProvider !== provider
           || observed.completeness.databases !== 'complete'
+          || observedBoundDatabaseServices.length === 1
+          || (
+            databaseSharesHostingScope
+            && Boolean(localDatabaseExternalId)
+            && observed.completeness.services !== 'complete'
+          )
         )
       ) {
         observed.completeness.databases = 'unknown';
@@ -357,13 +407,43 @@ export class PlanService {
                     environment.id,
                     engine
                   );
-            const db = await dbAdapter.observeDatabase(environment, component, {
+            const observationComponent =
+              component
+              && localDatabaseExternalId
+              && !component.externalId
+                ? { ...component, externalId: localDatabaseExternalId }
+                : component;
+            const db = await dbAdapter.observeDatabase(environment, observationComponent, {
               resourceName: `${project.name}-${environment.name}-${engine}`,
             });
+            if (
+              observedBoundDatabaseServices.length === 1
+              && (
+                !db
+                || db.provider !== dbProvider
+                || dbProvider !== provider
+                || db.externalId !== localDatabaseExternalId
+              )
+            ) {
+              throw new Error(
+                `The database lifecycle adapter did not confirm hosting service ${localDatabaseExternalId} as the bound database.`
+              );
+            }
+            if (
+              db
+              && db.provider === dbProvider
+              && dbProvider === provider
+              && db.externalId === localDatabaseExternalId
+              && observedBoundDatabaseServices.length === 1
+            ) {
+              const [databaseService] = observedBoundDatabaseServices;
+              observed.services = observed.services.filter((service) => service !== databaseService);
+            }
             observed.databases = [
               ...observed.databases.filter((item) =>
                 item.provider !== dbProvider
-                && (!db || item.externalId !== db.externalId)
+                || !db
+                || item.externalId !== db.externalId
               ),
               ...(db ? [db] : []),
             ];
@@ -1722,6 +1802,27 @@ export class PlanService {
         suppliedValues: delegatedSecretValues,
       });
     const local = this.buildLocalSnapshot(projectForPlan, environment, effectiveBindings);
+    const localDatabase = local.components.find((component) => component.type === 'postgres');
+    const localDatabaseProvider = recordValue(localDatabase?.bindings, 'provider');
+    const localDatabaseProjectId = componentProjectId(localDatabase);
+    const localHostingProjectId = recordValue(local.bindings, 'projectId');
+    const localDatabaseProviderId = componentProviderId(localDatabase);
+    const databaseSharesHostingScope =
+      localDatabaseProvider === environmentSpec.hosting.provider
+      && Boolean(localDatabaseProjectId)
+      && Boolean(localHostingProjectId)
+      && localDatabaseProjectId === localHostingProjectId;
+    const conflictingServiceBinding = databaseSharesHostingScope && localDatabaseProviderId
+      ? Object.entries(local.bindings?.services ?? {}).find(
+        ([, binding]) => binding.serviceId === localDatabaseProviderId
+      )
+      : undefined;
+    if (conflictingServiceBinding) {
+      const [serviceName, binding] = conflictingServiceBinding;
+      return {
+        error: `Provider id ${binding.serviceId} is bound as both the database and application service ${serviceName}. Repair the conflicting durable bindings before reconciliation.`,
+      };
+    }
     const sourceEnvironmentName = environmentSpec.dataMigration?.fromEnvironment;
     const sourceEnvironmentSpec = sourceEnvironmentName
       ? specResult.spec.environments[sourceEnvironmentName]

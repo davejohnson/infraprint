@@ -117,6 +117,51 @@ describe('Railway database adapter', () => {
     )).rejects.toThrow('outside the current environment project scope');
   });
 
+  it('rejects cross-project or duplicate hosting-service representations of a bound database id', async () => {
+    const databaseService = {
+      name: 'Postgres',
+      externalId: 'svc-db-1',
+      workloadKind: 'web' as const,
+      customDomains: [],
+      config: {},
+      envVarKeys: [],
+      envVarHashes: {},
+      status: 'running' as const,
+    };
+    const observation = (projectId: string, services: typeof databaseService[]) => ({
+      projectId,
+      services,
+      databases: [],
+      completeness: { services: 'complete' as const, databases: 'complete' as const },
+      warnings: [],
+    });
+    const observe = vi.fn()
+      .mockResolvedValueOnce(observation('other-project', [databaseService]))
+      .mockResolvedValueOnce(observation('rail-project-1', [databaseService, databaseService]))
+      .mockResolvedValueOnce({
+        ...observation('rail-project-1', [databaseService]),
+        completeness: { services: 'unknown' as const, databases: 'complete' as const },
+      })
+      .mockResolvedValueOnce({
+        ...observation('rail-project-1', []),
+        completeness: { services: 'unknown' as const, databases: 'complete' as const },
+      });
+    const adapter = createRailwayDatabaseAdapter({
+      hostingAdapter: { observe } as never,
+      envRepo: { findById: vi.fn(() => environment()) } as never,
+    });
+    const component = databaseComponent({ projectId: 'rail-project-1' });
+
+    await expect(adapter.observeDatabase(environment(), component))
+      .rejects.toThrow('durable project scope');
+    await expect(adapter.observeDatabase(environment(), component))
+      .rejects.toThrow('Multiple Railway services match durable database id');
+    await expect(adapter.observeDatabase(environment(), component))
+      .rejects.toThrow('was not completely observed');
+    await expect(adapter.observeDatabase(environment(), component))
+      .rejects.toThrow('was not completely observed');
+  });
+
   it('observes a retained database through its recorded project after a project rebind', async () => {
     const getProjectDetails = vi.fn(async () => ({
       services: {
