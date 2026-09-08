@@ -5479,20 +5479,27 @@ export class RailwayAdapter implements
     const environmentNodes: Array<{ id: string; unmergedChangesCount: number }> = [];
     const environmentIds = new Set<string>();
     for (const edge of result.project.environments.edges) {
+      const unmergedChangesCount = isRecord(edge) && isRecord(edge.node)
+        ? edge.node.unmergedChangesCount
+        : undefined;
       if (!isRecord(edge)
         || !isRecord(edge.node)
         || typeof edge.node.id !== 'string'
         || edge.node.id.trim().length === 0
-        || typeof edge.node.unmergedChangesCount !== 'number'
-        || !Number.isSafeInteger(edge.node.unmergedChangesCount)
-        || edge.node.unmergedChangesCount < 0) {
+        || (unmergedChangesCount !== null
+          && (typeof unmergedChangesCount !== 'number'
+            || !Number.isSafeInteger(unmergedChangesCount)
+            || unmergedChangesCount < 0))) {
         throw new Error(`Railway returned a malformed environment identity or staged-change count for project ${projectId}.`);
       }
       if (environmentIds.has(edge.node.id)) {
         throw new Error(`Railway returned duplicate environment id ${edge.node.id} for project ${projectId}.`);
       }
       environmentIds.add(edge.node.id);
-      environmentNodes.push({ id: edge.node.id, unmergedChangesCount: edge.node.unmergedChangesCount });
+      // Railway's public schema makes this count nullable, and its official
+      // client interprets null as no staged changes. A missing field remains
+      // invalid so partial observations still fail closed.
+      environmentNodes.push({ id: edge.node.id, unmergedChangesCount: unmergedChangesCount ?? 0 });
     }
     const environmentNode = environmentNodes.find((candidate) => candidate.id === environmentId);
     if (!environmentNode) {
