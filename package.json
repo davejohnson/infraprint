@@ -78,7 +78,7 @@
     "@google-cloud/cloud-sql-connector": "1.10.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "better-sqlite3": "^13.0.3",
-    "google-auth-library": "^10.9.0",
+    "google-auth-library": "^11.0.2",
     "graphql": "^16.9.0",
     "graphql-request": "^7.0.0",
     "pg": "^8.17.2",
