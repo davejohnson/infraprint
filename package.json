@@ -75,7 +75,7 @@
     "@azure/identity": "^4.13.1",
     "@azure/storage-blob": "^12.33.0",
     "@bitwarden/sdk-napi": "^1.0.0",
-    "@google-cloud/cloud-sql-connector": "1.10.0",
+    "@google-cloud/cloud-sql-connector": "1.11.3",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "better-sqlite3": "^13.0.3",
     "google-auth-library": "^10.9.0",
