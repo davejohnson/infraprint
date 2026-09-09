@@ -194,6 +194,12 @@ describe('hv_runs', () => {
         overrides: {
           envVarKeys: ['DEBUG'],
           envVarsEncrypted: 'encrypted-debug-value',
+          envFileKeys: ['SESSION_SECRET'],
+          envFileVarsEncrypted: 'encrypted-env-file-value',
+          delegatedSecretKeys: ['AI_API_KEY'],
+          delegatedSecretVarsEncrypted: 'encrypted-delegated-value',
+          futureCustomEncrypted: 'encrypted-future-value',
+          safeMetadata: 'preserved',
         },
         steps: [
           { id: 'legacy', params: { vars: { SECRET_TOKEN: 'plaintext' }, keep: true } },
@@ -204,9 +210,17 @@ describe('hv_runs', () => {
 
     const get = await t.call('hv_runs', { action: 'get', runId: run.id });
     expect(get.ok).toBe(true);
-    expect(get.data.run.plan.overrides).toEqual({ envVarKeys: ['DEBUG'] });
+    expect(get.data.run.plan.overrides).toEqual({
+      envVarKeys: ['DEBUG'],
+      envFileKeys: ['SESSION_SECRET'],
+      delegatedSecretKeys: ['AI_API_KEY'],
+      safeMetadata: 'preserved',
+    });
     expect(get.data.run.plan.steps[0].params.vars).toEqual({ SECRET_TOKEN: '***' });
     expect(JSON.stringify(get.data.run.plan)).not.toContain('encrypted-debug-value');
+    expect(JSON.stringify(get.data.run.plan)).not.toContain('encrypted-env-file-value');
+    expect(JSON.stringify(get.data.run.plan)).not.toContain('encrypted-delegated-value');
+    expect(JSON.stringify(get.data.run.plan)).not.toContain('encrypted-future-value');
     expect(JSON.stringify(get.data.run.plan)).not.toContain('plaintext');
     await t.close();
   });

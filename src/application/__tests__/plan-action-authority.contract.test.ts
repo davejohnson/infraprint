@@ -40,6 +40,7 @@ import { MAINTENANCE_OPERATIONS } from '../../domain/services/maintenance-plan.s
 import { MESSAGING_OPERATIONS } from '../../domain/services/twilio-messaging.service.js';
 import { DOMAIN_DETACH_OPERATION } from '../../domain/services/domain-attach-policy.js';
 import {
+  hasExactPlanActionConfirmationAuthority,
   resolvePlanActionAuthority,
   type PlanMutationCapability,
 } from '../../domain/plan/action-authority.js';
@@ -696,6 +697,27 @@ const authorized: AuthorizedCase[] = [
     }),
   },
   {
+    label: 'Hypervibe-generated secret sync',
+    capability: 'hosting.delegated-secret.sync',
+    action: action({
+      id: delegatedSecretActionId('SESSION_SECRET'),
+      type: 'update',
+      kind: 'secret',
+      name: 'SESSION_SECRET',
+      operation: DELEGATED_SECRET_OPERATION,
+      metadata: {
+        ownership: 'hypervibe',
+        principal: 'hypervibe',
+        generator: 'random-base64url-32-v1',
+        generation: 1,
+        expectedValueHash: 'a'.repeat(64),
+        inputProvided: false,
+        valuePrepared: true,
+        services: ['web'],
+      },
+    }),
+  },
+  {
     label: 'GitHub delegated secret sync',
     capability: 'github.delegated-secret.sync',
     action: action({
@@ -1199,6 +1221,22 @@ describe('plan action mutation-authority contract', () => {
     expect(resolvePlanActionAuthority({ ...candidate, id: 'load-balancer:other.example.com' })).toBeNull();
   });
 
+  it.each([
+    { generator: undefined },
+    { generator: 'unknown-generator' },
+    { generation: 0 },
+    { expectedValueHash: 'not-a-sha256' },
+    { inputProvided: true },
+    { valuePrepared: false },
+    { services: ['web', 'web'] },
+  ])('rejects incomplete generated-secret authority metadata %#', (metadataPatch) => {
+    const candidate = authorized.find((entry) => entry.label === 'Hypervibe-generated secret sync')!.action;
+    expect(resolvePlanActionAuthority({
+      ...candidate,
+      metadata: { ...candidate.metadata, ...metadataPatch },
+    })).toBeNull();
+  });
+
   it('rejects retained database deletion without a complete non-empty provider scope', () => {
     const candidate = authorized.find((entry) => entry.label === 'retained database destroy')!.action;
     expect(resolvePlanActionAuthority({
@@ -1420,6 +1458,28 @@ describe('plan action mutation-authority contract', () => {
     const candidate = authorized.find((entry) => entry.label === label)!.action;
     expect(resolvePlanActionAuthority({ ...candidate, dataBearing: undefined })).toBeNull();
     expect(resolvePlanActionAuthority({ ...candidate, requiresConfirm: undefined })).toBeNull();
+  });
+
+  it('requires both persisted and caller confirmation authority for a consequential transition', () => {
+    const candidate = authorized.find((entry) => entry.label === 'Hypervibe-generated secret sync')!.action;
+    const confirmationGated = { ...candidate, requiresConfirm: true as const };
+    const confirmedActionIds = new Set([candidate.id]);
+
+    expect(hasExactPlanActionConfirmationAuthority(
+      confirmationGated,
+      true,
+      confirmedActionIds
+    )).toBe(true);
+    expect(hasExactPlanActionConfirmationAuthority(
+      { ...confirmationGated, requiresConfirm: undefined },
+      true,
+      confirmedActionIds
+    )).toBe(false);
+    expect(hasExactPlanActionConfirmationAuthority(
+      candidate,
+      false,
+      new Set()
+    )).toBe(true);
   });
 
   it('grants no mutation authority to noop or unknown actions', () => {

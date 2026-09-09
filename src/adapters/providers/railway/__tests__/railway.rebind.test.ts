@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import { ClientError } from 'graphql-request';
+import { GraphQLError } from 'graphql';
 import { RailwayAdapter } from '../railway.adapter.js';
 import type { Environment } from '../../../../domain/entities/environment.entity.js';
 import type { Service } from '../../../../domain/entities/service.entity.js';
@@ -205,6 +207,75 @@ describe('RailwayAdapter stale binding recovery', () => {
     const upsertCall = request.mock.calls.find(([query]) => String(query).includes('variableCollectionUpsert'))!;
     expect(String(upsertCall[0])).toContain('skipDeploys');
     expect(upsertCall[1]).toMatchObject({ skipDeploys: true });
+  });
+
+  it('scrubs exact environment values from GraphQL failures returned to direct callers', async () => {
+    const suppliedValue = 'generated-session-secret-graphql-sentinel';
+    const request = vi.fn()
+      .mockResolvedValueOnce({
+        project: {
+          environments: {
+            edges: [{ node: { id: 'env-staging', name: 'staging' } }],
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        project: {
+          services: {
+            edges: [{ node: { id: 'svc-web', name: 'web' } }],
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        service: {
+          serviceInstances: {
+            edges: [{ node: { environmentId: 'env-staging' } }],
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        service: {
+          serviceInstances: {
+            edges: [{ node: { environmentId: 'env-staging' } }],
+          },
+        },
+      })
+      .mockRejectedValueOnce(new ClientError(
+        {
+          errors: [new GraphQLError(`Railway rejected ${suppliedValue}`, {
+            path: ['variableCollectionUpsert'],
+            extensions: { code: 'BAD_USER_INPUT' },
+          })],
+          status: 400,
+          headers: new Headers(),
+          body: '',
+        },
+        {
+          query: 'mutation UpsertVariables',
+          variables: { variables: { SESSION_SECRET: suppliedValue } },
+        }
+      ));
+
+    const adapter = new RailwayAdapter();
+    (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
+
+    const receipt = await adapter.setEnvVars(
+      makeEnv({
+        projectId: 'proj-railway',
+        environmentId: 'env-staging',
+        services: { web: { serviceId: 'svc-web' } },
+      }),
+      makeService('web'),
+      { SESSION_SECRET: suppliedValue },
+      { deferDeployment: true }
+    );
+
+    expect(receipt).toMatchObject({
+      success: false,
+      message: 'Failed to set environment variables',
+      error: 'Railway rejected [redacted] (code: BAD_USER_INPUT, path: variableCollectionUpsert)',
+    });
+    expect(JSON.stringify(receipt)).not.toContain(suppliedValue);
   });
 
   it('deletes only explicitly named variables and never returns their values', async () => {

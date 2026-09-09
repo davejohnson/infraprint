@@ -175,10 +175,15 @@ exact detach. Cloud Run stays DNS-only during its native certificate flow.
 GitHub Pages custom domains use the separate project-level `github.pages`
 lifecycle.
 
-### 6. Supply Secrets (Optional)
+### 6. Handle application secrets
 
-Declare delegated secret slots in the spec, then supply local or secret-manager
-references when planning:
+Let Hypervibe create opaque application secrets whenever the app does not need
+a value issued by somebody else. A declared Hypervibe-owned session secret is
+generated, encrypted into the plan, and installed during apply without asking
+the user to invent or copy a value.
+
+For credentials issued by another system or owned by another person, declare a
+delegated slot and supply a local or secret-manager reference when planning:
 
 ```
 You: "Connect to Vault at https://vault.mycompany.com"
@@ -525,6 +530,38 @@ infrastructure owner. It should not assume that every coder belongs in each
 hosting, data, DNS, or integration provider account. This stays local and repo-backed; it
 does not require a new Hypervibe web service or shared drift database.
 
+### Hypervibe-generated application secrets
+
+Use a Hypervibe-owned slot for opaque runtime values the application needs but
+the user should never have to choose, see, or paste:
+
+```json
+{
+  "secrets": {
+    "SESSION_SECRET": {
+      "ownership": "hypervibe",
+      "generator": "random-base64url-32-v1",
+      "generation": 1,
+      "environments": ["production"]
+    }
+  }
+}
+```
+
+`hv_plan` derives a cryptographically strong value scoped to the project,
+environment, key, generator, and generation. It freezes that value only inside
+the encrypted plan; `hv_apply` installs it in every service and records only a
+hash plus generator provenance. The value never appears in the spec, local env
+templates, previews, status, logs, or receipts. Replanning on the same Hypervibe
+installation produces the same value, including after a partial provider
+failure, so a retry cannot split services across different session secrets.
+
+Increment `generation` only for an intentional rotation. Replacing a live
+secret is confirmation-gated because it can sign users out or invalidate other
+application state. Back up Hypervibe's `.secret-key` (or keep a stable
+`HYPERVIBE_SECRET_KEY` in a hosted installation): Hypervibe blocks rather than
+silently rotating if it cannot reproduce an accepted generated value.
+
 ### Delegated secrets
 
 Use a delegated secret slot when a collaborator, customer, or app owner should
@@ -593,7 +630,7 @@ If a machine or local Hypervibe database is lost, recloning the committed `.hype
 
 When `.env.<environment>` or repo `.env` exists, `hv_plan` considers it as a local deploy input. Environment-specific files such as `.env.production` and `.env.staging` win over `.env`. Hypervibe does **not** blindly publish every key. The default policy is `envFile.mode: "runtime"`: Hypervibe syncs high-confidence app runtime keys such as `SENDGRID_API_KEY`, `SESSION_SECRET`, `*_URL`, `*_TOKEN`, `*_SECRET`, `APP_*`, `VITE_*`, and similar names; it treats blank assignments as missing; it skips provider/control-plane credentials such as `HYPERVIBE_*`, `RAILWAY_API_TOKEN`, `GITHUB_TOKEN`, and `CLOUDFLARE_API_TOKEN`; it skips local-looking runtime values such as `localhost`, `127.0.0.1`, `0.0.0.0`, `host.docker.internal`, `.local`, and `.internal`; and it reports affected key names in the plan.
 
-When a spec is written from its matching checkout, Hypervibe non-destructively prepares both `.env` and `.env.example` with the exact delegated-secret and `envFile.include` names declared by that project—for example, `RECAPTCHA_V3_SITE_KEY=` and `RECAPTCHA_V3_SECRET_KEY=`. Every slot gets a short comment; existing values, owner comments, and ordering are preserved, while stale Hypervibe-owned comments are refreshed. The tracked `.env.example` stays value-free and points people to the private file. Actual missing connections add only their provider-declared local inputs, such as `HYPERVIBE_RAILWAY_TOKEN`, rather than every credential Hypervibe supports. Hypervibe first proves each exact private path is a regular, untracked, repository-ignored file (adding root rules such as `/.env` or `/.env.production`, plus `!/.env.example` only when needed), refuses symlinks and tracked secret files, creates new private env files with mode `0600`, and removes group/world access from an existing private file without adding owner permissions. The receipt reports when permissions changed.
+When a spec is written from its matching checkout, Hypervibe non-destructively prepares both `.env` and `.env.example` with the exact delegated-secret and `envFile.include` names declared by that project—for example, `RECAPTCHA_V3_SITE_KEY=` and `RECAPTCHA_V3_SECRET_KEY=`. Hypervibe-owned generated secrets are deliberately omitted because there is nothing for the user to fill in. Every input slot gets a short comment; existing values, owner comments, and ordering are preserved, while stale Hypervibe-owned comments are refreshed. The tracked `.env.example` stays value-free and points people to the private file. Actual missing connections add only their provider-declared local inputs, such as `HYPERVIBE_RAILWAY_TOKEN`, rather than every credential Hypervibe supports. Hypervibe first proves each exact private path is a regular, untracked, repository-ignored file (adding root rules such as `/.env` or `/.env.production`, plus `!/.env.example` only when needed), refuses symlinks and tracked secret files, creates new private env files with mode `0600`, and removes group/world access from an existing private file without adding owner permissions. The receipt reports when permissions changed.
 
 Tune this per environment in `.hypervibe/spec.json`:
 

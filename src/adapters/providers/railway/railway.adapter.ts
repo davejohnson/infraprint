@@ -64,6 +64,7 @@ import type {
   ProviderEnvironmentVariablesRequest,
   ProviderEnvironmentVariablesResult,
 } from '../../../domain/ports/provider-env-vars.port.js';
+import { redactExactValues } from '../../../utils/redact-exact-values.js';
 
 // Credentials schema for self-registration
 export const RailwayCredentialsSchema = z.object({
@@ -3071,6 +3072,7 @@ export class RailwayAdapter implements
     if (!this.client) {
       throw new Error('Not connected. Call connect() first.');
     }
+    const safeReceipt = (receipt: Receipt): Receipt => redactExactValues(receipt, Object.values(vars));
 
     const bindings = environment.platformBindings as {
       projectId?: string;
@@ -3081,20 +3083,20 @@ export class RailwayAdapter implements
     let environmentId = bindings.environmentId;
 
     if (!projectId) {
-      return {
+      return safeReceipt({
         success: false,
         message: 'No Railway project bound to this environment',
-      };
+      });
     }
 
     try {
       environmentId = await this.resolveRailwayEnvironmentId(projectId, environment);
 
       if (!environmentId) {
-        return {
+        return safeReceipt({
           success: false,
           message: 'No Railway environment ID available for variable update',
-        };
+        });
       }
 
       const serviceResolution = await this.resolveServiceIdForEnvironment(
@@ -3105,7 +3107,7 @@ export class RailwayAdapter implements
       );
       const railwayServiceId = serviceResolution.serviceId;
       if (!railwayServiceId) {
-        return {
+        return safeReceipt({
           success: false,
           message: `Service ${service.name} not found in Railway environment ${environment.name}`,
           data: {
@@ -3116,7 +3118,7 @@ export class RailwayAdapter implements
               ? { staleBinding: true, ignoredBoundServiceId: serviceResolution.ignoredBoundServiceId }
               : {}),
           },
-        };
+        });
       }
 
       const mutation = gql`
@@ -3138,7 +3140,7 @@ export class RailwayAdapter implements
         environmentId
       );
       if (!ensuredInstance.success) {
-        return {
+        return safeReceipt({
           success: false,
           message: `Railway service ${service.name} is missing an instance in environment ${environment.name}`,
           error: ensuredInstance.error,
@@ -3147,7 +3149,7 @@ export class RailwayAdapter implements
             serviceId: railwayServiceId,
             environmentId,
           },
-        };
+        });
       }
 
       let rolloutBaseline: { state: 'present' | 'absent' | 'unknown'; deploymentId?: string } | undefined;
@@ -3192,7 +3194,7 @@ export class RailwayAdapter implements
         }
       }
 
-      return {
+      return safeReceipt({
         success: true,
         message: `Set ${Object.keys(vars).length} environment variables`,
         data: {
@@ -3209,13 +3211,13 @@ export class RailwayAdapter implements
               }
             : {}),
         },
-      };
+      });
     } catch (error) {
-      return {
+      return safeReceipt({
         success: false,
         message: 'Failed to set environment variables',
-        error: String(error),
-      };
+        error: this.describeError(error),
+      });
     }
   }
 

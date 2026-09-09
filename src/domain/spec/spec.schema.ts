@@ -778,6 +778,28 @@ export const delegatedSecretSpecSchema = z.object({
   }
 });
 
+export const hypervibeRandomSecretSpecSchema = z.object({
+  /** Hypervibe generates and owns this value; users never supply it. */
+  ownership: z.literal('hypervibe'),
+  /** Stable, opinionated generation contract. */
+  generator: z.literal('random-base64url-32-v1'),
+  /** Incrementing this value requests a reviewed rotation. */
+  generation: z.number().int().positive().default(1),
+  /** Runtime environments in which this secret must be injected. */
+  environments: z.array(z.string().min(1)).min(
+    1,
+    'Hypervibe-owned secrets require at least one runtime environment'
+  ),
+}).strict();
+
+export const hypervibeSecretSpecSchema = hypervibeRandomSecretSpecSchema;
+
+/** Existing specs default to delegated; Hypervibe ownership is always explicit. */
+export const projectSecretSpecSchema = z.union([
+  delegatedSecretSpecSchema,
+  hypervibeSecretSpecSchema,
+]);
+
 export const migrationsSpecSchema = z.object({
   mode: z.enum(['none', 'releaseCommand', 'tool']),
   runInDeploy: z.boolean().optional(),
@@ -1970,7 +1992,7 @@ export const projectSpecSchema = z.object({
   collaboration: collaborationSpecSchema.optional(),
   secrets: z.record(
     z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'secret names must be valid environment variable names'),
-    delegatedSecretSpecSchema
+    projectSecretSpecSchema
   ).default({}),
   environments: z.record(z.string().min(1), environmentSpecSchema),
 }).strict().superRefine((spec, ctx) => {
@@ -2125,9 +2147,12 @@ export const projectSpecSchema = z.object({
       path: ['environments'],
     });
   }
-  const githubSecretKeys = Object.entries(spec.secrets)
-    .filter(([, secret]) => secret.githubActions?.repository || secret.githubActions?.environments.length)
-    .map(([key]) => key);
+  const githubSecretKeys = Object.entries(spec.secrets).flatMap(([key, secret]) =>
+    secret.ownership === 'delegated'
+      && (secret.githubActions?.repository || secret.githubActions?.environments.length)
+      ? [key]
+      : []
+  );
   if (githubSecretKeys.length > 0 && (!spec.github || spec.github.enabled === false)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -2136,12 +2161,15 @@ export const projectSpecSchema = z.object({
     });
   }
   for (const [key, secret] of Object.entries(spec.secrets)) {
+    const secretKind = secret.ownership === 'delegated'
+      ? 'delegated secret'
+      : 'Hypervibe-owned secret';
     const seen = new Set<string>();
     for (const environmentName of secret.environments) {
       if (seen.has(environmentName)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `delegated secret "${key}" lists environment "${environmentName}" more than once`,
+          message: `${secretKind} "${key}" lists environment "${environmentName}" more than once`,
           path: ['secrets', key, 'environments'],
         });
         continue;
@@ -2152,7 +2180,7 @@ export const projectSpecSchema = z.object({
       if (!environment) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `delegated secret "${key}" targets unknown environment "${environmentName}"`,
+          message: `${secretKind} "${key}" targets unknown environment "${environmentName}"`,
           path: ['secrets', key, 'environments'],
         });
         continue;
@@ -2160,35 +2188,35 @@ export const projectSpecSchema = z.object({
       if (Object.keys(environment.services).length === 0) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `delegated secret "${key}" requires at least one service in environment "${environmentName}"`,
+          message: `${secretKind} "${key}" requires at least one service in environment "${environmentName}"`,
           path: ['secrets', key, 'environments'],
         });
       }
       if (key in environment.envVars) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `delegated secret "${key}" cannot also be declared in environments.${environmentName}.envVars`,
+          message: `${secretKind} "${key}" cannot also be declared in environments.${environmentName}.envVars`,
           path: ['environments', environmentName, 'envVars', key],
         });
       }
       if (environment.envVarExceptions?.includes(key)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `delegated secret "${key}" cannot also be an environment variable exception in "${environmentName}"`,
+          message: `${secretKind} "${key}" cannot also be an environment variable exception in "${environmentName}"`,
           path: ['environments', environmentName, 'envVarExceptions'],
         });
       }
       if (environment.envFile?.include.includes(key)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `delegated secret "${key}" cannot be selected through environments.${environmentName}.envFile.include`,
+          message: `${secretKind} "${key}" cannot be selected through environments.${environmentName}.envFile.include`,
           path: ['environments', environmentName, 'envFile', 'include'],
         });
       }
       if (environment.removeEnvVars?.includes(key)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `delegated secret "${key}" cannot also be retired in environment "${environmentName}"`,
+          message: `${secretKind} "${key}" cannot also be retired in environment "${environmentName}"`,
           path: ['environments', environmentName, 'removeEnvVars'],
         });
       }
@@ -2198,7 +2226,7 @@ export const projectSpecSchema = z.object({
       if (databaseAliasServices.length > 0) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `delegated secret "${key}" cannot also be a managed database alias on service(s): ${databaseAliasServices.join(', ')}`,
+          message: `${secretKind} "${key}" cannot also be a managed database alias on service(s): ${databaseAliasServices.join(', ')}`,
           path: ['secrets', key],
         });
       }
@@ -2218,21 +2246,21 @@ export const projectSpecSchema = z.object({
       if (stripeManagedKeys.has(key)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `delegated secret "${key}" cannot also be managed by Stripe environment sync in "${environmentName}"`,
+          message: `${secretKind} "${key}" cannot also be managed by Stripe environment sync in "${environmentName}"`,
           path: ['secrets', key],
         });
       }
       if (environment.email.enabled && (EMAIL_MANAGED_ENV_KEYS as readonly string[]).includes(key)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `delegated secret "${key}" cannot also be managed by email desired state in "${environmentName}"`,
+          message: `${secretKind} "${key}" cannot also be managed by email desired state in "${environmentName}"`,
           path: ['secrets', key],
         });
       }
       if (environment.messaging && (MESSAGING_MANAGED_ENV_KEYS as readonly string[]).includes(key)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `delegated secret "${key}" cannot also be managed by messaging desired state in "${environmentName}"`,
+          message: `${secretKind} "${key}" cannot also be managed by messaging desired state in "${environmentName}"`,
           path: ['secrets', key],
         });
       }
@@ -2266,6 +2294,9 @@ export type IosTestflightGroupSpec = z.infer<typeof iosTestflightGroupSpecSchema
 export type DomainRegistrationSpec = z.infer<typeof domainRegistrationSpecSchema>;
 export type EnvFileSpec = z.infer<typeof envFileSpecSchema>;
 export type DelegatedSecretSpec = z.infer<typeof delegatedSecretSpecSchema>;
+export type HypervibeRandomSecretSpec = z.infer<typeof hypervibeRandomSecretSpecSchema>;
+export type HypervibeSecretSpec = z.infer<typeof hypervibeSecretSpecSchema>;
+export type ProjectSecretSpec = z.infer<typeof projectSecretSpecSchema>;
 export type CollaborationSpec = z.infer<typeof collaborationSpecSchema>;
 export type GitHubScheduleSpec = z.infer<typeof githubScheduleSpecSchema>;
 export type GitHubAutomationSpec = z.infer<typeof githubAutomationSpecSchema>;

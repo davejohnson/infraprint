@@ -200,6 +200,48 @@ describe('repo local env file', () => {
     }
   });
 
+  it('omits Hypervibe-owned secrets from local input requirements', () => {
+    const spec = projectSpecSchema.parse({
+      version: 1,
+      project: 'generated-secrets-stay-in-plans',
+      secrets: {
+        USER_SUPPLIED_TOKEN: {
+          principal: 'github:alice',
+          environments: ['production'],
+        },
+        SESSION_SECRET: {
+          ownership: 'hypervibe',
+          generator: 'random-base64url-32-v1',
+          environments: ['production'],
+        },
+        APP_SIGNING_SECRET: {
+          ownership: 'hypervibe',
+          generator: 'random-base64url-32-v1',
+          environments: ['production'],
+        },
+      },
+      environments: {
+        production: {
+          hosting: { provider: 'railway' },
+          services: { web: {} },
+          envFile: {
+            mode: 'explicit',
+            include: ['CUSTOM_RUNTIME_VALUE'],
+          },
+        },
+      },
+    });
+
+    const requirements = specLocalEnvRequirements(spec);
+
+    expect(requirements.map((requirement) => requirement.key)).toEqual([
+      'USER_SUPPLIED_TOKEN',
+      'CUSTOM_RUNTIME_VALUE',
+    ]);
+    expect(JSON.stringify(requirements)).not.toContain('SESSION_SECRET');
+    expect(JSON.stringify(requirements)).not.toContain('APP_SIGNING_SECRET');
+  });
+
   it('fails closed instead of adding ignore rules around an already-tracked env file', () => {
     const root = mkdtempSync(path.join(tmpdir(), 'hypervibe-tracked-env-'));
     initRepo(root);

@@ -5,6 +5,7 @@ import { parseHostingBindings, type IHostingAdapter } from '../ports/hosting.por
 import type { Receipt } from '../ports/provider.port.js';
 import { isProviderEnvironmentVariablesAdapter } from '../ports/provider-env-vars.port.js';
 import { providerRegistry } from '../registry/provider.registry.js';
+import { redactExactValues } from '../../utils/redact-exact-values.js';
 import { adapterFactory } from './adapter.factory.js';
 
 export const HOSTING_ENV_REMOVE_OPERATION = 'hostingEnvRemove';
@@ -79,29 +80,45 @@ export async function syncHostingEnvVars(params: {
 
   const deferDeployment = params.deferDeployment === true
     && adapter.capabilities?.supportsDeferredDeploy === true;
-  const receipt = deferDeployment
-    ? await adapter.setEnvVars(
-      params.environment,
-      params.service,
-      params.vars,
-      { deferDeployment: true }
-    )
-    : await adapter.setEnvVars(
-      params.environment,
-      params.service,
-      params.vars
-    );
-  return {
-    ...receipt,
-    provider,
-    data: {
-      ...(receipt.data ?? {}),
+  const exactValues = Object.values(params.vars);
+  try {
+    const receipt = deferDeployment
+      ? await adapter.setEnvVars(
+        params.environment,
+        params.service,
+        params.vars,
+        { deferDeployment: true }
+      )
+      : await adapter.setEnvVars(
+        params.environment,
+        params.service,
+        params.vars
+      );
+    return redactExactValues({
+      ...receipt,
       provider,
-      service: params.service.name,
-      variableCount: Object.keys(params.vars).length,
-      ...(deferDeployment ? { deploymentDeferred: true } : {}),
-    },
-  };
+      data: {
+        ...(receipt.data ?? {}),
+        provider,
+        service: params.service.name,
+        variableCount: Object.keys(params.vars).length,
+        ...(deferDeployment ? { deploymentDeferred: true } : {}),
+      },
+    }, exactValues);
+  } catch (error) {
+    return redactExactValues({
+      success: false,
+      message: `Failed to sync environment variables with ${displayName}`,
+      error: error instanceof Error ? error.message : String(error),
+      provider,
+      data: {
+        provider,
+        service: params.service.name,
+        variableCount: Object.keys(params.vars).length,
+        ...(deferDeployment ? { deploymentDeferred: true } : {}),
+      },
+    }, exactValues);
+  }
 }
 
 export async function removeHostingEnvVars(params: {

@@ -194,6 +194,41 @@ describe('hosting env var tools', () => {
     expect(setEnvCalls[0].vars).toEqual({ SENDGRID_API_KEY: 'SG.test-key' });
   });
 
+  it('scrubs exact supplied values from every nested hosting receipt field', async () => {
+    const { project, environment, service } = await setupCloudRunProject();
+    const { adapter } = stubCloudRunHostingAdapter();
+    const suppliedValue = 'generated-session-secret-regression-sentinel';
+    adapter.setEnvVars = vi.fn().mockResolvedValue({
+      success: false,
+      message: `Provider rejected ${suppliedValue}`,
+      error: `GraphQL request variables included ${suppliedValue}`,
+      data: {
+        request: {
+          variables: [{ value: suppliedValue }],
+        },
+      },
+    });
+
+    const result = await syncHostingEnvVars({
+      project,
+      environment,
+      service,
+      vars: { SESSION_SECRET: suppliedValue },
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      message: 'Provider rejected [redacted]',
+      error: 'GraphQL request variables included [redacted]',
+      data: {
+        request: {
+          variables: [{ value: '[redacted]' }],
+        },
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain(suppliedValue);
+  });
+
   it('SendGrid setup resolves the Cloud Run provider from generic bindings', async () => {
     const { project, environment, service } = await setupCloudRunProject();
     new EnvironmentRepository().update(environment.id, {

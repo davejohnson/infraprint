@@ -1,13 +1,38 @@
 import sodium from 'sodium-native';
 import fs from 'fs';
 import path from 'path';
-import { randomUUID } from 'crypto';
+import { createHmac, randomUUID, type Hmac } from 'crypto';
 import {
   ensurePrivateDirectory,
   getDataDir,
   hardenPrivateFile,
   PRIVATE_FILE_MODE,
 } from '../storage/paths.js';
+
+const SECRET_DERIVATION_LABEL = 'hypervibe.secret-store.derived-secret.v1';
+const MAX_DERIVATION_DOMAIN_BYTES = 128;
+const MAX_DERIVATION_CONTEXT_FIELDS = 32;
+const MAX_DERIVATION_CONTEXT_KEY_BYTES = 128;
+const MAX_DERIVATION_CONTEXT_VALUE_BYTES = 4096;
+
+function compareContextKeys(
+  [left]: readonly [string, string],
+  [right]: readonly [string, string]
+): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function updateLengthPrefixedUtf8(
+  hmac: Hmac,
+  lengthBuffer: Buffer,
+  value: string
+): void {
+  lengthBuffer.writeUInt32BE(Buffer.byteLength(value, 'utf-8'));
+  hmac.update(lengthBuffer);
+  hmac.update(value, 'utf-8');
+}
 
 export class SecretStore {
   private key: Buffer;
@@ -171,6 +196,70 @@ export class SecretStore {
 
   decryptObject<T>(encrypted: string): T {
     return JSON.parse(this.decrypt(encrypted)) as T;
+  }
+
+  /**
+   * Derive stable, opaque secret material without exposing the store's root
+   * key. The versioned label and length-prefixed, sorted context make the
+   * input encoding unambiguous; changing that encoding intentionally changes
+   * every derived value.
+   */
+  deriveSecret(
+    domain: string,
+    context: Readonly<Record<string, string>>
+  ): Buffer {
+    const domainBytes = Buffer.byteLength(domain, 'utf-8');
+    if (domainBytes === 0 || domainBytes > MAX_DERIVATION_DOMAIN_BYTES) {
+      throw new Error(
+        `Secret derivation domain must contain 1-${MAX_DERIVATION_DOMAIN_BYTES} UTF-8 bytes.`
+      );
+    }
+
+    const entries = Object.entries(context).sort(compareContextKeys);
+    if (
+      entries.length === 0
+      || entries.length > MAX_DERIVATION_CONTEXT_FIELDS
+    ) {
+      throw new Error(
+        `Secret derivation context must contain 1-${MAX_DERIVATION_CONTEXT_FIELDS} fields.`
+      );
+    }
+
+    for (const [key, value] of entries) {
+      const keyBytes = Buffer.byteLength(key, 'utf-8');
+      if (
+        keyBytes === 0
+        || keyBytes > MAX_DERIVATION_CONTEXT_KEY_BYTES
+      ) {
+        throw new Error(
+          `Secret derivation context keys must contain 1-${MAX_DERIVATION_CONTEXT_KEY_BYTES} UTF-8 bytes.`
+        );
+      }
+      if (typeof value !== 'string') {
+        throw new Error('Secret derivation context values must be strings.');
+      }
+      if (Buffer.byteLength(value, 'utf-8') > MAX_DERIVATION_CONTEXT_VALUE_BYTES) {
+        throw new Error(
+          `Secret derivation context values must contain at most ${MAX_DERIVATION_CONTEXT_VALUE_BYTES} UTF-8 bytes.`
+        );
+      }
+    }
+
+    const hmac = createHmac('sha256', this.key);
+    const lengthBuffer = Buffer.alloc(4);
+    try {
+      hmac.update(SECRET_DERIVATION_LABEL, 'utf-8');
+      updateLengthPrefixedUtf8(hmac, lengthBuffer, domain);
+      lengthBuffer.writeUInt32BE(entries.length);
+      hmac.update(lengthBuffer);
+      for (const [key, value] of entries) {
+        updateLengthPrefixedUtf8(hmac, lengthBuffer, key);
+        updateLengthPrefixedUtf8(hmac, lengthBuffer, value);
+      }
+      return hmac.digest();
+    } finally {
+      lengthBuffer.fill(0);
+    }
   }
 }
 

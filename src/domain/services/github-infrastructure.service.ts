@@ -12,6 +12,7 @@ import type { Environment } from '../entities/environment.entity.js';
 import type { PlanAction } from '../plan/plan.types.js';
 import { hashEnvValue } from '../ports/observe.port.js';
 import type {
+  DelegatedSecretSpec,
   GitHubAutomationSpec,
   GitHubSpec,
   ProjectRuntimeSpec,
@@ -1363,7 +1364,7 @@ export function githubDelegatedSecretActionId(name: string, target: GitHubSecret
 }
 
 function githubSecretTargets(
-  secret: ProjectSpec['secrets'][string]
+  secret: DelegatedSecretSpec
 ): GitHubSecretTarget[] {
   return [
     ...(secret.githubActions?.repository ? [{ scope: 'repository' as const }] : []),

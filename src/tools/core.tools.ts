@@ -16,6 +16,8 @@ import { planDatabaseResilience } from '../domain/services/database-resilience-p
 import { planQueues } from '../domain/services/queue-plan.service.js';
 import { planStorage } from '../domain/services/storage-plan.service.js';
 import { planDelegatedSecrets } from '../domain/services/delegated-secret.service.js';
+import { deriveHypervibeSecretValues } from '../domain/services/hypervibe-secret-value.js';
+import { withReceiptValidatedManagedSecretBindings } from '../domain/services/managed-secret-binding-receipts.js';
 import { runtimeRolloutRequirements } from '../domain/services/runtime-rollout.service.js';
 import { planManagedCiDeploy } from '../domain/services/managed-ci.service.js';
 import { resolveDevOpsSelection } from '../domain/spec/devops-selection.js';
@@ -730,7 +732,7 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
 
   commands.register(
     'hv_plan',
-    'Observe live infrastructure, diff it against the desired spec, and persist an executable plan. Returns planId plus a compact review of non-noop actions; hv_apply requires that planId. scope="retained-cleanup" isolates confirm-gated destruction of exact abandoned hosting, database, cache, and provider-declared resource identities retained through hv_import; it excludes ordinary deployment, integrations, domain, email, and repository work. Missing connections block unsafe work. Delegated values are accepted only through secretRefs and are encrypted into the stored plan, never returned. Optional services restricts a full plan to selected services.',
+    'Observe live infrastructure, diff it against the desired spec, and persist an executable plan. Returns planId plus a compact review of non-noop actions; hv_apply requires that planId. scope="retained-cleanup" isolates confirm-gated destruction of exact abandoned hosting, database, cache, and provider-declared resource identities retained through hv_import; it excludes ordinary deployment, integrations, domain, email, and repository work. Missing connections block unsafe work. Hypervibe-owned application secrets are generated automatically inside the encrypted plan boundary. Externally owned values are accepted only through secretRefs and are never returned. Optional services restricts a full plan to selected services.',
     {
       project: projectField,
       env: envField,
@@ -861,7 +863,7 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
           after: 'Connect them for full convergence, or apply this plan to converge independent actions and fail only blocked actions.',
         });
       } else {
-        hint = `Apply with hv_apply planId="${result.planRunId}"${confirmIds.length ? ` and confirmActions=${JSON.stringify(confirmIds)} for confirm-gated billable or destructive actions` : ''}.`;
+        hint = `Apply with hv_apply planId="${result.planRunId}"${confirmIds.length ? ` and confirmActions=${JSON.stringify(confirmIds)} for consequential actions that require explicit confirmation` : ''}.`;
       }
 
       if (hardBlocked.length > 0) {
@@ -1113,8 +1115,9 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
         spec: specResult.spec,
         environmentName: envName,
         hostingProvider: envSpec.hosting.provider,
-        environment,
+        environment: withReceiptValidatedManagedSecretBindings(environment, ctx.repos.runs),
         observed,
+        generatedValues: deriveHypervibeSecretValues(specResult.spec, envName),
       });
       const delegatedSecretDrift = delegatedSecrets.actions.filter((action) => action.type !== 'noop');
       const stripeSync = await planStripeEnvironmentSync({
@@ -1246,6 +1249,7 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
             }
             : {}),
           inputRequired: delegatedSecrets.inputRequired.length > 0 ? delegatedSecrets.inputRequired : undefined,
+          secretBlockers: delegatedSecrets.blockers.length > 0 ? delegatedSecrets.blockers : undefined,
           blocked,
           ...(blocked.length > 0 ? connectionRecoveryDetails(blocked, { project: project.name, gitRemoteUrl: project.gitRemoteUrl }) : {}),
           ...(iosStatus ? { ios: iosStatus } : {}),
@@ -1274,6 +1278,8 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
                 ? 'Run hv_plan and hv_apply to converge the selected managed CI provider; use hv_ci_status for runs after configuration is active.'
               : delegatedSecrets.inputRequired.length > 0
                 ? 'Use a safe local secretRef if the value is available here; otherwise prepare a value-free handoff naming the delegated key, environment, and principal. Do not paste raw secret values into chat.'
+              : delegatedSecrets.blockers.length > 0
+                ? `Resolve the managed-secret safety block before planning: ${delegatedSecrets.blockers.map((entry) => entry.reason).join('; ')}.`
               : hasConfigurationDrift
                 ? 'Run hv_plan to get an executable plan for this drift.'
                 : restartRequired
@@ -1293,11 +1299,11 @@ export function registerCoreTools(commands: CommandRegistrar, ctx: CommandContex
 
   commands.register(
     'hv_apply',
-    'Apply a plan produced by hv_plan. Rejects stale plans (spec changed, infrastructure changed, plan expired, or already applied). Confirm-gated billable/destructive actions run only when their action ids are passed in confirmActions.',
+    'Apply a plan produced by hv_plan. Rejects stale plans (spec changed, infrastructure changed, plan expired, or already applied). Any consequential confirmation-gated action runs only when its exact action id is passed in confirmActions.',
     {
       project: projectField,
       planId: z.string().describe('Plan id returned by hv_plan'),
-      confirmActions: z.array(z.string()).optional().describe('Action ids for confirm-gated billable or destructive actions (e.g. ["domain:example.com:register", "database:provider:destroy"])'),
+      confirmActions: z.array(z.string()).optional().describe('Exact action ids for consequential confirmation-gated changes such as purchases, deletion, or an application-secret rotation.'),
     },
     wrapCommandHandler(async ({ project: projectRef, planId, confirmActions }) => {
       const project = ctx.resolveProjectOrThrow({ project: projectRef });

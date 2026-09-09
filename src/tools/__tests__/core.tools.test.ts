@@ -27,6 +27,7 @@ import { createToolContext } from '../../application/context.js';
 import { SpecStore } from '../../domain/spec/spec.store.js';
 import { projectSpecSchema } from '../../domain/spec/spec.schema.js';
 import type { PlanAction } from '../../domain/plan/plan.types.js';
+import { deriveHypervibeSecretValues } from '../../domain/services/hypervibe-secret-value.js';
 
 let tempDir: string;
 
@@ -2379,6 +2380,117 @@ describe('hv_plan / hv_status / hv_apply', () => {
     expect(status.data.inSync).toBe(false);
     const drift = status.data.drift.find((a: { id: string }) => a.id === 'service:web');
     expect(drift.type).toBe('update');
+    await t.close();
+  });
+
+  it('reports binding-only drift when a local managed-secret binding has a failed receipt', async () => {
+    const t = await makeClient();
+    const project = new ProjectRepository().create({
+      name: 'failed-secret-binding-status-app',
+      defaultPlatform: 'railway',
+    });
+    const spec = projectSpecSchema.parse({
+      version: 1,
+      project: project.name,
+      secrets: {
+        SESSION_SECRET: {
+          ownership: 'hypervibe',
+          generator: 'random-base64url-32-v1',
+          generation: 1,
+          environments: ['production'],
+        },
+      },
+      environments: {
+        production: {
+          hosting: { provider: 'railway' },
+          services: { web: { startCommand: 'npm start' } },
+        },
+      },
+    });
+    new SpecStore().replace(project, spec);
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'production',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'rp-1',
+        environmentId: 're-1',
+        services: { web: { serviceId: 's-1' } },
+      },
+    });
+    new ServiceRepository().create({
+      projectId: project.id,
+      name: 'web',
+      buildConfig: { workloadKind: 'web', startCommand: 'npm start' },
+      envVarSpec: {},
+    });
+    const runs = new RunRepository();
+    const plan = runs.create({
+      projectId: project.id,
+      environmentId: environment.id,
+      type: 'plan',
+      plan: {},
+    });
+    const reservation = runs.reserveApply({
+      projectId: project.id,
+      environmentId: environment.id,
+      planRunId: plan.id,
+      environmentName: environment.name,
+      specRevision: 1,
+    });
+    if (!reservation.reserved) throw new Error('Expected a local apply reservation');
+    runs.addReceipt(reservation.run.id, {
+      step: 'secret:SESSION_SECRET',
+      status: 'failure',
+      error: 'repository export failed',
+      timestamp: new Date().toISOString(),
+    });
+    runs.updateStatus(reservation.run.id, 'failed', 'repository export failed');
+    const generatedValue = deriveHypervibeSecretValues(spec, 'production').SESSION_SECRET;
+    new EnvironmentRepository().updatePlatformBindings(environment.id, {
+      delegatedEnvBindings: [{
+        name: 'SESSION_SECRET',
+        principal: 'hypervibe',
+        valueHash: hashEnvValue(generatedValue),
+        source: 'hypervibe-generated',
+        generator: 'random-base64url-32-v1',
+        generation: 1,
+        syncedAt: new Date().toISOString(),
+        applyRunId: reservation.run.id,
+        actionId: 'secret:SESSION_SECRET',
+      }],
+    });
+    verifyRailwayConnection();
+    mockObserved({
+      provider: 'railway',
+      observedAt: new Date().toISOString(),
+      projectExists: true,
+      projectId: 'rp-1',
+      environmentId: 're-1',
+      services: [{
+        name: 'web',
+        externalId: 's-1',
+        workloadKind: 'web',
+        customDomains: [],
+        config: { startCommand: 'npm start' },
+        envVarKeys: ['SESSION_SECRET'],
+        envVarHashes: { SESSION_SECRET: hashEnvValue(generatedValue) },
+        status: 'running',
+      }],
+      databases: [],
+      partial: false,
+      warnings: [],
+    });
+
+    const status = await t.call('hv_status', { project: project.name, env: 'production' });
+
+    expect(status.ok).toBe(true);
+    expect(status.data.inSync).toBe(false);
+    expect(status.data.drift).toContainEqual(expect.objectContaining({
+      id: 'secret:SESSION_SECRET',
+      type: 'update',
+      metadata: expect.objectContaining({ bindingOnly: true }),
+    }));
     await t.close();
   });
 

@@ -199,7 +199,15 @@ export interface ActionResult {
   data?: Record<string, unknown>;
 }
 
-export type ActionHandler = (action: PlanAction) => Promise<ActionResult>;
+export interface ActionExecutionContext {
+  /** Durable id of the apply run that will receive this action's receipt. */
+  applyRunId: string;
+}
+
+export type ActionHandler = (
+  action: PlanAction,
+  context: ActionExecutionContext
+) => Promise<ActionResult>;
 
 export interface ConvergeParams {
   planRunId: string;
@@ -284,6 +292,7 @@ export function fingerprintObservedState(observed: ObservedState): string {
         config: s.config,
         source: s.source ?? null,
         sourceState: s.sourceState ?? null,
+        envVarKeys: [...s.envVarKeys].sort(),
         envVarHashes: Object.fromEntries(Object.entries(s.envVarHashes).sort(([a], [b]) => a.localeCompare(b))),
         deployment: s.deployment ?? null,
         maintenance: s.maintenance ?? null,
@@ -557,7 +566,7 @@ export class ConvergeExecutor {
       };
 
       try {
-        const result = await params.handler(action);
+        const result = await params.handler(action, { applyRunId: applyRun.id });
         if (result.status === 'pending') {
           pending = true;
           recordReceipt('pending', result.message, result.error, result.data);

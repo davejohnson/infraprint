@@ -597,7 +597,35 @@ When adding or changing token guidance, include all of these details:
 
 Tests should fail if new provider guidance omits these basics. Update `src/domain/services/__tests__/connection-guidance.test.ts` and add provider-specific verification-error assertions for ambiguous or commonly miscreated tokens.
 
-## Delegated Secrets
+## Runtime Secrets
+
+`ProjectSpec.secrets` has two explicit ownership modes. Use Hypervibe ownership
+for opaque application values a human should not choose; use delegated
+ownership only for a value issued or controlled outside Hypervibe.
+
+Hypervibe-owned secrets declare a versioned generator, generation, and runtime
+environments. Planning derives strong, stable material from SecretStore's
+private root key with project/environment/key/generator/generation domain
+separation, then stores the provider-ready value only in the existing encrypted
+plan override. The value is excluded from `secretRefs`, ordinary `envVars`,
+deploy-env loading, `.env`, `.env.example`, previews, status, logs, receipts,
+and repository bindings. One value is sent to every declared service. A
+successful action records only its SHA-256 hash and generator/generation
+provenance, and binding persistence is part of action success rather than a
+post-apply best effort.
+
+Provider-confirmed absence is an automatic initial install. Replacing an
+existing random secret requires exact action confirmation. Unknown or masked
+live state without a matching accepted binding blocks mutation. A mismatch
+between an accepted generation's hash and newly derived material means the
+local root key changed; block and restore the original key instead of rotating.
+Apply recomputes whether the reviewed action is still a replacement from fresh
+provider and binding evidence. A replacement needs both its persisted
+`requiresConfirm` marker and exact caller confirmation before any provider
+write, so stripping confirmation metadata cannot turn a rotation into an
+automatic install.
+
+### Delegated secrets
 
 Delegated secrets are lifecycle-managed slots, not ordinary environment variables and not provider connections:
 
