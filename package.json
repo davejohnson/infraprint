@@ -50,6 +50,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:providers:roadmap": "vitest run --config vitest.provider-roadmap.config.ts",
+    "test:providers:upstream-contracts": "node scripts/check-railway-upstream-contract.mjs",
     "test:providers:live": "npm run build && vitest run test/provider-conformance/provider-lifecycle.live.test.ts --testTimeout=1200000",
     "test:providers:infrastructure-live": "npm run build && vitest run test/provider-conformance/provider-infrastructure.live.test.ts --testTimeout=5400000",
     "test:providers:managed-live": "npm run build && vitest run test/provider-conformance/provider-managed-workflow.live.test.ts --testTimeout=3600000",

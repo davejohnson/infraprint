@@ -10,6 +10,7 @@ function environment(): Environment {
 function bucketState(options: {
   buckets?: Array<{ id: string; name: string }>;
   config?: Record<string, { region?: string; isCreated?: boolean; isDeleted?: boolean }>;
+  omitBucketConfig?: boolean;
   unmergedChangesCount?: number | null;
   projectId?: string;
   environmentId?: string;
@@ -31,7 +32,10 @@ function bucketState(options: {
         }],
       },
     },
-    environment: { id: environmentId, config: { buckets: options.config ?? {} } },
+    environment: {
+      id: environmentId,
+      config: options.omitBucketConfig ? {} : { buckets: options.config ?? {} },
+    },
   };
 }
 
@@ -135,12 +139,56 @@ describe('Railway storage buckets', () => {
     await expect(adapter.observe(environment())).rejects.toThrow('bucket usage permission denied');
   });
 
+  it.each([
+    ['bucket inventory', {
+      project: {
+        id: 'rp', name: 'app',
+        environments: { edges: [{ node: { id: 're', name: 'staging', config: {} } }] },
+        services: { edges: [] }, plugins: { edges: [] },
+      },
+    }],
+    ['environment config', {
+      project: {
+        id: 'rp', name: 'app',
+        environments: { edges: [{ node: { id: 're', name: 'staging' } }] },
+        buckets: { edges: [] }, services: { edges: [] }, plugins: { edges: [] },
+      },
+    }],
+  ])('marks storage unknown when project details omit the %s', async (_label, response) => {
+    const request = vi.fn().mockResolvedValueOnce(response);
+    const adapter = new RailwayAdapter();
+    (adapter as unknown as { client: { request: typeof request } }).client = { request };
+
+    const result = await adapter.observe(environment());
+
+    expect(result.completeness).toMatchObject({ services: 'complete', storage: 'unknown' });
+    expect(result.partial).toBe(true);
+    expect(result.warnings).toEqual([expect.stringContaining('storage observation remains unknown')]);
+  });
+
+  it.each([
+    ['null environment config', null],
+    ['array bucket config', { buckets: [] }],
+    ['null bucket config', { buckets: null }],
+    ['malformed bucket instance', { buckets: { 'bucket-1': { isDeleted: 'no' } } }],
+  ])('rejects %s in project observation', async (_label, config) => {
+    const request = vi.fn().mockResolvedValueOnce({ project: {
+      id: 'rp', name: 'app',
+      environments: { edges: [{ node: { id: 're', name: 'staging', config } }] },
+      buckets: { edges: [] }, services: { edges: [] }, plugins: { edges: [] },
+    } });
+    const adapter = new RailwayAdapter();
+    (adapter as unknown as { client: { request: typeof request } }).client = { request };
+
+    await expect(adapter.observe(environment())).rejects.toThrow(/environment.*config/i);
+  });
+
   it('creates a project bucket and commits its environment instance', async () => {
     const request = vi.fn()
       .mockResolvedValueOnce(bucketState())
       .mockResolvedValueOnce({ bucketCreate: { id: 'bucket-1', name: 'uploads', projectId: 'rp' } })
       .mockResolvedValueOnce(bucketState({ buckets: [{ id: 'bucket-1', name: 'uploads' }] }))
-      .mockResolvedValueOnce({ environmentPatchCommit: true })
+      .mockResolvedValueOnce({ environmentPatchCommit: 'deployment-1' })
       .mockResolvedValueOnce(bucketState({
         buckets: [{ id: 'bucket-1', name: 'uploads' }],
         config: { 'bucket-1': { region: 'sjc', isCreated: true, isDeleted: false } },
@@ -156,6 +204,45 @@ describe('Railway storage buckets', () => {
     expect(request).toHaveBeenCalledTimes(5);
   });
 
+  it('treats an omitted empty bucket map as a complete empty configuration', async () => {
+    const request = vi.fn()
+      .mockResolvedValueOnce(bucketState({ omitBucketConfig: true }))
+      .mockResolvedValueOnce({ bucketCreate: { id: 'bucket-1', name: 'uploads', projectId: 'rp' } })
+      .mockResolvedValueOnce(bucketState({
+        buckets: [{ id: 'bucket-1', name: 'uploads' }],
+        omitBucketConfig: true,
+      }))
+      .mockResolvedValueOnce({ environmentPatchCommit: 'deployment-1' })
+      .mockResolvedValueOnce(bucketState({
+        buckets: [{ id: 'bucket-1', name: 'uploads' }],
+        config: { 'bucket-1': { region: 'sjc', isCreated: true, isDeleted: false } },
+      }));
+    const adapter = new RailwayAdapter();
+    (adapter as unknown as { client: { request: typeof request } }).client = { request };
+
+    const receipt = await adapter.ensureStorage(environment(), 'uploads', { region: 'sjc' });
+
+    expect(receipt).toMatchObject({ success: true, data: { externalId: 'bucket-1' } });
+    expect(request.mock.calls.some(([query]) => String(query).includes('bucketCreate'))).toBe(true);
+  });
+
+  it('accepts Railway\'s legacy boolean patch acknowledgement', async () => {
+    const request = vi.fn()
+      .mockResolvedValueOnce(bucketState())
+      .mockResolvedValueOnce({ bucketCreate: { id: 'bucket-1', name: 'uploads', projectId: 'rp' } })
+      .mockResolvedValueOnce(bucketState({ buckets: [{ id: 'bucket-1', name: 'uploads' }] }))
+      .mockResolvedValueOnce({ environmentPatchCommit: true })
+      .mockResolvedValueOnce(bucketState({
+        buckets: [{ id: 'bucket-1', name: 'uploads' }],
+        config: { 'bucket-1': { region: 'sjc', isCreated: true, isDeleted: false } },
+      }));
+    const adapter = new RailwayAdapter();
+    (adapter as unknown as { client: { request: typeof request } }).client = { request };
+
+    await expect(adapter.ensureStorage(environment(), 'uploads', { region: 'sjc' }))
+      .resolves.toMatchObject({ success: true });
+  });
+
   it('treats Railway\'s nullable staged-change count as no staged changes', async () => {
     const request = vi.fn()
       .mockResolvedValueOnce(bucketState({ unmergedChangesCount: null }))
@@ -164,7 +251,7 @@ describe('Railway storage buckets', () => {
         buckets: [{ id: 'bucket-1', name: 'uploads' }],
         unmergedChangesCount: null,
       }))
-      .mockResolvedValueOnce({ environmentPatchCommit: true })
+      .mockResolvedValueOnce({ environmentPatchCommit: 'deployment-1' })
       .mockResolvedValueOnce(bucketState({
         buckets: [{ id: 'bucket-1', name: 'uploads' }],
         config: { 'bucket-1': { region: 'sjc', isCreated: true, isDeleted: false } },
@@ -223,9 +310,21 @@ describe('Railway storage buckets', () => {
       project: bucketState().project,
       environment: { id: 're' },
     }],
-    ['missing bucket config', {
+    ['null bucket config', {
       project: bucketState().project,
-      environment: { id: 're', config: {} },
+      environment: { id: 're', config: { buckets: null } },
+    }],
+    ['malformed bucket config', {
+      project: bucketState().project,
+      environment: { id: 're', config: { buckets: [] } },
+    }],
+    ['invalid bucket region', {
+      project: bucketState().project,
+      environment: { id: 're', config: { buckets: { 'bucket-1': { region: null } } } },
+    }],
+    ['invalid bucket lifecycle flag', {
+      project: bucketState().project,
+      environment: { id: 're', config: { buckets: { 'bucket-1': { isCreated: 'yes' } } } },
     }],
     ['missing staged-change count', {
       project: {
@@ -415,12 +514,18 @@ describe('Railway storage buckets', () => {
     expect(request).toHaveBeenCalledTimes(3);
   });
 
-  it('rejects an unacknowledged environment patch and retains the created identity', async () => {
+  it.each([
+    ['false', { environmentPatchCommit: false }],
+    ['null', { environmentPatchCommit: null }],
+    ['empty string', { environmentPatchCommit: '' }],
+    ['missing field', {}],
+    ['wrong type', { environmentPatchCommit: 1 }],
+  ])('rejects a %s environment patch acknowledgement and retains the created identity', async (_label, acknowledgement) => {
     const request = vi.fn()
       .mockResolvedValueOnce(bucketState())
       .mockResolvedValueOnce({ bucketCreate: { id: 'bucket-1', name: 'uploads', projectId: 'rp' } })
       .mockResolvedValueOnce(bucketState({ buckets: [{ id: 'bucket-1', name: 'uploads' }] }))
-      .mockResolvedValueOnce({ environmentPatchCommit: false });
+      .mockResolvedValueOnce(acknowledgement);
     const adapter = new RailwayAdapter();
     (adapter as unknown as { client: { request: typeof request } }).client = { request };
 
@@ -439,7 +544,7 @@ describe('Railway storage buckets', () => {
       .mockResolvedValueOnce(bucketState())
       .mockResolvedValueOnce({ bucketCreate: { id: 'bucket-1', name: 'uploads', projectId: 'rp' } })
       .mockResolvedValueOnce(bucketState({ buckets: [{ id: 'bucket-1', name: 'uploads' }] }))
-      .mockResolvedValueOnce({ environmentPatchCommit: true })
+      .mockResolvedValueOnce({ environmentPatchCommit: 'deployment-1' })
       .mockResolvedValueOnce(bucketState({ buckets: [{ id: 'bucket-1', name: 'uploads' }] }));
     const adapter = new RailwayAdapter();
     (adapter as unknown as { client: { request: typeof request } }).client = { request };
@@ -460,7 +565,7 @@ describe('Railway storage buckets', () => {
     });
     const request = vi.fn()
       .mockResolvedValueOnce(active)
-      .mockResolvedValueOnce({ environmentPatchCommit: true })
+      .mockResolvedValueOnce({ environmentPatchCommit: 'deployment-1' })
       .mockResolvedValueOnce(bucketState({
         buckets: [{ id: 'bucket-1', name: 'uploads' }],
         config: { 'bucket-1': { region: 'sjc', isCreated: true, isDeleted: true } },
@@ -500,7 +605,7 @@ describe('Railway storage buckets', () => {
     });
     const request = vi.fn()
       .mockResolvedValueOnce(active)
-      .mockResolvedValueOnce({ environmentPatchCommit: true })
+      .mockResolvedValueOnce({ environmentPatchCommit: 'deployment-1' })
       .mockResolvedValueOnce(active);
     const adapter = new RailwayAdapter();
     (adapter as unknown as { client: { request: typeof request } }).client = { request };
@@ -538,5 +643,55 @@ describe('Railway storage buckets', () => {
       endpoint: 'https://storage.railway.app', accessKeyId: 'key', secretAccessKey: 'secret',
       bucket: 'uploads-hash', region: 'auto', urlStyle: 'virtual',
     });
+  });
+
+  it.each([
+    ['missing response field', {}],
+    ['no credentials', { bucketS3Credentials: [] }],
+    ['multiple credentials', { bucketS3Credentials: [
+      {
+        endpoint: 'https://storage.railway.app', accessKeyId: 'key-1', secretAccessKey: 'secret-1',
+        bucketName: 'uploads-hash', region: 'auto', urlStyle: 'virtual',
+      },
+      {
+        endpoint: 'https://storage.railway.app', accessKeyId: 'key-2', secretAccessKey: 'secret-2',
+        bucketName: 'uploads-hash', region: 'auto', urlStyle: 'virtual',
+      },
+    ] }],
+    ['empty credential field', { bucketS3Credentials: [{
+      endpoint: 'https://storage.railway.app', accessKeyId: '', secretAccessKey: 'secret',
+      bucketName: 'uploads-hash', region: 'auto', urlStyle: 'virtual',
+    }] }],
+    ['malformed credential entry', { bucketS3Credentials: [null] }],
+  ])('rejects %s instead of guessing S3 credentials', async (_label, response) => {
+    const request = vi.fn().mockResolvedValueOnce(response);
+    const adapter = new RailwayAdapter();
+    (adapter as unknown as { client: { request: typeof request } }).client = { request };
+
+    await expect(adapter.getStorageCredentials(environment(), 'bucket-1'))
+      .rejects.toThrow(/credentials|credential set/i);
+  });
+
+  it.each([
+    ['nullable details', { bucketInstanceDetails: null }],
+    ['missing details', {}],
+    ['missing object count', { bucketInstanceDetails: { sizeBytes: 42 } }],
+    ['negative size', { bucketInstanceDetails: { objectCount: 3, sizeBytes: -1 } }],
+    ['string count', { bucketInstanceDetails: { objectCount: '3', sizeBytes: 42 } }],
+  ])('rejects %s instead of reporting incomplete bucket usage', async (_label, usageResponse) => {
+    const request = vi.fn()
+      .mockResolvedValueOnce({ project: {
+        id: 'rp', name: 'app',
+        environments: { edges: [{
+          node: { id: 're', name: 'staging', config: { buckets: { 'bucket-docs': { region: 'sjc', isCreated: true } } } },
+        }] },
+        buckets: { edges: [{ node: { id: 'bucket-docs', name: 'documents' } }] },
+        services: { edges: [] }, plugins: { edges: [] },
+      } })
+      .mockResolvedValueOnce(usageResponse);
+    const adapter = new RailwayAdapter();
+    (adapter as unknown as { client: { request: typeof request } }).client = { request };
+
+    await expect(adapter.observe(environment())).rejects.toThrow(/bucket usage/i);
   });
 });

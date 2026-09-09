@@ -28,7 +28,7 @@ function volumeInventory(
   volumes: Array<{
     instanceId: string;
     volumeId: string;
-    serviceId: string;
+    serviceId: string | null;
     mountPath: string;
     projectId?: string;
     deletedAt?: string | null;
@@ -374,6 +374,66 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
     expect(volumeReads[0]?.[1]).toMatchObject({ after: null });
     expect(volumeReads[1]?.[1]).toMatchObject({ after: 'cursor-1' });
     expect(request.mock.calls.filter(([query]) => String(query).includes('volumeCreate'))).toHaveLength(1);
+  });
+
+  it('ignores a detached volume with Railway\'s nullable service id', async () => {
+    const request = vi.fn().mockResolvedValueOnce(volumeInventory('rail-env-1', [{
+      instanceId: 'detached-instance',
+      volumeId: 'detached-volume',
+      serviceId: null,
+      mountPath: '/data',
+    }]));
+    const adapter = new RailwayAdapter();
+    (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
+
+    await expect(adapter.resolveServiceVolume({
+      projectId: 'rail-proj-1',
+      environmentId: 'rail-env-1',
+      serviceId: 'rail-svc-db-1',
+      mountPath: '/var/lib/postgresql/data',
+    })).resolves.toEqual({ success: true, state: 'absent' });
+  });
+
+  it('does not mistake a detached recorded volume for the expected attachment', async () => {
+    const request = vi.fn().mockResolvedValueOnce(volumeInventory('rail-env-1', [{
+      instanceId: 'detached-instance',
+      volumeId: 'detached-volume',
+      serviceId: null,
+      mountPath: '/data',
+    }]));
+    const adapter = new RailwayAdapter();
+    (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
+
+    const result = await adapter.resolveServiceVolume({
+      projectId: 'rail-proj-1',
+      environmentId: 'rail-env-1',
+      serviceId: 'rail-svc-db-1',
+      mountPath: '/var/lib/postgresql/data',
+    }, 'detached-volume');
+
+    expect(result).toMatchObject({ success: false, error: expect.stringContaining('<detached>') });
+  });
+
+  it('still rejects a volume response that omits service ownership', async () => {
+    const response = volumeInventory('rail-env-1', [{
+      instanceId: 'partial-instance',
+      volumeId: 'partial-volume',
+      serviceId: null,
+      mountPath: '/data',
+    }]);
+    delete (response.environment.volumeInstances.edges[0]!.node as { serviceId?: string | null }).serviceId;
+    const request = vi.fn().mockResolvedValueOnce(response);
+    const adapter = new RailwayAdapter();
+    (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
+
+    const result = await adapter.resolveServiceVolume({
+      projectId: 'rail-proj-1',
+      environmentId: 'rail-env-1',
+      serviceId: 'rail-svc-db-1',
+      mountPath: '/var/lib/postgresql/data',
+    });
+
+    expect(result).toMatchObject({ success: false, error: expect.stringContaining('partial volume identity') });
   });
 
   it('does not create a volume when the exact target is already ambiguous', async () => {
