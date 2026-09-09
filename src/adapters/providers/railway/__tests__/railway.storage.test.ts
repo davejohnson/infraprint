@@ -242,6 +242,7 @@ describe('Railway storage buckets', () => {
     const receipt = await adapter.ensureStorage(environment(), 'uploads', { region: 'sjc' });
 
     expect(receipt.success).toBe(false);
+    expect(receipt.data).toMatchObject({ phase: 'bucketCreate', mutationAttempted: false });
     expect(request).toHaveBeenCalledTimes(1);
   });
 

@@ -5941,6 +5941,12 @@ export class RailwayAdapter implements
         success: false,
         message: `Failed to ensure Railway bucket "${name}"`,
         error: this.describeError(error),
+        data: {
+          provider: 'railway',
+          phase: 'bucketCreate',
+          mutationAttempted: false,
+          region: options.region,
+        },
       };
     }
   }

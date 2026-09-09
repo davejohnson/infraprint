@@ -849,6 +849,13 @@ export function resolvePlanActionAuthority(
     && (
       action.metadata?.operation === STORAGE_OPERATIONS.ensure
       || (
+        action.metadata?.operation === STORAGE_OPERATIONS.clearCreateRecovery
+        && action.type === 'update'
+        && action.requiresConfirm === true
+        && Boolean(metadataStringRecord(action, 'instanceScope'))
+        && Boolean(action.metadata?.storageCreateRecovery)
+      )
+      || (
         action.metadata?.operation === STORAGE_OPERATIONS.destroy
         && metadataString(action, 'externalId')
         && metadataStringRecord(action, 'instanceScope')
