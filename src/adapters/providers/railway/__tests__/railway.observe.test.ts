@@ -42,10 +42,11 @@ const projectDetailsResponse = {
     name: 'billforge',
     environments: {
       edges: [
-        { node: { id: 'env-prod', name: 'production' } },
-        { node: { id: 'env-staging', name: 'staging' } },
+        { node: { id: 'env-prod', name: 'production', config: {} } },
+        { node: { id: 'env-staging', name: 'staging', config: {} } },
       ],
     },
+    buckets: { edges: [] },
     services: {
       edges: [
         {

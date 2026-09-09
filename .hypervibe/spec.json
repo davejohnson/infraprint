@@ -52,7 +52,8 @@
         },
         "changeScope": "all",
         "commands": [
-          "npm test -- test/provider-conformance/provider-matrix.test.ts"
+          "npm test -- test/provider-conformance/provider-matrix.test.ts",
+          "npm run test:providers:upstream-contracts"
         ],
         "failureArtifacts": []
       },

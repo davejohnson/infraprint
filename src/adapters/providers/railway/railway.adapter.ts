@@ -138,7 +138,7 @@ interface RailwayVolumeInstance {
   volumeId: string;
   projectId: string;
   environmentId: string;
-  serviceId: string;
+  serviceId: string | null;
   mountPath: string;
   deletedAt: string | null;
   isPendingDeletion: boolean;
@@ -1628,9 +1628,10 @@ export class RailwayAdapter implements
         }
         if (idMatches.length === 1 && targetMatches[0]?.volumeId !== expectedVolumeId) {
           const actual = idMatches[0]!;
+          const actualService = actual.serviceId ?? '<detached>';
           return {
             success: false,
-            error: `Railway volume ${expectedVolumeId} is attached to service ${actual.serviceId} in environment ${actual.environmentId} at ${actual.mountPath}, not the recorded target.`,
+            error: `Railway volume ${expectedVolumeId} is attached to service ${actualService} in environment ${actual.environmentId} at ${actual.mountPath}, not the recorded target.`,
           };
         }
         if (targetMatches.length === 1 && targetMatches[0]!.volumeId !== expectedVolumeId) {
@@ -1715,7 +1716,8 @@ export class RailwayAdapter implements
       for (const [index, edge] of edges.entries()) {
         if (!isRecord(edge) || !isRecord(edge.node) || !isRecord(edge.node.volume)
           || typeof edge.node.id !== 'string' || edge.node.id.trim().length === 0
-          || typeof edge.node.serviceId !== 'string' || edge.node.serviceId.trim().length === 0
+          || (edge.node.serviceId !== null
+            && (typeof edge.node.serviceId !== 'string' || edge.node.serviceId.trim().length === 0))
           || typeof edge.node.environmentId !== 'string' || edge.node.environmentId.trim().length === 0
           || typeof edge.node.mountPath !== 'string' || edge.node.mountPath.trim().length === 0
           || (edge.node.deletedAt !== null && typeof edge.node.deletedAt !== 'string')
@@ -4345,7 +4347,30 @@ export class RailwayAdapter implements
     };
 
     for (const edge of requireEdges(value.environments, 'environment')) {
-      requireIdentity(edge.node as Record<string, unknown>, 'environment');
+      const node = edge.node as Record<string, unknown>;
+      requireIdentity(node, 'environment');
+      if (node.config !== undefined) {
+        if (!isRecord(node.config)) {
+          throw new Error(`Railway project ${expectedProjectId} returned an invalid environment config.`);
+        }
+        if (Object.prototype.hasOwnProperty.call(node.config, 'buckets')
+          && !isRecord(node.config.buckets)) {
+          throw new Error(`Railway project ${expectedProjectId} returned an invalid environment bucket config.`);
+        }
+        if (isRecord(node.config.buckets)) {
+          for (const [bucketId, bucketConfig] of Object.entries(node.config.buckets)) {
+            if (bucketId.trim().length === 0 || !isRecord(bucketConfig)
+              || (Object.prototype.hasOwnProperty.call(bucketConfig, 'region')
+                && (typeof bucketConfig.region !== 'string' || bucketConfig.region.trim().length === 0))
+              || (Object.prototype.hasOwnProperty.call(bucketConfig, 'isCreated')
+                && typeof bucketConfig.isCreated !== 'boolean')
+              || (Object.prototype.hasOwnProperty.call(bucketConfig, 'isDeleted')
+                && typeof bucketConfig.isDeleted !== 'boolean')) {
+              throw new Error(`Railway project ${expectedProjectId} returned an invalid environment bucket config.`);
+            }
+          }
+        }
+      }
     }
     for (const edge of requireEdges(value.services, 'service')) {
       const node = edge.node as Record<string, unknown>;
@@ -4357,8 +4382,18 @@ export class RailwayAdapter implements
       requireIdentity(edge.node as Record<string, unknown>, 'plugin');
     }
     if (value.buckets !== undefined) {
+      const bucketIds = new Set<string>();
+      const bucketNames = new Set<string>();
       for (const edge of requireEdges(value.buckets, 'bucket')) {
-        requireIdentity(edge.node as Record<string, unknown>, 'bucket');
+        const node = edge.node as Record<string, unknown>;
+        requireIdentity(node, 'bucket');
+        const id = node.id as string;
+        const normalizedName = (node.name as string).toLowerCase();
+        if (bucketIds.has(id) || bucketNames.has(normalizedName)) {
+          throw new Error(`Railway project ${expectedProjectId} returned duplicate bucket identities.`);
+        }
+        bucketIds.add(id);
+        bucketNames.add(normalizedName);
       }
     }
 
@@ -5690,13 +5725,20 @@ export class RailwayAdapter implements
       throw new Error(`Railway did not confirm the exact environment ${environmentId} while observing bucket configuration.`);
     }
     if (!Object.prototype.hasOwnProperty.call(result.environment, 'config')
-      || !isRecord(result.environment.config)
-      || !Object.prototype.hasOwnProperty.call(result.environment.config, 'buckets')
-      || !isRecord(result.environment.config.buckets)) {
+      || !isRecord(result.environment.config)) {
+      throw new Error(`Railway returned an incomplete bucket configuration for environment ${environmentId}.`);
+    }
+    // Railway's canonical EnvironmentConfig defaults omitted maps to empty and
+    // omits them again when serializing. Explicit null or a non-object remains
+    // invalid because it cannot prove an empty configuration.
+    const rawBuckets = Object.prototype.hasOwnProperty.call(result.environment.config, 'buckets')
+      ? result.environment.config.buckets
+      : {};
+    if (!isRecord(rawBuckets)) {
       throw new Error(`Railway returned an incomplete bucket configuration for environment ${environmentId}.`);
     }
     const environmentBuckets: Record<string, { region?: string; isCreated?: boolean; isDeleted?: boolean }> = {};
-    for (const [bucketId, rawConfig] of Object.entries(result.environment.config.buckets)) {
+    for (const [bucketId, rawConfig] of Object.entries(rawBuckets)) {
       if (bucketId.trim().length === 0 || !isRecord(rawConfig)) {
         throw new Error(`Railway returned a malformed bucket configuration for environment ${environmentId}.`);
       }
@@ -5765,15 +5807,25 @@ export class RailwayAdapter implements
     return undefined;
   }
 
-  private async getBucketUsage(bucketId: string, environmentId: string): Promise<{ objectCount?: number; sizeBytes?: number }> {
+  private async getBucketUsage(bucketId: string, environmentId: string): Promise<{ objectCount: number; sizeBytes: number }> {
     if (!this.client) throw new Error('Not connected. Call connect() first.');
     const query = gql`
       query BucketUsage($bucketId: String!, $environmentId: String!) {
         bucketInstanceDetails(bucketId: $bucketId, environmentId: $environmentId) { objectCount sizeBytes }
       }
     `;
-    const result = await this.client.request<{ bucketInstanceDetails?: { objectCount?: number; sizeBytes?: number } }>(query, { bucketId, environmentId });
-    return result.bucketInstanceDetails ?? {};
+    const result = await this.client.request<unknown>(query, { bucketId, environmentId });
+    const details = isRecord(result) ? result.bucketInstanceDetails : undefined;
+    if (!isRecord(details)
+      || typeof details.objectCount !== 'number'
+      || !Number.isSafeInteger(details.objectCount)
+      || details.objectCount < 0
+      || typeof details.sizeBytes !== 'number'
+      || !Number.isSafeInteger(details.sizeBytes)
+      || details.sizeBytes < 0) {
+      throw new Error(`Railway returned incomplete or invalid bucket usage for bucket ${bucketId} in environment ${environmentId}.`);
+    }
+    return { objectCount: details.objectCount, sizeBytes: details.sizeBytes };
   }
 
   private async commitBucketPatch(
@@ -5788,7 +5840,11 @@ export class RailwayAdapter implements
       }
     `;
     const result = await this.client.request<unknown>(mutation, { environmentId, patch: { buckets }, commitMessage });
-    if (!isRecord(result) || result.environmentPatchCommit !== true) {
+    const acknowledgement = isRecord(result) ? result.environmentPatchCommit : undefined;
+    // Railway currently returns a non-empty deployment id (String!). Retain
+    // support for the earlier boolean acknowledgement Hypervibe accepted.
+    if (acknowledgement !== true
+      && (typeof acknowledgement !== 'string' || acknowledgement.trim().length === 0)) {
       throw new Error(`Railway did not acknowledge the bucket configuration commit for environment ${environmentId}; mutation state is unknown.`);
     }
   }
@@ -5832,20 +5888,40 @@ export class RailwayAdapter implements
         }
       }
     `;
-    const result = await this.client.request<{
-      bucketS3Credentials: Array<{
-        endpoint: string; accessKeyId: string; secretAccessKey: string; bucketName: string; region: string; urlStyle: string;
-      }>;
-    }>(query, { projectId: bindings.projectId, environmentId: bindings.environmentId, bucketId: externalId });
-    const credential = result.bucketS3Credentials?.[0];
-    if (!credential) throw new Error('Railway returned no S3 credentials for the bucket');
+    const result = await this.client.request<unknown>(query, {
+      projectId: bindings.projectId,
+      environmentId: bindings.environmentId,
+      bucketId: externalId,
+    });
+    const credentials = isRecord(result) ? result.bucketS3Credentials : undefined;
+    if (!Array.isArray(credentials) || credentials.length === 0) {
+      throw new Error('Railway returned no S3 credentials for the bucket');
+    }
+    if (credentials.length !== 1) {
+      throw new Error('Railway returned more than one S3 credential set for the bucket');
+    }
+    const credential = credentials[0];
+    const credentialFields = [
+      'endpoint',
+      'accessKeyId',
+      'secretAccessKey',
+      'bucketName',
+      'region',
+      'urlStyle',
+    ] as const;
+    if (!isRecord(credential)
+      || credentialFields.some((field) => (
+        typeof credential[field] !== 'string' || credential[field].trim().length === 0
+      ))) {
+      throw new Error('Railway returned a malformed S3 credential set for the bucket');
+    }
     return {
-      bucket: credential.bucketName,
-      endpoint: credential.endpoint,
-      accessKeyId: credential.accessKeyId,
-      secretAccessKey: credential.secretAccessKey,
-      region: credential.region,
-      urlStyle: credential.urlStyle,
+      bucket: credential.bucketName as string,
+      endpoint: credential.endpoint as string,
+      accessKeyId: credential.accessKeyId as string,
+      secretAccessKey: credential.secretAccessKey as string,
+      region: credential.region as string,
+      urlStyle: credential.urlStyle as string,
     };
   }
 
@@ -6315,7 +6391,13 @@ export class RailwayAdapter implements
     let cacheObservationComplete = true;
 
     const environmentConfig = projectEnvironments.find((candidate) => candidate.id === environmentId)?.config;
-    for (const edge of details.buckets?.edges ?? []) {
+    const storageObservationComplete = details.buckets !== undefined && environmentConfig !== undefined;
+    if (!storageObservationComplete) {
+      warnings.push(
+        `Railway omitted the bucket inventory or environment config for ${environmentId}; storage observation remains unknown.`
+      );
+    }
+    for (const edge of storageObservationComplete ? details.buckets!.edges : []) {
       const instance = environmentConfig?.buckets?.[edge.node.id];
       if (!instance || instance.isDeleted === true) continue;
       const usage = await this.getBucketUsage(edge.node.id, environmentId);
@@ -6504,6 +6586,7 @@ export class RailwayAdapter implements
     }
 
     const serviceObservationComplete = !partial;
+    if (!storageObservationComplete) partial = true;
     for (const edge of details.plugins?.edges ?? []) {
       const node = edge.node;
       const engine = this.classifyDatastoreEngine(node.name);
@@ -6552,7 +6635,7 @@ export class RailwayAdapter implements
         services: serviceObservationComplete ? 'complete' : 'unknown',
         databases: databaseObservationComplete ? 'complete' : 'unknown',
         caches: cacheObservationComplete ? 'complete' : 'unknown',
-        storage: 'complete',
+        storage: storageObservationComplete ? 'complete' : 'unknown',
       },
       partial,
       warnings,
@@ -6900,7 +6983,7 @@ export interface RailwayProjectDetails {
       node: {
         id: string;
         name: string;
-        config?: { buckets?: Record<string, { region?: string; isDeleted?: boolean }> };
+        config?: { buckets?: Record<string, { region?: string; isCreated?: boolean; isDeleted?: boolean }> };
       };
     }>;
   };

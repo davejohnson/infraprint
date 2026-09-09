@@ -31,7 +31,10 @@ describe('provider conformance matrix', () => {
     expect(actions['provider-conformance']).toMatchObject({
       kind: 'check',
       triggers: { schedule: { cron: expect.any(String) } },
-      commands: ['npm test -- test/provider-conformance/provider-matrix.test.ts'],
+      commands: [
+        'npm test -- test/provider-conformance/provider-matrix.test.ts',
+        'npm run test:providers:upstream-contracts',
+      ],
     });
     expect(actions['provider-truth']).toMatchObject({
       kind: 'code-audit',
