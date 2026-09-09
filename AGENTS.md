@@ -6,6 +6,7 @@ Hypervibe is an infrastructure creation, migration, and destruction orchestrator
 
 Core rules for coding agents:
 
+- Add the least code needed for the requested behavior. Prefer deleting or extending existing paths over introducing new layers, helpers, configuration, compatibility branches, or abstractions for hypothetical future needs.
 - Keep MCP and CLI as thin adapters over `src/application`. Define command ids, schemas, descriptions, safety metadata, handlers, redaction, and structured results once; never put provider calls or lifecycle orchestration in an interface.
 - Every supported command must be reachable through both adapters unless architecture documentation explicitly declares it interface-specific. Contract tests must pin registry/MCP parity and CLI routing.
 - Redact command results before they reach any interface. MCP `structuredContent` and CLI `--json` must expose the same safe envelope; prompts, human output, stderr, and validation errors must follow the same secret boundary.

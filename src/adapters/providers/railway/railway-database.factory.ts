@@ -1,11 +1,20 @@
 import type { Project } from '../../../domain/entities/project.entity.js';
 import type { Environment } from '../../../domain/entities/environment.entity.js';
 import type { Component, ComponentType } from '../../../domain/entities/component.entity.js';
-import type { IProviderAdapter, TemporaryDatabaseAccess } from '../../../domain/ports/provider.port.js';
+import type {
+  HostingServiceDeleteScope,
+  HostingServiceDeleteOptions,
+  IProviderAdapter,
+  TemporaryDatabaseAccess,
+} from '../../../domain/ports/provider.port.js';
 import type { IDatabaseAdapter, ProvisionResult, ProvisionableType } from '../../../domain/ports/database.port.js';
 import type { ObservedDatabase, ObservedState } from '../../../domain/ports/observe.port.js';
 import type { EnvironmentRepository } from '../../db/repositories/environment.repository.js';
-import type { RailwayVolumeResolution, RailwayVolumeTarget } from './railway.adapter.js';
+import type {
+  RailwayServiceInstanceInspection,
+  RailwayVolumeResolution,
+  RailwayVolumeTarget,
+} from './railway.adapter.js';
 
 interface RailwayHostingOps {
   ensureProject: (projectName: string, environment: Environment) => Promise<{
@@ -19,17 +28,13 @@ interface RailwayHostingOps {
     receipt: { success: boolean; message: string; error?: string; data?: Record<string, unknown> };
   }>;
   listPlugins: (projectId: string) => Promise<Array<{ id: string; name: string; type: string }>>;
-  getProjectDetails?: (projectId: string) => Promise<{
-    services: { edges: Array<{ node: {
-      id: string;
-      name: string;
-      serviceInstances?: { edges?: Array<{ node?: { source?: { image?: string | null } | null } }> };
-    } }> };
-    plugins: { edges: Array<{ node: { id: string; name: string } }> };
-  } | null>;
+  inspectServiceInstance?: (
+    serviceId: string,
+    environmentId: string
+  ) => Promise<RailwayServiceInstanceInspection>;
   observe?: (environment: Environment) => Promise<ObservedState>;
   deleteProject?: (projectId: string) => Promise<{ success: boolean; error?: string }>;
-  deleteService?: (serviceId: string) => Promise<{ success: boolean; error?: string; alreadyAbsent?: boolean }>;
+  deleteService?: (serviceId: string, target: HostingServiceDeleteScope, options: HostingServiceDeleteOptions) => Promise<{ success: boolean; error?: string; alreadyAbsent?: boolean }>;
   resolveServiceVolume?: (
     target: RailwayVolumeTarget,
     expectedVolumeId?: string
@@ -88,6 +93,17 @@ export function createRailwayDatabaseAdapter(params: {
       : undefined;
   };
 
+  const componentEnvironmentId = (component?: Component | null): string | undefined => {
+    const providerScope = component?.bindings.providerScope;
+    if (!providerScope || typeof providerScope !== 'object' || Array.isArray(providerScope)) {
+      return undefined;
+    }
+    const environmentId = (providerScope as Record<string, unknown>).environmentId;
+    return typeof environmentId === 'string' && environmentId.length > 0
+      ? environmentId
+      : undefined;
+  };
+
   const environmentProjectId = (environment: Environment): string | undefined => {
     const projectId = (environment.platformBindings as Record<string, unknown>).projectId;
     return typeof projectId === 'string' && projectId.length > 0 ? projectId : undefined;
@@ -133,6 +149,23 @@ export function createRailwayDatabaseAdapter(params: {
       return { target };
     }
 
+    if (bindings.retainedCleanup === true) {
+      const scopedEnvironmentId = componentEnvironmentId(component);
+      if (!component.externalId || !scopedEnvironmentId) {
+        return {
+          error: 'The retained Railway database identity is missing its exact matching environment scope, so attached-volume observation is unsafe.',
+        };
+      }
+      return {
+        target: {
+          projectId: scopedProjectId,
+          environmentId: scopedEnvironmentId,
+          serviceId: component.externalId,
+          mountPath: expectedMountPath,
+        },
+      };
+    }
+
     if (!volumeId) return {};
     const environmentId = environment
       ? (environment.platformBindings as Record<string, unknown>).environmentId
@@ -175,49 +208,56 @@ export function createRailwayDatabaseAdapter(params: {
     database: ObservedDatabase;
   } | null> => {
     const retainedProjectId = componentProjectId(component);
-    if (!component.externalId || !retainedProjectId) {
-      throw new Error('Railway retained database observation requires an exact database id and durable project scope.');
+    const retainedEnvironmentId = componentEnvironmentId(component);
+    const resourceKind = component.bindings.resourceKind;
+    if (!component.externalId || !retainedProjectId || !retainedEnvironmentId) {
+      throw new Error(
+        'Railway retained database observation requires an exact database id and durable project and environment scope. '
+        + 'Re-import or reconcile the Railway binding before retrying cleanup.'
+      );
     }
-    if (typeof railway.getProjectDetails !== 'function') {
-      throw new Error('Railway hosting adapter does not expose retained database observation.');
+    if (resourceKind !== 'service') {
+      throw new Error(
+        resourceKind === 'plugin' || resourceKind === 'legacy-plugin'
+          ? 'Legacy Railway plugin databases do not have a verified teardown contract. Re-import a service-backed PostgreSQL instance before retrying cleanup.'
+          : 'The retained Railway database binding does not prove this id is a service-backed datastore. Re-import the exact database before retrying cleanup.'
+      );
     }
-    const details = await railway.getProjectDetails(retainedProjectId);
-    if (!details) return null;
-    const services = details.services.edges
-      .map((edge) => edge.node)
-      .filter((node) => node.id === component.externalId);
-    const plugins = details.plugins.edges
-      .map((edge) => edge.node)
-      .filter((node) => node.id === component.externalId);
-    if (services.length + plugins.length > 1) {
-      throw new Error(`Railway returned multiple resource identities for retained database id ${component.externalId}.`);
+    if (typeof railway.inspectServiceInstance !== 'function') {
+      throw new Error('Railway hosting adapter does not expose exact retained database instance observation.');
     }
-    const service = services[0];
-    const plugin = plugins[0];
-    if (!service && !plugin) return null;
-
-    const postgresImage = service?.serviceInstances?.edges?.some((edge) => {
-      const image = edge.node?.source?.image?.trim().toLowerCase();
-      return Boolean(image && /(^|\/)postgres(?::|@|$)/.test(image));
-    }) ?? false;
-    if (service && !postgresImage) {
-      throw new Error(`Railway service ${service.id} is not provider-verified as a PostgreSQL database image.`);
+    const instance = await railway.inspectServiceInstance(
+      component.externalId,
+      retainedEnvironmentId
+    );
+    if (instance.state === 'unknown') {
+      throw new Error(
+        `Railway retained database instance observation is unknown: ${instance.error}`
+      );
     }
-    if (plugin && !plugin.name.toLowerCase().includes('postgres')) {
-      throw new Error(`Railway resource ${plugin.id} is not a PostgreSQL database.`);
+    if (instance.state === 'present') {
+      const image = instance.sourceImage?.trim().toLowerCase();
+      if (!image || !/(^|\/)postgres(?::|@|$)/.test(image)) {
+        throw new Error(
+          `Railway service ${component.externalId} in environment ${retainedEnvironmentId} is not provider-verified as a PostgreSQL database image.`
+        );
+      }
+      return {
+        kind: 'service',
+        database: {
+          provider: 'railway',
+          engine: 'postgres',
+          externalId: component.externalId,
+          providerScope: {
+            projectId: retainedProjectId,
+            environmentId: retainedEnvironmentId,
+          },
+          name: component.externalId,
+          status: 'unknown',
+        },
+      };
     }
-    const candidate = service ?? plugin!;
-    return {
-      kind: service ? 'service' : 'legacy-plugin',
-      database: {
-        provider: 'railway',
-        engine: 'postgres',
-        externalId: candidate.id,
-        providerScope: { projectId: retainedProjectId },
-        name: candidate.name,
-        status: 'unknown',
-      },
-    };
+    return null;
   };
 
   const observeRailwayDatabase = async (
@@ -345,7 +385,9 @@ export function createRailwayDatabaseAdapter(params: {
       const projectName = project?.name ?? `project-${environment.projectId}`;
       const refreshedEnvironment = envRepo.findById(environment.id) ?? environment;
       const projectId = environmentProjectId(refreshedEnvironment);
-      if (!projectId) {
+      const environmentId = (refreshedEnvironment.platformBindings as Record<string, unknown>)
+        .environmentId;
+      if (!projectId || typeof environmentId !== 'string' || !environmentId.trim()) {
         return {
           component: {
             id: '',
@@ -358,8 +400,8 @@ export function createRailwayDatabaseAdapter(params: {
           },
           receipt: {
             success: false,
-            message: 'Railway project binding is missing',
-            error: 'Apply the reviewed project action first, then re-run hv_plan. Database provisioning will not create or rebind a hosting project implicitly.',
+            message: 'Railway project or environment binding is missing',
+            error: 'Apply the reviewed project and environment actions first, then re-run hv_plan. Database provisioning will not create or rebind hosting scope implicitly.',
             data: {
               phase: 'requireProjectBinding',
               provider: 'railway',
@@ -449,7 +491,7 @@ export function createRailwayDatabaseAdapter(params: {
             ...(componentResult.component.bindings ?? {}),
             provider: 'railway',
             projectId,
-            providerScope: { projectId },
+            providerScope: { projectId, environmentId },
             connectionUrl,
             pluginName,
             resourceKind,
@@ -537,20 +579,14 @@ export function createRailwayDatabaseAdapter(params: {
             error: error instanceof Error ? error.message : String(error),
           };
         }
-        if (!retainedIdentity) {
-          return {
-            success: true,
-            message: `Railway database service is already absent: ${component.externalId}`,
-          };
-        }
-        if (retainedIdentity.kind !== 'service') {
+        if (retainedIdentity && retainedIdentity.kind !== 'service') {
           return {
             success: false,
             message: `Refusing to destroy retained Railway database component ${component.externalId ?? component.id}`,
             error: 'The exact retained Railway id is a legacy plugin, not a service-backed datastore. Hypervibe will not send it to the service deletion API.',
           };
         }
-        verifiedResourceKind = 'service';
+        if (retainedIdentity) verifiedResourceKind = 'service';
       }
       if (verifiedResourceKind !== 'service') {
         return {
@@ -616,7 +652,31 @@ export function createRailwayDatabaseAdapter(params: {
         };
       }
       if (component.externalId && typeof railway.deleteService === 'function') {
-        const deletedService = await railway.deleteService(component.externalId);
+        const providerScope = bindings.providerScope;
+        const retainedEnvironmentId = providerScope
+          && typeof providerScope === 'object'
+          && !Array.isArray(providerScope)
+          && typeof (providerScope as Record<string, unknown>).environmentId === 'string'
+          ? (providerScope as Record<string, string>).environmentId
+          : undefined;
+        const currentEnvironmentId = currentEnvironment
+          ? (currentEnvironment.platformBindings as Record<string, unknown>).environmentId
+          : undefined;
+        const scopedEnvironmentId = volumeTarget?.environmentId
+          ?? retainedEnvironmentId
+          ?? (typeof currentEnvironmentId === 'string' ? currentEnvironmentId : undefined);
+        if (!scopedEnvironmentId) {
+          return {
+            success: false,
+            message: `Refusing to destroy Railway database service ${component.externalId}`,
+            error: 'The durable Railway environment scope is missing; project-only service deletion is unsafe. Re-import or reconcile the Railway binding before retrying cleanup.',
+          };
+        }
+        const deletedService = await railway.deleteService(component.externalId, {
+          scope: 'environment',
+          projectId: scopedProjectId,
+          environmentId: scopedEnvironmentId,
+        }, { allowMutation: true });
         if (!deletedService.success) {
           return {
             success: false,

@@ -236,6 +236,14 @@ function metadataStringRecord(action: PlanAction, key: string): Record<string, s
   return Object.fromEntries(entries) as Record<string, string>;
 }
 
+function hasServiceDeleteTarget(action: PlanAction): boolean {
+  const scope = metadataString(action, 'deleteScope');
+  const providerScope = metadataStringRecord(action, 'providerScope');
+  if (!metadataString(action, 'externalId') || !providerScope?.projectId) return false;
+  return scope === 'project'
+    || (scope === 'environment' && Boolean(providerScope.environmentId));
+}
+
 function githubInfrastructureIncludesRestoreDrill(action: PlanAction): boolean {
   const files = action.metadata?.desiredFiles;
   return Array.isArray(files) && files.some((file) => {
@@ -895,6 +903,13 @@ export function resolvePlanActionAuthority(
     && (
       action.metadata?.operation === STORAGE_OPERATIONS.ensure
       || (
+        action.metadata?.operation === STORAGE_OPERATIONS.clearCreateRecovery
+        && action.type === 'update'
+        && action.requiresConfirm === true
+        && Boolean(metadataStringRecord(action, 'instanceScope'))
+        && Boolean(action.metadata?.storageCreateRecovery)
+      )
+      || (
         action.metadata?.operation === STORAGE_OPERATIONS.destroy
         && metadataString(action, 'externalId')
         && metadataStringRecord(action, 'instanceScope')
@@ -1151,20 +1166,34 @@ export function resolvePlanActionAuthority(
   if (exactResource(action, 'service') && action.type === 'destroy') {
     if (
       action.metadata?.operation === 'taskServiceCleanup'
-      && metadataString(action, 'externalId')
+      && action.id === `service:${action.resource.name}:destroy`
+      && action.resource.name.startsWith('hv-task-')
+      && hasServiceDeleteTarget(action)
+      && metadataSha256(action, 'bindingsFingerprint')
     ) {
       return authority(action, 'hosting.task-service.destroy');
     }
     if (
       action.metadata?.operation === 'previousHostingDestroy'
+      && action.id === `service:${action.resource.name}:previous-destroy`
       && metadataString(action, 'previousProvider') === action.resource.provider
       && ['services', 'project'].includes(metadataString(action, 'cleanupBoundary') ?? '')
+      && metadataString(action, 'serviceId') === metadataString(action, 'externalId')
+      && action.requiresConfirm === true
+      && hasServiceDeleteTarget(action)
     ) {
       return authority(action, 'hosting.previous-service.destroy');
     }
-    if (action.metadata?.operation) return null;
-    if (!metadataString(action, 'externalId')) return null;
-    return authority(action, 'hosting.service.destroy');
+    if (
+      action.metadata?.operation === 'hostingServiceDestroy'
+      && action.id === `service:${action.resource.name}:destroy`
+      && action.requiresConfirm === true
+      && hasServiceDeleteTarget(action)
+      && metadataSha256(action, 'bindingsFingerprint')
+    ) {
+      return authority(action, 'hosting.service.destroy');
+    }
+    return null;
   }
   if (
     exactResource(action, 'domain')

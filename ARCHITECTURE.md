@@ -338,6 +338,28 @@ is confirmation-gated, provider absence must be verified before the retained
 binding is cleared, and a second provider switch is blocked while an earlier
 cleanup identity remains.
 
+Individual hosting-service cleanup carries the reviewed operation, external
+service id, provider project/environment scope, and a fingerprint of the local
+binding identity. Apply revalidates that the service is still omitted from the
+spec and that the provider, scope, logical name, external id, and fingerprint
+still match before resolving a deletion adapter. For Railway, aggregate
+environment observation is never sufficient deletion evidence: the adapter
+checks the exact `serviceInstance(serviceId, environmentId)` before and after
+the mutation. A present target may be deleted only when no other current or
+retained local binding refers to the id and a complete paginated provider
+inventory proves that no sibling environment instance exists. The mutation is
+scoped with `serviceDelete(id, environmentId)`. An exact already-absent result
+removes only the selected local binding; unknown or conflicting evidence keeps
+all local state for a safe retry. Before any retained hosting boundary is
+destroyed, apply scans every local Hypervibe project and environment for an
+exact or ambiguously scoped reference to that provider boundary; any other
+reference blocks cleanup, including a database or cache provider identity
+nested in a component's retained previous binding. Retained hosting cleanup is
+not planned without its required project/environment scope. If rollout rollback
+cannot remove a newly created service, snapshot restoration persists an
+identified recovery marker with the provider-returned resource name so the next
+plan blocks until that exact provider resource is reviewed and cleaned up.
+
 `hv_inspect` environment forensics are provider-scoped. When the selected host
 is not the current host, the selected adapter receives only its own retained
 binding (when present), logical project/environment context, and bounded
@@ -351,12 +373,28 @@ provider; deletion remains a separately reviewed `hv_plan`/`hv_apply` action.
 those previous-host destroy actions. The same isolated scope may include one
 exact abandoned PostgreSQL identity recorded through
 `hv_import mode="retained-database-cleanup"` after provider-owned inventory.
-It may likewise include one exact Redis-compatible cache identity recorded through
-`hv_import mode="retained-cache-cleanup"`. These bindings carry the durable provider id and provider-native account/project
-and region/organization scope, never connection material. Planning and apply
+It may likewise include one exact Redis-compatible cache identity recorded
+through `hv_import mode="retained-cache-cleanup"`. These bindings carry the
+durable provider id and provider-native account/project and region/organization
+scope, never connection material. Planning and apply
 re-observe that exact scoped identity; deletion is data-bearing and
 confirmation-gated, and the binding is cleared only after provider-confirmed
-terminal absence. It observes the current host for the usual stale-plan
+terminal absence. If a provider inventory returns the same durable service id
+in multiple environments, import selects a candidate only when exactly one
+complete compatible scope is established by the current hosting binding, the
+retained previous-host binding, or an explicit unresolved-create marker;
+otherwise it remains ambiguous. A retained Railway service-backed database
+must include both its project and environment ids; legacy project-only
+identities must be re-imported before Hypervibe can authorize
+environment-scoped deletion, and its binding records that the provider resource
+is a service rather than a legacy plugin. Cleanup verifies that exact
+environment instance is PostgreSQL. It also
+reconstructs and removes an attached Railway volume when one remains after the
+service is already absent, so a retry can finish dependent cleanup without
+reissuing an unsafe service mutation. Retained database and cache cleanup scan
+all local projects and environments for another exact or ambiguously scoped
+reference to the same provider id before mutation. It
+observes the current host for the usual stale-plan
 fingerprint, preflights only the current and retained hosting, database, or cache
 providers, and neither loads deploy env files nor resolves unrelated
 integrations. `hv_apply` derives that isolation from the persisted plan scope,
@@ -1377,6 +1415,16 @@ explicitly read-only adapter method, while provider registration, resource-group
 creation, and credential derivation remain inside the reviewed apply action.
 Temporary CLI sessions may provision, observe, and migrate storage, but are not
 projected into deployed workloads as long-lived secrets.
+
+An ambiguous bucket-create outcome is retained as scoped recovery evidence and
+blocks retries. If complete provider observation later proves that an unresolved
+requested name is absent, planning may emit a separately confirmation-gated
+recovery-clear action followed by the normal billable create. Apply must
+re-observe the exact provider scope immediately before clearing the marker and
+must preserve it if a matching bucket appears or observation becomes unknown.
+Known preflight failures must report that no mutation was attempted and must not
+create recovery state. Identified or mismatched provider ids still require
+explicit adoption or cleanup; absence recovery is never deletion authority.
 
 ## Database Tasks And Seed Data
 

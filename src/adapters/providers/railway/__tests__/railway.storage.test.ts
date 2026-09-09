@@ -10,7 +10,7 @@ function environment(): Environment {
 function bucketState(options: {
   buckets?: Array<{ id: string; name: string }>;
   config?: Record<string, { region?: string; isCreated?: boolean; isDeleted?: boolean }>;
-  unmergedChangesCount?: number;
+  unmergedChangesCount?: number | null;
   projectId?: string;
   environmentId?: string;
 } = {}) {
@@ -21,7 +21,14 @@ function bucketState(options: {
       id: projectId,
       buckets: { edges: (options.buckets ?? []).map((node) => ({ node })) },
       environments: {
-        edges: [{ node: { id: environmentId, unmergedChangesCount: options.unmergedChangesCount ?? 0 } }],
+        edges: [{
+          node: {
+            id: environmentId,
+            unmergedChangesCount: options.unmergedChangesCount === undefined
+              ? 0
+              : options.unmergedChangesCount,
+          },
+        }],
       },
     },
     environment: { id: environmentId, config: { buckets: options.config ?? {} } },
@@ -149,6 +156,33 @@ describe('Railway storage buckets', () => {
     expect(request).toHaveBeenCalledTimes(5);
   });
 
+  it('treats Railway\'s nullable staged-change count as no staged changes', async () => {
+    const request = vi.fn()
+      .mockResolvedValueOnce(bucketState({ unmergedChangesCount: null }))
+      .mockResolvedValueOnce({ bucketCreate: { id: 'bucket-1', name: 'uploads', projectId: 'rp' } })
+      .mockResolvedValueOnce(bucketState({
+        buckets: [{ id: 'bucket-1', name: 'uploads' }],
+        unmergedChangesCount: null,
+      }))
+      .mockResolvedValueOnce({ environmentPatchCommit: true })
+      .mockResolvedValueOnce(bucketState({
+        buckets: [{ id: 'bucket-1', name: 'uploads' }],
+        config: { 'bucket-1': { region: 'sjc', isCreated: true, isDeleted: false } },
+        unmergedChangesCount: null,
+      }));
+    const adapter = new RailwayAdapter();
+    (adapter as unknown as { client: { request: typeof request } }).client = { request };
+
+    const receipt = await adapter.ensureStorage(environment(), 'uploads', { region: 'sjc' });
+
+    expect(receipt).toMatchObject({
+      success: true,
+      data: { externalId: 'bucket-1', region: 'sjc' },
+    });
+    expect(request.mock.calls.some(([query]) => String(query).includes('bucketCreate'))).toBe(true);
+    expect(request.mock.calls.some(([query]) => String(query).includes('environmentPatchCommit'))).toBe(true);
+  });
+
   it('reports an unbound same-name bucket as an adoption candidate without attaching it', async () => {
     const request = vi.fn().mockResolvedValueOnce(bucketState({
       buckets: [{ id: 'bucket-1', name: 'documents' }],
@@ -208,6 +242,7 @@ describe('Railway storage buckets', () => {
     const receipt = await adapter.ensureStorage(environment(), 'uploads', { region: 'sjc' });
 
     expect(receipt.success).toBe(false);
+    expect(receipt.data).toMatchObject({ phase: 'bucketCreate', mutationAttempted: false });
     expect(request).toHaveBeenCalledTimes(1);
   });
 

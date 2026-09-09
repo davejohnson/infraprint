@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { RailwayAdapter } from '../railway.adapter.js';
+import { RailwayAdapter } from '../railway.adapter.js';
 import { inspectRailwayResources } from '../railway-inspection.driver.js';
 
 function boundedInspectionAdapter(): RailwayAdapter {
@@ -75,13 +75,18 @@ function boundedInspectionAdapter(): RailwayAdapter {
 }
 
 describe('Railway abandoned-environment inspection', () => {
-  it('inventories differently named PostgreSQL services with project scope', async () => {
+  it('inventories one differently named PostgreSQL candidate per environment scope', async () => {
     const adapter = {
       listProjects: vi.fn(async () => [{ id: 'railway-project', name: 'customer-platform' }]),
       getProjectDetails: vi.fn(async () => ({
         id: 'railway-project',
         name: 'customer-platform',
-        environments: { edges: [{ node: { id: 'railway-production', name: 'production' } }] },
+        environments: {
+          edges: [
+            { node: { id: 'railway-production', name: 'production' } },
+            { node: { id: 'railway-staging', name: 'staging' } },
+          ],
+        },
         services: {
           edges: [{
             node: {
@@ -89,13 +94,22 @@ describe('Railway abandoned-environment inspection', () => {
               name: 'primary-data',
               repoTriggers: { edges: [] },
               serviceInstances: {
-                edges: [{
-                  node: {
-                    environmentId: 'railway-production',
-                    domains: { serviceDomains: [], customDomains: [] },
-                    source: { image: 'postgres:17' },
+                edges: [
+                  {
+                    node: {
+                      environmentId: 'railway-production',
+                      domains: { serviceDomains: [], customDomains: [] },
+                      source: { image: 'postgres:17' },
+                    },
                   },
-                }],
+                  {
+                    node: {
+                      environmentId: 'railway-staging',
+                      domains: { serviceDomains: [], customDomains: [] },
+                      source: { image: 'postgres:17' },
+                    },
+                  },
+                ],
               },
             },
           }],
@@ -116,12 +130,26 @@ describe('Railway abandoned-environment inspection', () => {
     expect(inspected).toMatchObject({
       observation: 'present',
       resource: 'database',
-      databases: [{
-        id: 'railway-db-service',
-        name: 'primary-data',
-        engine: 'postgres',
-        providerScope: { projectId: 'railway-project' },
-      }],
+      databases: [
+        {
+          id: 'railway-db-service',
+          name: 'primary-data',
+          engine: 'postgres',
+          providerScope: {
+            projectId: 'railway-project',
+            environmentId: 'railway-production',
+          },
+        },
+        {
+          id: 'railway-db-service',
+          name: 'primary-data',
+          engine: 'postgres',
+          providerScope: {
+            projectId: 'railway-project',
+            environmentId: 'railway-staging',
+          },
+        },
+      ],
       partial: false,
     });
   });
@@ -343,5 +371,60 @@ describe('Railway abandoned-environment inspection', () => {
     });
     expect((adapter as unknown as { getProjectDetails: ReturnType<typeof vi.fn> }).getProjectDetails)
       .toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Railway exact service-instance inspection', () => {
+  it.each([
+    ['missing root field', {}],
+    ['mismatched identity', {
+      serviceInstance: {
+        id: 'instance-1',
+        serviceId: 'different-service',
+        environmentId: 'railway-production',
+        source: { image: 'postgres:17' },
+      },
+    }],
+    ['malformed image', {
+      serviceInstance: {
+        id: 'instance-1',
+        serviceId: 'railway-db-service',
+        environmentId: 'railway-production',
+        source: { image: 17 },
+      },
+    }],
+  ])('treats %s as unknown rather than absence', async (_label, response) => {
+    const adapter = new RailwayAdapter();
+    const request = vi.fn(async () => response);
+    (adapter as unknown as { client: { request: typeof request } }).client = { request };
+
+    await expect(adapter.inspectServiceInstance(
+      'railway-db-service',
+      'railway-production'
+    )).resolves.toMatchObject({ state: 'unknown' });
+  });
+
+  it('returns the exact instance image and scope when present', async () => {
+    const adapter = new RailwayAdapter();
+    const request = vi.fn(async () => ({
+      serviceInstance: {
+        id: 'instance-1',
+        serviceId: 'railway-db-service',
+        environmentId: 'railway-production',
+        source: { image: 'postgres:17' },
+      },
+    }));
+    (adapter as unknown as { client: { request: typeof request } }).client = { request };
+
+    await expect(adapter.inspectServiceInstance(
+      'railway-db-service',
+      'railway-production'
+    )).resolves.toEqual({
+      state: 'present',
+      instanceId: 'instance-1',
+      serviceId: 'railway-db-service',
+      environmentId: 'railway-production',
+      sourceImage: 'postgres:17',
+    });
   });
 });

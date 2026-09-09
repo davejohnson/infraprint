@@ -35,11 +35,31 @@ interface Call {
 function fakeClient(overrides: Record<string, (variables: Record<string, unknown>, call: number) => unknown> = {}) {
   const calls: Call[] = [];
   const counts = new Map<string, number>();
-  const deletedServices = new Set<string>();
+  const deletedServiceInstances = new Set<string>();
+  const serviceInstanceKey = (serviceId: unknown, environmentId: unknown) =>
+    `${String(serviceId)}:${String(environmentId)}`;
   const defaults: Record<string, (variables: Record<string, unknown>, call: number) => unknown> = {
     GetProjectServicesConnection: () => ({ project: { services: { edges: [{ node: { id: 'src-svc-1', name: 'web' } }] } } }),
-    GetServiceEnvironmentInstance: () => ({
-      service: { id: 'src-svc-1', serviceInstances: { edges: [{ node: { environmentId: 'railenv-1' } }] } },
+    GetServiceEnvironmentInstance: (variables) => ({
+      serviceInstance: deletedServiceInstances.has(serviceInstanceKey(variables.serviceId, variables.environmentId))
+        ? null
+        : {
+            id: `instance-${String(variables.serviceId)}`,
+            serviceId: variables.serviceId,
+            environmentId: variables.environmentId,
+          },
+    }),
+    GetServiceInstanceInventory: (variables) => ({
+      service: deletedServiceInstances.has(serviceInstanceKey(variables.serviceId, 'railenv-1'))
+        ? null
+        : {
+            id: variables.serviceId,
+            projectId: 'proj-1',
+            serviceInstances: {
+              edges: [{ node: { id: `instance-${String(variables.serviceId)}`, environmentId: 'railenv-1' } }],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
     }),
     TaskSourceInstance: () => ({ serviceInstance: { source: { image: 'ghcr.io/dave/app:sha1' } } }),
     GetVariables: () => ({ variables: { DATABASE_URL: 'postgresql://internal', RAILWAY_TOKEN_INJECTED: 'x', SESSION_SECRET: 's' } }),
@@ -51,17 +71,11 @@ function fakeClient(overrides: Record<string, (variables: Record<string, unknown
       { timestamp: 't', message: 'seeding...', severity: 'info' },
       { timestamp: 't', message: '__HYPERVIBE_TASK_EXIT:0__', severity: 'info' },
     ] }),
-    serviceDelete: () => ({ serviceDelete: true }),
-    GetService: (variables) => {
-      const id = String(variables.id);
-      if (deletedServices.has(id)) {
-        const error = new Error('Service not found') as Error & { response: Record<string, unknown> };
-        error.response = {
-          errors: [{ message: 'Service not found', path: ['service'], extensions: { code: 'NOT_FOUND' } }],
-        };
-        throw error;
+    serviceDelete: (variables) => {
+      if (variables.environmentId !== 'railenv-1') {
+        throw new Error('Expected environment-scoped service deletion');
       }
-      return { service: { id } };
+      return { serviceDelete: true };
     },
   };
   const request = vi.fn(async (query: string, variables: Record<string, unknown> = {}) => {
@@ -79,7 +93,7 @@ function fakeClient(overrides: Record<string, (variables: Record<string, unknown
       && typeof result === 'object'
       && (result as { serviceDelete?: unknown }).serviceDelete
     ) {
-      deletedServices.add(String(variables.id));
+      deletedServiceInstances.add(serviceInstanceKey(variables.id, variables.environmentId));
     }
     return result;
   });
@@ -189,8 +203,8 @@ describe('RailwayAdapter.runJob', () => {
     expect(result.status).toBe('completed');
     const deleteCalls = client.calls.filter((call) => call.query === 'serviceDelete');
     expect(deleteCalls.map((call) => call.variables)).toEqual([
-      { id: 'old-task-1' },
-      { id: 'task-svc-1' },
+      { id: 'old-task-1', environmentId: 'railenv-1' },
+      { id: 'task-svc-1', environmentId: 'railenv-1' },
     ]);
   });
 

@@ -252,6 +252,40 @@ describe('hv_inspect / hv_import', () => {
     vi.spyOn(RailwayAdapter.prototype, 'getServiceVariables').mockResolvedValue({ DATABASE_URL: 'postgres://x' });
   }
 
+  function railwayDatabaseProject(
+    projectId: string,
+    environmentIds: string[]
+  ): RailwayProjectDetails {
+    return {
+      id: projectId,
+      name: `${projectId}-app`,
+      environments: {
+        edges: environmentIds.map((environmentId) => ({
+          node: { id: environmentId, name: environmentId },
+        })),
+      },
+      services: {
+        edges: [{
+          node: {
+            id: 'railway-db-service',
+            name: 'primary-data',
+            repoTriggers: { edges: [] },
+            serviceInstances: {
+              edges: environmentIds.map((environmentId) => ({
+                node: {
+                  environmentId,
+                  domains: { serviceDomains: [], customDomains: [] },
+                  source: { image: 'postgres:17' },
+                },
+              })),
+            },
+          },
+        }],
+      },
+      plugins: { edges: [] },
+    };
+  }
+
   function railwayService(input: {
     id: string;
     name: string;
@@ -743,6 +777,126 @@ describe('hv_inspect / hv_import', () => {
       externalId: null,
       bindings: { provisioningIncomplete: true },
     });
+    await t.close();
+  });
+
+  it('hv_import retains the Railway database instance in the selected local environment scope', async () => {
+    const project = new ProjectRepository().create({ name: 'railway-retained-db-app' });
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'staging',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'railway-project',
+        environmentId: 'railway-staging',
+      },
+    });
+    createRailwayConnection(true);
+    mockAdapter(railwayDatabaseProject('railway-project', [
+      'railway-production',
+      'railway-staging',
+    ]));
+    const t = await makeClient();
+
+    const result = await t.call('hv_import', {
+      provider: 'railway',
+      mode: 'retained-database-cleanup',
+      project: project.name,
+      env: environment.name,
+      id: 'railway-db-service',
+      confirm: true,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(new EnvironmentRepository().findById(environment.id)!.platformBindings.previousDatabase)
+      .toEqual({
+        provider: 'railway',
+        externalId: 'railway-db-service',
+        engine: 'postgres',
+        name: 'primary-data',
+        resourceKind: 'service',
+        providerScope: {
+          projectId: 'railway-project',
+          environmentId: 'railway-staging',
+        },
+      });
+    await t.close();
+  });
+
+  it('hv_import preserves a unique retained Railway database scope after the hosting binding moved', async () => {
+    const project = new ProjectRepository().create({ name: 'railway-moved-db-app' });
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'production',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'current-project',
+        environmentId: 'current-environment',
+      },
+    });
+    createRailwayConnection(true);
+    mockAdapter(railwayDatabaseProject('retained-project', ['retained-environment']));
+    const t = await makeClient();
+
+    const result = await t.call('hv_import', {
+      provider: 'railway',
+      mode: 'retained-database-cleanup',
+      project: project.name,
+      env: environment.name,
+      id: 'railway-db-service',
+      confirm: true,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(new EnvironmentRepository().findById(environment.id)!.platformBindings.previousDatabase)
+      .toMatchObject({
+        externalId: 'railway-db-service',
+        resourceKind: 'service',
+        providerScope: {
+          projectId: 'retained-project',
+          environmentId: 'retained-environment',
+        },
+      });
+    await t.close();
+  });
+
+  it('hv_import refuses a truncated Railway database inventory', async () => {
+    const project = new ProjectRepository().create({ name: 'railway-truncated-db-app' });
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'production',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'railway-project-0',
+        environmentId: 'railway-environment-0',
+      },
+    });
+    createRailwayConnection(true);
+    mockAdapter(railwayDatabaseProject('railway-project-0', ['railway-environment-0']));
+    const projects = Array.from({ length: 26 }, (_, index) => ({
+      id: `railway-project-${index}`,
+      name: `railway-project-${index}`,
+    }));
+    vi.mocked(RailwayAdapter.prototype.listProjects).mockResolvedValue(projects);
+    vi.mocked(RailwayAdapter.prototype.getProjectDetails).mockImplementation(async (projectId) => (
+      railwayDatabaseProject(projectId, [`railway-environment-${projectId.split('-').at(-1)}`])
+    ));
+    const t = await makeClient();
+
+    const result = await t.call('hv_import', {
+      provider: 'railway',
+      mode: 'retained-database-cleanup',
+      project: project.name,
+      env: environment.name,
+      id: 'railway-db-service',
+      confirm: true,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatchObject({ code: 'PROVIDER_ERROR' });
+    expect(result.error.message).toContain('incomplete database inventory');
+    expect(new EnvironmentRepository().findById(environment.id)!.platformBindings.previousDatabase)
+      .toBeUndefined();
     await t.close();
   });
 

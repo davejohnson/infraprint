@@ -611,13 +611,24 @@ const authorized: AuthorizedCase[] = [
       operation,
       billable: operation === STORAGE_OPERATIONS.ensure,
       dataBearing: operation === STORAGE_OPERATIONS.destroy,
-      requiresConfirm: operation === STORAGE_OPERATIONS.destroy,
+      requiresConfirm: operation === STORAGE_OPERATIONS.destroy
+        || operation === STORAGE_OPERATIONS.clearCreateRecovery,
       metadata: {
         storageName: 'documents',
         ...(operation === STORAGE_OPERATIONS.destroy
           ? {
               externalId: 'bucket-1',
               instanceScope: { projectId: 'railway-project', environmentId: 'railway-environment' },
+            }
+          : {}),
+        ...(operation === STORAGE_OPERATIONS.clearCreateRecovery
+          ? {
+              instanceScope: { projectId: 'railway-project', environmentId: 'railway-environment' },
+              storageCreateRecovery: {
+                provider: 'railway', operation: 'create', resourceName: 'documents',
+                providerScope: { projectId: 'railway-project', environmentId: 'railway-environment' },
+                state: 'unresolved',
+              },
             }
           : {}),
         ...(
@@ -955,12 +966,36 @@ const authorized: AuthorizedCase[] = [
   {
     label: 'task service destroy',
     capability: 'hosting.task-service.destroy',
-    action: action({ type: 'destroy', operation: 'taskServiceCleanup', metadata: { externalId: 'task-1' } }),
+    action: action({
+      id: 'service:hv-task-1:destroy',
+      name: 'hv-task-1',
+      type: 'destroy',
+      operation: 'taskServiceCleanup',
+      metadata: {
+        externalId: 'task-1',
+        deleteScope: 'environment',
+        providerScope: { projectId: 'project-1', environmentId: 'environment-1' },
+        bindingsFingerprint: 'a'.repeat(64),
+      },
+    }),
   },
   {
     label: 'previous provider service destroy',
     capability: 'hosting.previous-service.destroy',
-    action: action({ type: 'destroy', operation: 'previousHostingDestroy', metadata: { cleanupBoundary: 'services', previousProvider: 'railway' } }),
+    action: action({
+      id: 'service:web:previous-destroy',
+      type: 'destroy',
+      operation: 'previousHostingDestroy',
+      requiresConfirm: true,
+      metadata: {
+        cleanupBoundary: 'services',
+        previousProvider: 'railway',
+        serviceId: 'service-1',
+        externalId: 'service-1',
+        deleteScope: 'project',
+        providerScope: { projectId: 'project-1' },
+      },
+    }),
   },
   {
     label: 'previous provider environment destroy',
@@ -990,7 +1025,18 @@ const authorized: AuthorizedCase[] = [
   {
     label: 'hosting service destroy',
     capability: 'hosting.service.destroy',
-    action: action({ type: 'destroy', metadata: { externalId: 'service-1' } }),
+    action: action({
+      id: 'service:web:destroy',
+      type: 'destroy',
+      operation: 'hostingServiceDestroy',
+      requiresConfirm: true,
+      metadata: {
+        externalId: 'service-1',
+        deleteScope: 'environment',
+        providerScope: { projectId: 'project-1', environmentId: 'environment-1' },
+        bindingsFingerprint: 'a'.repeat(64),
+      },
+    }),
   },
   {
     label: 'custom domain configure',
@@ -1293,10 +1339,38 @@ describe('plan action mutation-authority contract', () => {
     })).toBeNull();
   });
 
-  it('rejects hosting service deletion without an exact provider target', () => {
-    const candidate = authorized.find((entry) => entry.label === 'hosting service destroy')!.action;
-    expect(resolvePlanActionAuthority({ ...candidate, metadata: undefined })).toBeNull();
-    expect(resolvePlanActionAuthority({ ...candidate, metadata: { externalId: '' } })).toBeNull();
+  it.each((() => {
+    const normal = authorized.find((entry) => entry.label === 'hosting service destroy')!.action;
+    const task = authorized.find((entry) => entry.label === 'task service destroy')!.action;
+    const previous = authorized.find((entry) => entry.label === 'previous provider service destroy')!.action;
+    const withMetadata = (
+      candidate: PlanAction,
+      patch: Record<string, unknown>
+    ): PlanAction => ({ ...candidate, metadata: { ...candidate.metadata, ...patch } });
+
+    return [
+      ['normal missing operation', withMetadata(normal, { operation: undefined })],
+      ['normal wrong operation', withMetadata(normal, { operation: 'taskServiceCleanup' })],
+      ['normal noncanonical id', { ...normal, id: 'service:web:remove' }],
+      ['normal without confirmation', { ...normal, requiresConfirm: false }],
+      ['normal missing delete scope', withMetadata(normal, { deleteScope: undefined })],
+      ['normal invalid delete scope', withMetadata(normal, { deleteScope: 'global' })],
+      ['normal missing project scope', withMetadata(normal, { providerScope: { environmentId: 'environment-1' } })],
+      ['normal missing environment scope', withMetadata(normal, { providerScope: { projectId: 'project-1' } })],
+      ['normal missing binding fingerprint', withMetadata(normal, { bindingsFingerprint: undefined })],
+      ['normal invalid binding fingerprint', withMetadata(normal, { bindingsFingerprint: 'not-a-sha256' })],
+      ['task noncanonical name prefix', {
+        ...task,
+        id: 'service:task-1:destroy',
+        resource: { ...task.resource, name: 'task-1' },
+      }],
+      ['task missing binding fingerprint', withMetadata(task, { bindingsFingerprint: undefined })],
+      ['previous noncanonical id', { ...previous, id: 'service:web:destroy' }],
+      ['previous without confirmation', { ...previous, requiresConfirm: false }],
+      ['previous mismatched legacy and exact ids', withMetadata(previous, { externalId: 'other-service' })],
+    ] satisfies Array<[string, PlanAction]>;
+  })())('rejects invalid service destroy authority: %s', (_label, candidate) => {
+    expect(resolvePlanActionAuthority(candidate)).toBeNull();
   });
 
   it('rejects storage deletion without its exact provider id and instance scope', () => {
@@ -1384,6 +1458,13 @@ describe('plan action mutation-authority contract', () => {
       type: 'update',
       metadata: { ...candidate.metadata, blockedReason: 'queue_observation_unknown' },
     })).toBeNull();
+  });
+
+  it('rejects storage create-recovery clearing when confirmation is stripped', () => {
+    const candidate = authorized.find(
+      (entry) => entry.label === STORAGE_OPERATIONS.clearCreateRecovery
+    )!.action;
+    expect(resolvePlanActionAuthority({ ...candidate, requiresConfirm: undefined })).toBeNull();
   });
 
   it('authorizes exact desired cache reconciliation and rejects unpinned config', () => {

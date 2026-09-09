@@ -19,6 +19,24 @@ export interface DeploymentMutationOptions {
   deferDeployment?: boolean;
 }
 
+/** Exact provider context authorized for deleting one hosting service. */
+export type HostingServiceDeleteScope = Readonly<
+  | {
+      scope: 'environment';
+      projectId: string;
+      environmentId: string;
+    }
+  | {
+      scope: 'project';
+      projectId: string;
+    }
+>;
+
+export interface HostingServiceDeleteOptions {
+  /** False requires an observation-only idempotency check and forbids mutation. */
+  allowMutation: boolean;
+}
+
 /** Non-secret desired hosting placement selected by the spec, not credentials. */
 export interface HostingTargetOptions {
   region?: string;
@@ -228,11 +246,12 @@ export interface IProviderAdapter {
     environmentId: string
   ): Promise<{ success: boolean; error?: string; alreadyAbsent?: boolean }>;
 
-  /**
-   * Delete a provider service/resource that was created by Hypervibe.
-   * Optional because not all providers expose this operation.
-   */
-  deleteService?(serviceId: string): Promise<{ success: boolean; error?: string }>;
+  /** Delete one exact provider service target that was created by Hypervibe. */
+  deleteService?(
+    serviceId: string,
+    target: HostingServiceDeleteScope,
+    options: HostingServiceDeleteOptions
+  ): Promise<{ success: boolean; error?: string; alreadyAbsent?: boolean }>;
 
   /**
    * Read back live state for an environment (services, config, env var

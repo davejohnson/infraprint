@@ -165,7 +165,7 @@ describe('RailwayAdapter observe', () => {
         provider: 'railway',
         engine: 'postgres',
         externalId: 'svc-pg',
-        providerScope: { projectId: 'rail-project-1' },
+        providerScope: { projectId: 'rail-project-1', environmentId: 'env-prod' },
         name: 'postgres-db',
         status: 'running',
       },

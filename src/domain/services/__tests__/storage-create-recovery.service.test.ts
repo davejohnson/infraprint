@@ -52,6 +52,23 @@ function ensureAction(): PlanAction {
   };
 }
 
+function recoveryClearAction(): PlanAction {
+  return {
+    id: 'storage:uploads:create-recovery:clear',
+    type: 'update',
+    resource: { kind: 'storage', name: 'uploads', provider: 'railway' },
+    verified: true,
+    requiresConfirm: true,
+    reason: 'Clear provider-confirmed absent recovery state',
+    metadata: {
+      operation: STORAGE_OPERATIONS.clearCreateRecovery,
+      storageName: 'uploads',
+      instanceScope: { projectId: 'rp', environmentId: 're' },
+      storageCreateRecovery: recovery,
+    },
+  };
+}
+
 describe('storage create-recovery planning', () => {
   it('turns a retained exact marker into a non-billable blocker', () => {
     const result = planStorage({
@@ -74,6 +91,46 @@ describe('storage create-recovery planning', () => {
       }),
     ]);
     expect(result.actions[0]?.billable).toBeUndefined();
+  });
+
+  it('plans a confirmed recovery clear before a new create when complete observation proves absence', () => {
+    const result = planStorage({
+      environmentSpec,
+      environment: directEnvironment({
+        provider: 'railway', projectId: 'rp', environmentId: 're',
+        services: { api: { serviceId: 'service-api' } },
+        storageCreateRecovery: { uploads: recovery },
+      }),
+      observed: {
+        provider: 'railway', observedAt: new Date().toISOString(), projectExists: true,
+        projectId: 'rp', environmentId: 're', databases: [], storage: [], partial: false,
+        warnings: [],
+        services: [{
+          name: 'api', externalId: 'service-api', workloadKind: 'web', customDomains: [],
+          envVarKeys: [], envVarHashes: {}, status: 'running', config: {},
+        }],
+        completeness: { storage: 'complete', storageByProvider: { railway: 'complete' } },
+      },
+    });
+
+    expect(result.actions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'storage:uploads:create-recovery:clear',
+        type: 'update',
+        verified: true,
+        requiresConfirm: true,
+        metadata: expect.objectContaining({
+          operation: STORAGE_OPERATIONS.clearCreateRecovery,
+          instanceScope: { projectId: 'rp', environmentId: 're' },
+        }),
+      }),
+      expect.objectContaining({
+        id: 'storage:uploads',
+        type: 'create',
+        billable: true,
+        dependsOn: ['storage:uploads:create-recovery:clear'],
+      }),
+    ]));
   });
 
   it('fails closed on malformed recovery state', () => {
@@ -149,7 +206,10 @@ describe('storage create-recovery apply boundary', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  function fakeStorageAdapter(ensureBucket: ReturnType<typeof vi.fn>) {
+  function fakeStorageAdapter(
+    ensureBucket: ReturnType<typeof vi.fn>,
+    observe: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue([])
+  ) {
     return {
       name: 'railway',
       runtimeEnvKeys: () => [],
@@ -157,6 +217,7 @@ describe('storage create-recovery apply boundary', () => {
         receipt: { success: true, message: 'context ready' },
         context: { projectId: 'rp', environmentId: 're' },
       }),
+      observe,
       ensureBucket,
     };
   }
@@ -174,6 +235,55 @@ describe('storage create-recovery apply boundary', () => {
     expect(result).toMatchObject({ success: false, status: 'blocked' });
     expect(result.error).toContain('No storage provider mutation was attempted');
     expect(getStorageAdapter).not.toHaveBeenCalled();
+  });
+
+  it('clears only the reviewed marker after re-observation proves the bucket is absent', async () => {
+    new EnvironmentRepository().updatePlatformBindings(environment.id, {
+      storageCreateRecovery: { uploads: recovery },
+    });
+    const observe = vi.fn().mockResolvedValue([]);
+    const ensureBucket = vi.fn();
+    vi.spyOn(adapterFactory, 'getStorageAdapter').mockResolvedValue({
+      success: true,
+      adapter: fakeStorageAdapter(ensureBucket, observe),
+    } as never);
+
+    const result = await applyStorageAction({
+      project, envName: 'staging', environmentSpec, action: recoveryClearAction(),
+    });
+    const persisted = new EnvironmentRepository().findById(environment.id);
+
+    expect(result).toMatchObject({ success: true, data: { cleared: true } });
+    expect(observe).toHaveBeenCalledWith(
+      expect.objectContaining({ id: environment.id }),
+      { projectId: 'rp', environmentId: 're' }
+    );
+    expect(ensureBucket).not.toHaveBeenCalled();
+    expect(persisted?.platformBindings.storageCreateRecovery).toBeUndefined();
+  });
+
+  it('preserves the marker when re-observation finds the requested bucket', async () => {
+    new EnvironmentRepository().updatePlatformBindings(environment.id, {
+      storageCreateRecovery: { uploads: recovery },
+    });
+    const observe = vi.fn().mockResolvedValue([{
+      provider: 'railway', kind: 'object', externalId: 'bucket-1',
+      instanceScope: { projectId: 'rp', environmentId: 're' },
+      name: 'uploads', region: 'sjc', status: 'ready',
+    }]);
+    vi.spyOn(adapterFactory, 'getStorageAdapter').mockResolvedValue({
+      success: true,
+      adapter: fakeStorageAdapter(vi.fn(), observe),
+    } as never);
+
+    const result = await applyStorageAction({
+      project, envName: 'staging', environmentSpec, action: recoveryClearAction(),
+    });
+    const persisted = new EnvironmentRepository().findById(environment.id);
+
+    expect(result).toMatchObject({ success: false, status: 'blocked' });
+    expect(result.error).toContain('explicitly adopt');
+    expect(persisted?.platformBindings.storageCreateRecovery).toEqual({ uploads: recovery });
   });
 
   it('durably retains a no-id failed create and prevents a second mutation', async () => {
@@ -210,6 +320,31 @@ describe('storage create-recovery apply boundary', () => {
     expect(second).toMatchObject({ success: false, status: 'blocked' });
     expect(ensureBucket).toHaveBeenCalledTimes(1);
     expect(getStorageAdapter).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retain recovery state for a definitive preflight failure', async () => {
+    const ensureBucket = vi.fn().mockResolvedValue({
+      receipt: {
+        success: false,
+        message: 'bucket inventory could not be read',
+        error: 'provider response was malformed',
+        data: { phase: 'bucketCreate', mutationAttempted: false },
+      },
+      context: { projectId: 'rp', environmentId: 're' },
+    });
+    vi.spyOn(adapterFactory, 'getStorageAdapter').mockResolvedValue({
+      success: true,
+      adapter: fakeStorageAdapter(ensureBucket),
+    } as never);
+
+    const result = await applyStorageAction({
+      project, envName: 'staging', environmentSpec, action: ensureAction(),
+    });
+    const persisted = new EnvironmentRepository().findById(environment.id);
+
+    expect(result).toMatchObject({ success: false });
+    expect(result.data).not.toHaveProperty('storageCreateRecovery');
+    expect(persisted?.platformBindings.storageCreateRecovery).toBeUndefined();
   });
 
   it('replaces malformed provider recovery data with a strict conservative marker', async () => {

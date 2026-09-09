@@ -2,7 +2,11 @@ import type { Project } from '../entities/project.entity.js';
 import type { Environment } from '../entities/environment.entity.js';
 import { serviceWorkloadKind, type Service } from '../entities/service.entity.js';
 import type { Run, RunPlan, RunStep, RunReceipt } from '../entities/run.entity.js';
-import type { IProviderAdapter } from '../ports/provider.port.js';
+import type {
+  HostingServiceDeleteOptions,
+  HostingServiceDeleteScope,
+  IProviderAdapter,
+} from '../ports/provider.port.js';
 import {
   createHostingServiceCreateRecovery,
   parseHostingServiceCreateRecovery,
@@ -14,6 +18,7 @@ import { RunRepository } from '../../adapters/db/repositories/run.repository.js'
 import { EnvironmentRepository } from '../../adapters/db/repositories/environment.repository.js';
 import { ServiceRepository } from '../../adapters/db/repositories/service.repository.js';
 import { AuditRepository } from '../../adapters/db/repositories/audit.repository.js';
+import { providerRegistry } from '../registry/provider.registry.js';
 import { InfraTransaction, type InfraTransactionRollbackResult } from './infra.transaction.js';
 import { snapshotEnvironmentBindings } from './local-state.transaction.js';
 
@@ -192,7 +197,8 @@ export class DeployOrchestrator {
         rollback = await tx.rollback();
         const recoveryPersistenceError = this.persistServiceCreateRecoveries(
           options.environment.id,
-          pendingServiceCreateRecoveries
+          pendingServiceCreateRecoveries,
+          rollback
         );
         if (recoveryPersistenceError) errors.push(recoveryPersistenceError);
       }
@@ -223,7 +229,8 @@ export class DeployOrchestrator {
       const rollback = await tx.rollback();
       const recoveryPersistenceError = this.persistServiceCreateRecoveries(
         options.environment.id,
-        pendingServiceCreateRecoveries
+        pendingServiceCreateRecoveries,
+        rollback
       );
       const caughtErrors = [String(error), ...(recoveryPersistenceError ? [recoveryPersistenceError] : [])];
       this.runRepo.updateStatus(run.id, 'failed', caughtErrors.join('; '));
@@ -256,9 +263,44 @@ export class DeployOrchestrator {
    */
   private persistServiceCreateRecoveries(
     environmentId: string,
-    recoveries: ReadonlyMap<string, HostingServiceCreateRecovery>
+    recoveries: ReadonlyMap<string, HostingServiceCreateRecovery>,
+    rollback: InfraTransactionRollbackResult
   ): string | undefined {
-    if (recoveries.size === 0) return undefined;
+    const recoveriesToPersist = new Map(recoveries);
+    for (const failed of rollback.failed) {
+      const { resource } = failed;
+      const rawProviderScope = resource.metadata?.providerScope;
+      if (resource.type !== 'service'
+        || typeof resource.id !== 'string'
+        || typeof resource.name !== 'string'
+        || !rawProviderScope
+        || typeof rawProviderScope !== 'object'
+        || Array.isArray(rawProviderScope)) {
+        continue;
+      }
+      const providerScope = Object.fromEntries(
+        Object.entries(rawProviderScope)
+          .filter((entry): entry is [string, string] => (
+            entry[0].trim().length > 0
+            && typeof entry[1] === 'string'
+            && entry[1].trim().length > 0
+          ))
+      );
+      if (Object.keys(providerScope).length === 0) continue;
+      const providerResourceName = typeof resource.metadata?.providerResourceName === 'string'
+        && resource.metadata.providerResourceName.trim().length > 0
+        ? resource.metadata.providerResourceName
+        : resource.name;
+      recoveriesToPersist.set(resource.name, createHostingServiceCreateRecovery({
+        provider: resource.provider,
+        resourceName: providerResourceName,
+        providerScope,
+        state: 'identified',
+        serviceId: resource.id,
+        returnedName: providerResourceName,
+      }));
+    }
+    if (recoveriesToPersist.size === 0) return undefined;
     try {
       const environment = this.envRepo.findById(environmentId);
       if (!environment) {
@@ -268,7 +310,7 @@ export class DeployOrchestrator {
       const currentRecovery = rawRecovery && typeof rawRecovery === 'object' && !Array.isArray(rawRecovery)
         ? { ...(rawRecovery as Record<string, unknown>) }
         : {};
-      for (const [serviceName, recovery] of recoveries) {
+      for (const [serviceName, recovery] of recoveriesToPersist) {
         currentRecovery[serviceName] = recovery;
       }
       const updated = this.envRepo.updatePlatformBindings(environmentId, {
@@ -518,6 +560,10 @@ export class DeployOrchestrator {
             && deployData.environmentId.trim().length > 0
             ? deployData.environmentId
             : undefined;
+          const providerResourceName = typeof deployData.providerResourceName === 'string'
+            && deployData.providerResourceName.trim().length > 0
+            ? deployData.providerResourceName
+            : undefined;
 
           // A provider-reported success without an exact, non-empty identity
           // cannot become a successful deploy or a normal service binding.
@@ -568,6 +614,12 @@ export class DeployOrchestrator {
             const createdService = result.receipt.data?.createdService === true || result.receipt.data?.created === true;
             if (createdService) {
               const createdServiceId = externalId;
+              const providerProjectId = currentBindings.projectId;
+              const providerEnvironmentId = receiptEnvironmentId ?? currentBindings.environmentId;
+              const providerScope = {
+                ...(providerProjectId ? { projectId: providerProjectId } : {}),
+                ...(providerEnvironmentId ? { environmentId: providerEnvironmentId } : {}),
+              };
               tx.addStep({
                 id: `provider-service:${createdServiceId}`,
                 label: `deploy_${service.name}`,
@@ -576,10 +628,14 @@ export class DeployOrchestrator {
                   type: 'service',
                   id: createdServiceId,
                   name: service.name,
+                  metadata: {
+                    providerScope,
+                    ...(providerResourceName ? { providerResourceName } : {}),
+                  },
                 },
                 compensate: async () => {
                   const adapterWithDelete = options.adapter as (IProviderAdapter | IHostingAdapter) & {
-                    deleteService?: (serviceId: string) => Promise<{ success: boolean; error?: string }>;
+                    deleteService?: (serviceId: string, target: HostingServiceDeleteScope, options: HostingServiceDeleteOptions) => Promise<{ success: boolean; error?: string }>;
                   };
                   if (typeof adapterWithDelete.deleteService !== 'function') {
                     return {
@@ -587,7 +643,41 @@ export class DeployOrchestrator {
                       error: `Manual cleanup required: ${options.adapter.name} service ${createdServiceId}`,
                     };
                   }
-                  const deleted = await adapterWithDelete.deleteService(createdServiceId);
+                  if (!providerProjectId) {
+                    return {
+                      success: false,
+                      error: `Manual cleanup required: ${options.adapter.name} service ${createdServiceId} has no durable project scope`,
+                    };
+                  }
+                  const teardownBoundary = providerRegistry.getMetadata(options.adapter.name)
+                    ?.lifecycle?.hosting?.teardownBoundary;
+                  if (!teardownBoundary) {
+                    return {
+                      success: false,
+                      error: `Manual cleanup required: ${options.adapter.name} has no declared hosting teardown boundary for service ${createdServiceId}`,
+                    };
+                  }
+                  if (teardownBoundary === 'environment' && !providerEnvironmentId) {
+                    return {
+                      success: false,
+                      error: `Manual cleanup required: ${options.adapter.name} service ${createdServiceId} has no durable environment scope`,
+                    };
+                  }
+                  const deleteTarget: HostingServiceDeleteScope = teardownBoundary === 'environment'
+                    ? {
+                        scope: 'environment',
+                        projectId: providerProjectId,
+                        environmentId: providerEnvironmentId!,
+                      }
+                    : {
+                        scope: 'project',
+                        projectId: providerProjectId,
+                      };
+                  const deleted = await adapterWithDelete.deleteService(
+                    createdServiceId,
+                    deleteTarget,
+                    { allowMutation: true }
+                  );
                   return {
                     success: deleted.success,
                     error: deleted.error,
@@ -663,6 +753,7 @@ export class DeployOrchestrator {
               url: result.url,
               publicUrl: result.url,
               externalId,
+              ...(providerResourceName ? { providerResourceName } : {}),
               ...(serviceCreateRecovery
                 ? { serviceCreateRecovery }
                 : {}),

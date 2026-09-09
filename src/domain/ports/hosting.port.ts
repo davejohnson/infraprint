@@ -8,6 +8,8 @@ import type {
   JobResult,
   DeploymentMutationOptions,
   HostingTargetOptions,
+  HostingServiceDeleteScope,
+  HostingServiceDeleteOptions,
 } from './provider.port.js';
 
 /**
@@ -230,6 +232,7 @@ const previousDatabaseSchema = z.object({
   externalId: nonEmptyHostingBindingString,
   engine: z.literal('postgres'),
   name: nonEmptyHostingBindingString,
+  resourceKind: nonEmptyHostingBindingString.optional(),
   providerScope: retainedProviderScopeSchema,
 }).passthrough();
 
@@ -392,11 +395,12 @@ export interface IHostingAdapter {
     environmentId: string
   ): Promise<{ success: boolean; error?: string; alreadyAbsent?: boolean }>;
 
-  /**
-   * Delete a provider service/resource that was created by Hypervibe.
-   * Optional because not all hosting providers expose this operation.
-   */
-  deleteService?(serviceId: string): Promise<{ success: boolean; error?: string }>;
+  /** Delete one exact provider service target that was created by Hypervibe. */
+  deleteService?(
+    serviceId: string,
+    target: HostingServiceDeleteScope,
+    options: HostingServiceDeleteOptions
+  ): Promise<{ success: boolean; error?: string; alreadyAbsent?: boolean }>;
 
   /**
    * Get connection URL for a database component.

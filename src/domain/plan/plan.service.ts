@@ -1129,7 +1129,7 @@ export class PlanService {
       if (
         (teardownBoundary === 'services' && retainedServices.length === 0)
         || ((teardownBoundary === 'services' || teardownBoundary === 'project') && incompleteServices.length > 0)
-        || ((teardownBoundary === 'environment' || teardownBoundary === 'project') && !previousHosting.projectId)
+        || !previousHosting.projectId
         || (teardownBoundary === 'environment' && !previousHosting.environmentId)
       ) {
         return {
@@ -1155,18 +1155,26 @@ export class PlanService {
     if (previousDatabaseProvider) {
       const externalId = previousDatabase?.externalId;
       const engine = previousDatabase?.engine;
+      const resourceKind = previousDatabase?.resourceKind;
       const providerScope = previousDatabase?.providerScope;
+      const requiredScopeKeys = providerRegistry.get(previousDatabaseProvider)
+        ?.inspection?.selectors.database?.scopeKeys ?? [];
+      const missingScopeKeys = requiredScopeKeys.filter((key) => (
+        typeof providerScope?.[key] !== 'string' || !providerScope[key]?.trim()
+      ));
       if (
         !externalId
         || engine !== 'postgres'
         || !providerScope
+        || requiredScopeKeys.length === 0
+        || missingScopeKeys.length > 0
         || Object.keys(providerScope).length === 0
         || Object.entries(providerScope).some(([key, value]) => (
           !key.trim() || typeof value !== 'string' || !value.trim()
         ))
       ) {
         return {
-          error: `The retained ${previousDatabaseProvider} database binding is incomplete. Re-import one exact database id and provider scope before planning deletion.`,
+          error: `The retained ${previousDatabaseProvider} database binding is incomplete${missingScopeKeys.length > 0 ? ` (missing provider scope: ${missingScopeKeys.join(', ')})` : ''}. Re-run hv_inspect and re-import one exact database id with its complete provider scope before planning deletion.`,
         };
       }
       let blockedReason: string | undefined;
@@ -1186,6 +1194,7 @@ export class PlanService {
             instanceId: externalId,
             providerScope,
             retainedCleanup: true,
+            ...(resourceKind ? { resourceKind } : {}),
           },
           createdAt: environment.createdAt,
           updatedAt: environment.updatedAt,
@@ -1225,6 +1234,7 @@ export class PlanService {
           operation: 'retainedDatabaseDestroy',
           externalId,
           providerScope,
+          ...(resourceKind ? { resourceKind } : {}),
           ...(blockedReason ? { blockedReason } : {}),
         },
       });
@@ -1989,6 +1999,11 @@ export class PlanService {
       local,
       providerBehavior: hostingMetadata?.orchestration?.diff,
       previousHostingTeardownBoundary,
+      hostingServiceDeleteScope: hostingMetadata?.lifecycle?.hosting?.teardownBoundary === 'environment'
+        ? 'environment'
+        : hostingMetadata?.lifecycle?.hosting?.teardownBoundary
+          ? 'project'
+          : undefined,
       customDomainManagement: hostingMetadata?.lifecycle?.hosting?.customDomains,
       customDomainTrafficProxy: hostingMetadata?.lifecycle?.hosting?.domainTrafficProxy,
       expectedSource: this.expectedDeploySource(projectForPlan, environmentName, environmentSpec),
