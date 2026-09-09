@@ -1137,7 +1137,7 @@ describe('diffEnvironment — unmanaged resources', () => {
       type: 'destroy',
       resource: expect.objectContaining({ kind: 'service', name: 'daily', provider: 'railway' }),
       verified: true,
-      metadata: { externalId: 'svc-daily' },
+      metadata: expect.objectContaining({ externalId: 'svc-daily' }),
     }));
   });
 
@@ -1162,7 +1162,7 @@ describe('diffEnvironment — unmanaged resources', () => {
     expect(result.actions.filter((action) => action.id === 'service:daily:destroy')).toEqual([
       expect.objectContaining({
         type: 'destroy',
-        metadata: { externalId: 'svc-daily' },
+        metadata: expect.objectContaining({ externalId: 'svc-daily' }),
       }),
     ]);
     expect(result.unmanaged).toContainEqual(expect.objectContaining({
@@ -1193,13 +1193,37 @@ describe('diffEnvironment — unmanaged resources', () => {
       expect.objectContaining({
         type: 'destroy',
         verified: true,
-        metadata: { externalId: 'svc-original' },
+        metadata: expect.objectContaining({ externalId: 'svc-original' }),
       }),
     ]);
     expect(result.unmanaged).toContainEqual(expect.objectContaining({
       kind: 'service',
       name: 'daily',
     }));
+  });
+
+  it('does not authorize deleting a removed binding whose exact id now serves a desired service', () => {
+    const result = diffEnvironment({
+      spec: spec(),
+      envName: 'production',
+      observed: observed({
+        services: [observedWeb({ name: 'web', externalId: 'svc-shared' })],
+        completeness: { services: 'complete' },
+      }),
+      local: local({
+        services: [localService('web'), localService('daily')],
+        bindings: {
+          provider: 'railway',
+          projectId: 'rail-proj-1',
+          environmentId: 'rail-env-1',
+          services: { web: { serviceId: 'svc-web-old' }, daily: { serviceId: 'svc-shared' } },
+        },
+      }),
+      hostingServiceDeleteScope: 'environment',
+    });
+
+    expect(result.actions).not.toContainEqual(expect.objectContaining({ id: 'service:daily:destroy' }));
+    expect(result.warnings).toContainEqual(expect.stringContaining('identity conflict'));
   });
 
   it('plans unverified destroy for locally bound services removed from the spec when observation is unavailable', () => {

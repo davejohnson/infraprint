@@ -366,9 +366,14 @@ function validateStatefulInspectionResult(params: {
     if (typeof checked.name !== 'string' || !checked.name.trim()) {
       fail('a resource omitted its exact provider name.', { index, id: checked.id });
     }
-    const missingScopeKeys = scopeKeys.filter((key) => (
-      typeof scope?.[key] !== 'string' || !(scope[key] as string).trim()
-    ));
+    // Explicitly unsupported legacy resources remain inspectable, but cannot
+    // become deletion targets. Required scope keys apply to lifecycle-capable
+    // candidates that inspection may authorize for import.
+    const missingScopeKeys = checked.cleanupSupported === false
+      ? []
+      : scopeKeys.filter((key) => (
+          typeof scope?.[key] !== 'string' || !(scope[key] as string).trim()
+        ));
     if (missingScopeKeys.length > 0) {
       fail('a resource omitted required durable provider scope.', {
         index,

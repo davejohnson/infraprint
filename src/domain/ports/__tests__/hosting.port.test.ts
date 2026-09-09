@@ -118,6 +118,7 @@ describe('parseHostingBindings', () => {
           externalId: 'database-1',
           engine: 'postgres',
           name: 'database',
+          resourceKind: 'service',
           providerScope: { projectId: 'gcp-project', region: 'us-west1' },
           providerReceipt: { operation: 'insert' },
         },
@@ -134,6 +135,7 @@ describe('parseHostingBindings', () => {
     });
 
     expect(parsed.previousDatabase?.externalId).toBe('database-1');
+    expect(parsed.previousDatabase?.resourceKind).toBe('service');
     expect(parsed.previousCache?.externalId).toBe('cache-1');
     expect((parsed.previousCache as Record<string, unknown>).providerReceipt).toEqual({ operation: 'create' });
   });

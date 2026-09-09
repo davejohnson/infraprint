@@ -365,22 +365,54 @@ async function setupRailway(
     };
   } else {
     const railway = new RailwayAdapter();
-    const request = vi.fn(async (document: unknown) => {
+    let deleteAcknowledged = false;
+    let postDeleteReads = 0;
+    const request = vi.fn(async (
+      document: unknown,
+      variables: Record<string, unknown> = {}
+    ) => {
       const operation = String(document);
-      if (operation.includes('query GetService')) {
+      if (operation.includes('query GetServiceEnvironmentInstance')) {
         observations += 1;
         if (scenario === 'already_absent') {
-          return { service: null };
+          return { serviceInstance: null };
         }
         if (scenario === 'delete_observation_unknown') {
           throw new Error('Railway database observation unavailable');
         }
-        return observations >= 3
-          ? { service: null }
-          : { service: { id: EXTERNAL_IDS[0] } };
+        if (deleteAcknowledged) {
+          postDeleteReads += 1;
+          if (postDeleteReads >= 2) {
+            return { serviceInstance: null };
+          }
+        }
+        return {
+          serviceInstance: {
+            id: 'rail-db-instance',
+            serviceId: EXTERNAL_IDS[0],
+            environmentId: 'rail-env',
+          },
+        };
       }
-      if (operation.includes('mutation DeleteService')) {
-        mutations.push(document);
+      if (operation.includes('query GetServiceInstanceInventory')) {
+        observations += 1;
+        return {
+          service: {
+            id: EXTERNAL_IDS[0],
+            projectId: 'rail-project',
+            serviceInstances: {
+              edges: [{ node: { id: 'rail-db-instance', environmentId: 'rail-env' } }],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        };
+      }
+      if (operation.includes('mutation DeleteEnvironmentService')) {
+        if (variables.id !== EXTERNAL_IDS[0] || variables.environmentId !== 'rail-env') {
+          throw new Error('Expected exact environment-scoped Railway service deletion');
+        }
+        mutations.push({ document, variables });
+        deleteAcknowledged = true;
         return { serviceDelete: true };
       }
       throw new Error(`Unexpected Railway request: ${operation}`);

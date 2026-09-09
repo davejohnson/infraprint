@@ -246,6 +246,90 @@ describe('PlanService retained-cleanup scope', () => {
     expect(document).toMatchObject({ scope: 'retained-cleanup', actions: plan.actions });
   });
 
+  it('plans a retained Railway database destroy with its complete environment scope', async () => {
+    arrangeEnvironment('railway');
+    const environment = new EnvironmentRepository().findByProjectAndName(project.id, 'production')!;
+    new EnvironmentRepository().updatePlatformBindings(environment.id, {
+      previousDatabase: {
+        provider: 'railway',
+        externalId: 'retained-railway-db',
+        engine: 'postgres',
+        name: 'postgres-db',
+        resourceKind: 'service',
+        providerScope: {
+          projectId: 'retained-project',
+          environmentId: 'retained-environment',
+        },
+      },
+    });
+    const disconnect = vi.fn(async () => {});
+    const observeDatabase = vi.fn(async () => ({
+      provider: 'railway',
+      engine: 'postgres',
+      externalId: 'retained-railway-db',
+      providerScope: {
+        projectId: 'retained-project',
+        environmentId: 'retained-environment',
+      },
+      name: 'postgres-db',
+      status: 'running',
+    }));
+    vi.spyOn(adapterFactory, 'getDatabaseAdapter').mockResolvedValue({
+      success: true,
+      adapter: {
+        observeDatabase,
+        disconnect,
+      },
+    } as never);
+
+    const result = await new PlanService().plan(project, 'production', cleanupOptions);
+
+    expect(result).not.toHaveProperty('error');
+    const plan = result as Exclude<typeof result, { error: string }>;
+    expect(plan.actions).toEqual([expect.objectContaining({
+      id: 'database:railway:retained-destroy',
+      verified: true,
+      metadata: {
+        operation: 'retainedDatabaseDestroy',
+        externalId: 'retained-railway-db',
+        resourceKind: 'service',
+        providerScope: {
+          projectId: 'retained-project',
+          environmentId: 'retained-environment',
+        },
+      },
+    })]);
+    expect(observeDatabase).toHaveBeenCalledWith(
+      expect.objectContaining({ id: environment.id }),
+      expect.objectContaining({
+        bindings: expect.objectContaining({ resourceKind: 'service' }),
+      })
+    );
+    expect(disconnect).toHaveBeenCalledOnce();
+  });
+
+  it('blocks a legacy project-only retained Railway database before provider observation', async () => {
+    arrangeEnvironment('railway');
+    const environment = new EnvironmentRepository().findByProjectAndName(project.id, 'production')!;
+    new EnvironmentRepository().updatePlatformBindings(environment.id, {
+      previousDatabase: {
+        provider: 'railway',
+        externalId: 'retained-railway-db',
+        engine: 'postgres',
+        name: 'postgres-db',
+        providerScope: { projectId: 'retained-project' },
+      },
+    });
+    const getDatabaseAdapter = vi.spyOn(adapterFactory, 'getDatabaseAdapter');
+
+    const result = await new PlanService().plan(project, 'production', cleanupOptions);
+
+    expect(result).toHaveProperty('error');
+    expect((result as { error: string }).error).toMatch(/environmentId.*re-run hv_inspect.*re-import/i);
+    expect(getDatabaseAdapter).not.toHaveBeenCalled();
+    expect(new RunRepository().findByProjectId(project.id)).toEqual([]);
+  });
+
   it('plans one exact confirmation-gated retained cache destroy without unrelated actions', async () => {
     arrangeEnvironment('railway');
     const environment = new EnvironmentRepository().findByProjectAndName(project.id, 'production')!;
@@ -465,6 +549,7 @@ describe('PlanService retained-cleanup scope', () => {
 
   it.each([
     ['service', 'railway', { provider: 'cloudrun', projectId: 'old-gcp-project', services: { web: {} } }],
+    ['services', 'railway', { provider: 'cloudrun', services: { web: { serviceId: 'old-cloudrun-web' } } }],
     ['environment', 'cloudrun', { provider: 'railway', projectId: 'old-railway-project', services: {} }],
     ['project', 'railway', { provider: 'ecs', services: { web: { serviceId: 'old-ecs-web' } } }],
   ])('rejects an incomplete retained %s-boundary identity before persisting', async (_boundary, currentProvider, previousHosting) => {

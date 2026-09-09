@@ -19,7 +19,7 @@ function environment(projectId = 'rail-project-1'): Environment {
   };
 }
 
-function databaseComponent(providerScope?: { projectId: string }): Component {
+function databaseComponent(providerScope?: { projectId: string; environmentId?: string }): Component {
   const now = new Date();
   return {
     id: 'component-1',
@@ -69,11 +69,34 @@ describe('Railway database adapter', () => {
     expect(ensureComponent).toHaveBeenCalledWith('postgres', refreshedEnvironment);
     expect(result.component.bindings).toMatchObject({
       projectId: 'rail-project-refreshed',
-      providerScope: { projectId: 'rail-project-refreshed' },
+      providerScope: {
+        projectId: 'rail-project-refreshed',
+        environmentId: 'rail-environment-1',
+      },
     });
     expect(result.receipt.data).toMatchObject({
       providerProjectId: 'rail-project-refreshed',
     });
+  });
+
+  it('refuses provisioning without a durable Railway environment scope', async () => {
+    const incompleteEnvironment = environment();
+    delete incompleteEnvironment.platformBindings.environmentId;
+    const observe = vi.fn();
+    const ensureComponent = vi.fn();
+    const adapter = createRailwayDatabaseAdapter({
+      hostingAdapter: { observe, ensureComponent } as never,
+      envRepo: { findById: vi.fn(() => incompleteEnvironment) } as never,
+    });
+
+    const result = await adapter.provision('postgres', incompleteEnvironment);
+
+    expect(result.receipt).toMatchObject({
+      success: false,
+      message: 'Railway project or environment binding is missing',
+    });
+    expect(observe).not.toHaveBeenCalled();
+    expect(ensureComponent).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -162,37 +185,42 @@ describe('Railway database adapter', () => {
       .rejects.toThrow('was not completely observed');
   });
 
-  it('observes a retained database through its recorded project after a project rebind', async () => {
+  it('observes an exact retained instance even when aggregate project inventory omits it', async () => {
     const getProjectDetails = vi.fn(async () => ({
-      services: {
-        edges: [{
-          node: {
-            id: 'svc-db-1',
-            name: 'postgres-db',
-            serviceInstances: {
-              edges: [{ node: { source: { image: 'postgres:16' } } }],
-            },
-          },
-        }],
-      },
+      services: { edges: [] },
       plugins: { edges: [] },
+    }));
+    const inspectServiceInstance = vi.fn(async () => ({
+      state: 'present' as const,
+      instanceId: 'instance-1',
+      serviceId: 'svc-db-1',
+      environmentId: 'retained-environment',
+      sourceImage: 'postgres:16',
     }));
     const observe = vi.fn();
     const findById = vi.fn(() => environment('current-project'));
     const adapter = createRailwayDatabaseAdapter({
-      hostingAdapter: { getProjectDetails, observe } as never,
+      hostingAdapter: { getProjectDetails, inspectServiceInstance, observe } as never,
       envRepo: { findById } as never,
     });
-    const component = databaseComponent({ projectId: 'retained-project' });
+    const component = databaseComponent({
+      projectId: 'retained-project',
+      environmentId: 'retained-environment',
+    });
     component.bindings.retainedCleanup = true;
+    component.bindings.resourceKind = 'service';
 
     const result = await adapter.observeDatabase(environment('current-project'), component);
 
     expect(result).toMatchObject({
       externalId: 'svc-db-1',
-      providerScope: { projectId: 'retained-project' },
+      providerScope: {
+        projectId: 'retained-project',
+        environmentId: 'retained-environment',
+      },
     });
-    expect(getProjectDetails).toHaveBeenCalledWith('retained-project');
+    expect(inspectServiceInstance).toHaveBeenCalledWith('svc-db-1', 'retained-environment');
+    expect(getProjectDetails).not.toHaveBeenCalled();
     expect(findById).not.toHaveBeenCalled();
     expect(observe).not.toHaveBeenCalled();
   });
@@ -257,7 +285,15 @@ describe('Railway database adapter', () => {
     const result = await adapter.destroy(component);
 
     expect(result.success).toBe(true);
-    expect(deleteService).toHaveBeenCalledWith('svc-db-1');
+    expect(deleteService).toHaveBeenCalledWith(
+      'svc-db-1',
+      {
+        scope: 'environment',
+        projectId: 'rail-project-1',
+        environmentId: 'rail-environment-1',
+      },
+      { allowMutation: true }
+    );
     expect(resolveServiceVolume).toHaveBeenCalledWith({
       projectId: 'rail-project-1',
       environmentId: 'rail-environment-1',
@@ -322,7 +358,15 @@ describe('Railway database adapter', () => {
 
     expect(result.success).toBe(false);
     expect(result.message).toContain('persistent volume was preserved');
-    expect(deleteService).toHaveBeenCalledWith('svc-db-1');
+    expect(deleteService).toHaveBeenCalledWith(
+      'svc-db-1',
+      {
+        scope: 'environment',
+        projectId: 'rail-project-1',
+        environmentId: 'rail-environment-1',
+      },
+      { allowMutation: true }
+    );
     expect(deleteVolume).not.toHaveBeenCalled();
   });
 
@@ -351,7 +395,15 @@ describe('Railway database adapter', () => {
 
     expect(result.success).toBe(true);
     expect(resolveServiceVolume).toHaveBeenCalledWith(component.bindings.volumeTarget, undefined);
-    expect(deleteService).toHaveBeenCalledWith('svc-db-1');
+    expect(deleteService).toHaveBeenCalledWith(
+      'svc-db-1',
+      {
+        scope: 'environment',
+        projectId: 'rail-project-1',
+        environmentId: 'rail-environment-1',
+      },
+      { allowMutation: true }
+    );
     expect(deleteVolume).toHaveBeenCalledWith('recovered-volume', component.bindings.volumeTarget);
   });
 
@@ -426,15 +478,36 @@ describe('Railway database adapter', () => {
     expect(deleteVolume).not.toHaveBeenCalled();
   });
 
-  it('provider-verifies and deletes a retained service database even when generic cleanup omitted resourceKind', async () => {
+  it('discovers and deletes an attached volume for a present retained service database', async () => {
     const deleteService = vi.fn(async () => ({ success: true }));
+    const deleteVolume = vi.fn(async () => ({ success: true }));
+    const resolveServiceVolume = vi.fn(async () => ({
+      success: true as const,
+      state: 'present' as const,
+      volumeId: 'retained-volume',
+      pendingDeletion: false,
+    }));
+    const inspectServiceInstance = vi.fn(async () => ({
+      state: 'present' as const,
+      instanceId: 'instance-1',
+      serviceId: 'svc-db-1',
+      environmentId: 'retained-environment',
+      sourceImage: 'postgres:16',
+    }));
     const getProjectDetails = vi.fn(async () => ({
       services: {
         edges: [{
           node: {
             id: 'svc-db-1',
             name: 'postgres-db',
-            serviceInstances: { edges: [{ node: { source: { image: 'postgres:16' } } }] },
+            serviceInstances: {
+              edges: [{
+                node: {
+                  environmentId: 'retained-environment',
+                  source: { image: 'postgres:16' },
+                },
+              }],
+            },
           },
         }],
       },
@@ -442,29 +515,75 @@ describe('Railway database adapter', () => {
     }));
     const findById = vi.fn(() => environment('current-project'));
     const adapter = createRailwayDatabaseAdapter({
-      hostingAdapter: { deleteService, getProjectDetails } as never,
+      hostingAdapter: {
+        deleteService,
+        deleteVolume,
+        resolveServiceVolume,
+        getProjectDetails,
+        inspectServiceInstance,
+      } as never,
       envRepo: { findById } as never,
     });
-    const component = databaseComponent({ projectId: 'retained-project' });
+    const component = databaseComponent({
+      projectId: 'retained-project',
+      environmentId: 'retained-environment',
+    });
     component.bindings.retainedCleanup = true;
-    delete component.bindings.resourceKind;
+    component.bindings.resourceKind = 'service';
 
     const result = await adapter.destroy(component);
 
     expect(result.success).toBe(true);
-    expect(getProjectDetails).toHaveBeenCalledWith('retained-project');
-    expect(deleteService).toHaveBeenCalledWith('svc-db-1');
+    expect(inspectServiceInstance).toHaveBeenCalledWith('svc-db-1', 'retained-environment');
+    expect(getProjectDetails).not.toHaveBeenCalled();
+    expect(resolveServiceVolume).toHaveBeenCalledWith({
+      projectId: 'retained-project',
+      environmentId: 'retained-environment',
+      serviceId: 'svc-db-1',
+      mountPath: '/var/lib/postgresql/data',
+    }, undefined);
+    expect(deleteService).toHaveBeenCalledWith(
+      'svc-db-1',
+      {
+        scope: 'environment',
+        projectId: 'retained-project',
+        environmentId: 'retained-environment',
+      },
+      { allowMutation: true }
+    );
+    expect(deleteVolume).toHaveBeenCalledWith('retained-volume', {
+      projectId: 'retained-project',
+      environmentId: 'retained-environment',
+      serviceId: 'svc-db-1',
+      mountPath: '/var/lib/postgresql/data',
+    });
     expect(findById).not.toHaveBeenCalled();
   });
 
-  it('never sends a retained legacy-plugin database id to service deletion', async () => {
+  it('fails closed for a retained Railway service database with only legacy project scope', async () => {
     const deleteService = vi.fn(async () => ({ success: true }));
+    const inspectServiceInstance = vi.fn();
     const getProjectDetails = vi.fn(async () => ({
-      services: { edges: [] },
-      plugins: { edges: [{ node: { id: 'svc-db-1', name: 'postgres-plugin' } }] },
+      services: {
+        edges: [{
+          node: {
+            id: 'svc-db-1',
+            name: 'postgres-db',
+            serviceInstances: {
+              edges: [{
+                node: {
+                  environmentId: 'retained-environment',
+                  source: { image: 'postgres:16' },
+                },
+              }],
+            },
+          },
+        }],
+      },
+      plugins: { edges: [] },
     }));
     const adapter = createRailwayDatabaseAdapter({
-      hostingAdapter: { deleteService, getProjectDetails } as never,
+      hostingAdapter: { deleteService, getProjectDetails, inspectServiceInstance } as never,
       envRepo: { findById: vi.fn(() => environment('current-project')) } as never,
     });
     const component = databaseComponent({ projectId: 'retained-project' });
@@ -474,7 +593,139 @@ describe('Railway database adapter', () => {
     const result = await adapter.destroy(component);
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain('legacy plugin');
+    expect(result.error).toContain('Re-import or reconcile the Railway binding');
+    expect(inspectServiceInstance).not.toHaveBeenCalled();
+    expect(getProjectDetails).not.toHaveBeenCalled();
+    expect(deleteService).not.toHaveBeenCalled();
+  });
+
+  it('fails closed for a full-scope retained Railway database missing its service kind', async () => {
+    const deleteService = vi.fn(async () => ({ success: true }));
+    const inspectServiceInstance = vi.fn();
+    const adapter = createRailwayDatabaseAdapter({
+      hostingAdapter: { deleteService, inspectServiceInstance } as never,
+      envRepo: { findById: vi.fn(() => environment('current-project')) } as never,
+    });
+    const component = databaseComponent({
+      projectId: 'retained-project',
+      environmentId: 'retained-environment',
+    });
+    component.bindings.retainedCleanup = true;
+    delete component.bindings.resourceKind;
+
+    const result = await adapter.destroy(component);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('does not prove this id is a service-backed datastore');
+    expect(inspectServiceInstance).not.toHaveBeenCalled();
+    expect(deleteService).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['provider error', 'Railway API unavailable'],
+    ['malformed exact identity', 'Railway returned a partial service-instance identity'],
+  ])('blocks retained deletion when exact instance observation reports %s', async (_label, error) => {
+    const deleteService = vi.fn(async () => ({ success: true }));
+    const getProjectDetails = vi.fn();
+    const inspectServiceInstance = vi.fn(async () => ({
+      state: 'unknown' as const,
+      error,
+    }));
+    const adapter = createRailwayDatabaseAdapter({
+      hostingAdapter: { deleteService, getProjectDetails, inspectServiceInstance } as never,
+      envRepo: { findById: vi.fn(() => environment('current-project')) } as never,
+    });
+    const component = databaseComponent({
+      projectId: 'retained-project',
+      environmentId: 'retained-environment',
+    });
+    component.bindings.retainedCleanup = true;
+    component.bindings.resourceKind = 'service';
+
+    const result = await adapter.destroy(component);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain(error);
+    expect(inspectServiceInstance).toHaveBeenCalledWith('svc-db-1', 'retained-environment');
+    expect(getProjectDetails).not.toHaveBeenCalled();
+    expect(deleteService).not.toHaveBeenCalled();
+  });
+
+  it('discovers and deletes an attached volume when the retained service is already absent', async () => {
+    const deleteService = vi.fn(async () => ({ success: true, alreadyAbsent: true }));
+    const deleteVolume = vi.fn(async () => ({ success: true }));
+    const resolveServiceVolume = vi.fn(async () => ({
+      success: true as const,
+      state: 'present' as const,
+      volumeId: 'retained-volume',
+      pendingDeletion: false,
+    }));
+    const inspectServiceInstance = vi.fn(async () => ({ state: 'absent' as const }));
+    const adapter = createRailwayDatabaseAdapter({
+      hostingAdapter: { deleteService, deleteVolume, resolveServiceVolume, inspectServiceInstance } as never,
+      envRepo: { findById: vi.fn(() => environment('current-project')) } as never,
+    });
+    const component = databaseComponent({
+      projectId: 'retained-project',
+      environmentId: 'retained-environment',
+    });
+    component.bindings.retainedCleanup = true;
+    component.bindings.resourceKind = 'service';
+
+    const result = await adapter.destroy(component);
+
+    expect(result).toMatchObject({
+      success: true,
+      message: expect.stringContaining('already absent'),
+    });
+    expect(inspectServiceInstance).toHaveBeenCalledWith('svc-db-1', 'retained-environment');
+    expect(resolveServiceVolume).toHaveBeenCalledWith({
+      projectId: 'retained-project',
+      environmentId: 'retained-environment',
+      serviceId: 'svc-db-1',
+      mountPath: '/var/lib/postgresql/data',
+    }, undefined);
+    expect(deleteService).toHaveBeenCalledWith(
+      'svc-db-1',
+      {
+        scope: 'environment',
+        projectId: 'retained-project',
+        environmentId: 'retained-environment',
+      },
+      { allowMutation: true }
+    );
+    expect(deleteVolume).toHaveBeenCalledWith('retained-volume', {
+      projectId: 'retained-project',
+      environmentId: 'retained-environment',
+      serviceId: 'svc-db-1',
+      mountPath: '/var/lib/postgresql/data',
+    });
+  });
+
+  it('never sends a retained legacy-plugin database id to service deletion', async () => {
+    const deleteService = vi.fn(async () => ({ success: true }));
+    const inspectServiceInstance = vi.fn(async () => ({ state: 'absent' as const }));
+    const getProjectDetails = vi.fn(async () => ({
+      services: { edges: [] },
+      plugins: { edges: [{ node: { id: 'svc-db-1', name: 'postgres-plugin' } }] },
+    }));
+    const adapter = createRailwayDatabaseAdapter({
+      hostingAdapter: { deleteService, getProjectDetails, inspectServiceInstance } as never,
+      envRepo: { findById: vi.fn(() => environment('current-project')) } as never,
+    });
+    const component = databaseComponent({
+      projectId: 'retained-project',
+      environmentId: 'retained-environment',
+    });
+    component.bindings.retainedCleanup = true;
+    component.bindings.resourceKind = 'legacy-plugin';
+
+    const result = await adapter.destroy(component);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Legacy Railway plugin');
+    expect(inspectServiceInstance).not.toHaveBeenCalled();
+    expect(getProjectDetails).not.toHaveBeenCalled();
     expect(deleteService).not.toHaveBeenCalled();
   });
 });

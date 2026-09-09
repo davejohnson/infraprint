@@ -7,6 +7,7 @@ import {
   parseUnresolvedDatabaseMutation,
   parseUnresolvedDatastoreMutation,
 } from '../domain/ports/database.port.js';
+import { findActiveDatastoreBindingConflict } from './active-datastore-binding.js';
 
 export interface ImportProviderInput {
   provider: string;
@@ -180,18 +181,6 @@ async function retainDatabaseCleanup(
   }
 
   const externalId = input.id.trim();
-  const activeComponent = ctx.repos.components.findByEnvironmentId(environment.id).find((component) => (
-    component.type === 'postgres'
-    && component.bindings.provider === provider
-    && component.externalId === externalId
-  ));
-  if (activeComponent) {
-    return commandError('VALIDATION', `Database ${externalId} is the active locally bound ${provider} component for ${project.name}/${environment.name}.`, {
-      hint: 'Change desired state and use the ordinary hv_plan/hv_apply database destroy lifecycle; retained cleanup is only for an abandoned unbound identity.',
-      next: ['hv_plan'],
-    });
-  }
-
   const forensic = await inspectProvider(ctx, {
     provider,
     project: project.name,
@@ -199,12 +188,21 @@ async function retainDatabaseCleanup(
     id: externalId,
   });
   const databases = Array.isArray(forensic.databases) ? forensic.databases : [];
-  const exact = databases
+  const requiredScopeKeys = registration.inspection.selectors.database?.scopeKeys ?? [];
+  const compatibleHostingProviders = registration.metadata.lifecycle
+    ?.databaseConnectivity?.compatibleHostingProviders ?? [];
+  const exactById = databases
     .map(record)
     .filter((database): database is Record<string, unknown> => Boolean(database))
     .filter((database) => stringValue(database.id) === externalId);
-  if (forensic.partial !== false) {
-    return commandError('PROVIDER_ERROR', `${registration.metadata.displayName} returned a partial database inventory; cleanup identity was not retained.`, {
+  const exact = candidatesInCompatibleHostingScope({
+    candidates: exactById,
+    currentBindings,
+    compatibleHostingProviders,
+    requiredScopeKeys,
+  });
+  if (forensic.partial !== false || forensic.truncated !== false) {
+    return commandError('PROVIDER_ERROR', `${registration.metadata.displayName} returned an incomplete database inventory; cleanup identity was not retained.`, {
       details: forensic,
       hint: 'Resolve the provider read failure and refresh hv_inspect before retaining a data-bearing deletion target.',
       next: ['hv_inspect'],
@@ -232,7 +230,6 @@ async function retainDatabaseCleanup(
     });
   }
   const providerScope = record(exact[0].providerScope);
-  const requiredScopeKeys = registration.inspection.selectors.database?.scopeKeys ?? [];
   if (
     requiredScopeKeys.length === 0
     || !providerScope
@@ -250,7 +247,21 @@ async function retainDatabaseCleanup(
   if (engine !== 'postgres') {
     return commandError('UNSUPPORTED', `Retained cleanup supports PostgreSQL, but ${externalId} was reported as ${engine ?? 'an unknown engine'}.`);
   }
+  const activeBinding = findActiveDatastoreBindingConflict(ctx, {
+    componentType: 'postgres',
+    provider,
+    externalId,
+    providerScope: providerScope as Record<string, string>,
+  });
+  if (activeBinding) {
+    return commandError('VALIDATION', `Database ${externalId} is actively bound in ${activeBinding.projectName}/${activeBinding.environmentName}.`, {
+      details: { activeBinding },
+      hint: 'Use that environment’s ordinary desired-state database destroy lifecycle; retained cleanup cannot target an active or ambiguously scoped component.',
+      next: ['hv_plan'],
+    });
+  }
   const resourceName = stringValue(exact[0].name) ?? externalId;
+  const resourceKind = stringValue(exact[0].resourceKind);
   const unresolvedComponents = ctx.repos.components.findByEnvironmentId(environment.id)
     .filter((component) => (
       component.type === 'postgres'
@@ -285,6 +296,7 @@ async function retainDatabaseCleanup(
     externalId,
     engine,
     name: resourceName,
+    ...(resourceKind ? { resourceKind } : {}),
     providerScope,
   };
 
@@ -362,22 +374,6 @@ async function retainCacheCleanup(
   }
 
   const externalId = input.id.trim();
-  const activeComponent = ctx.repos.components.findByEnvironmentId(environment.id).find((component) => (
-    component.type === 'redis'
-    && component.bindings.provider === provider
-    && (
-      component.externalId
-      ?? stringValue(component.bindings.instanceId)
-      ?? stringValue(component.bindings.serviceId)
-    ) === externalId
-  ));
-  if (activeComponent) {
-    return commandError('VALIDATION', `Cache ${externalId} is the active locally bound ${provider} component for ${project.name}/${environment.name}.`, {
-      hint: 'Change desired state and use the ordinary hv_plan/hv_apply cache destroy lifecycle; retained cleanup is only for an abandoned unbound identity.',
-      next: ['hv_plan'],
-    });
-  }
-
   const unresolvedComponents = ctx.repos.components.findByEnvironmentId(environment.id)
     .filter((component) => (
       component.type === 'redis'
@@ -410,12 +406,15 @@ async function retainCacheCleanup(
     .map(record)
     .filter((cache): cache is Record<string, unknown> => Boolean(cache))
     .filter((cache) => stringValue(cache.id) === externalId);
-  const exact = unresolvedMarker
-    ? exactById.filter((cache) => {
-        const scope = record(cache.providerScope);
-        return scope && sameRecord(scope, unresolvedMarker.providerScope);
-      })
-    : exactById;
+  const compatibleHostingProviders = registration.metadata.lifecycle
+    ?.cacheConnectivity?.compatibleHostingProviders ?? [];
+  const exact = candidatesInCompatibleHostingScope({
+    candidates: exactById,
+    currentBindings,
+    compatibleHostingProviders,
+    requiredScopeKeys: contract.scopeKeys ?? [],
+    preferredScope: unresolvedMarker?.providerScope,
+  });
   if (forensic.partial !== false || forensic.truncated !== false) {
     return commandError('PROVIDER_ERROR', `${registration.metadata.displayName} returned an incomplete cache inventory; cleanup identity was not retained.`, {
       details: forensic,
@@ -463,6 +462,19 @@ async function retainCacheCleanup(
   const providerEngine = stringValue(exact[0].engine);
   if (providerEngine !== 'redis' && providerEngine !== 'valkey') {
     return commandError('UNSUPPORTED', `Retained cache cleanup supports Redis-compatible caches, but ${externalId} was reported as ${providerEngine ?? 'an unknown engine'}.`);
+  }
+  const activeBinding = findActiveDatastoreBindingConflict(ctx, {
+    componentType: 'redis',
+    provider,
+    externalId,
+    providerScope: providerScope as Record<string, string>,
+  });
+  if (activeBinding) {
+    return commandError('VALIDATION', `Cache ${externalId} is actively bound in ${activeBinding.projectName}/${activeBinding.environmentName}.`, {
+      details: { activeBinding },
+      hint: 'Use that environment’s ordinary desired-state cache destroy lifecycle; retained cleanup cannot target an active or ambiguously scoped component.',
+      next: ['hv_plan'],
+    });
   }
   const resourceName = stringValue(exact[0].name) ?? externalId;
   if (unresolvedMarker) {
@@ -542,6 +554,45 @@ function sameRecord(left: Record<string, unknown>, right: Record<string, unknown
     Object.entries(value).sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
   );
   return JSON.stringify(sorted(left)) === JSON.stringify(sorted(right));
+}
+
+function candidatesInCompatibleHostingScope(input: {
+  candidates: Record<string, unknown>[];
+  currentBindings: Record<string, unknown>;
+  compatibleHostingProviders: readonly string[];
+  requiredScopeKeys: readonly string[];
+  preferredScope?: Record<string, unknown>;
+}): Record<string, unknown>[] {
+  if (input.candidates.length <= 1 || input.requiredScopeKeys.length === 0) {
+    return input.candidates;
+  }
+
+  const bindingScopes = [input.currentBindings, record(input.currentBindings.previousHosting)]
+    .filter((binding): binding is Record<string, unknown> => Boolean(binding))
+    .filter((binding) => {
+      const hostingProvider = stringValue(binding.provider);
+      return Boolean(hostingProvider && input.compatibleHostingProviders.includes(hostingProvider));
+    });
+  const scopeSources = input.preferredScope ? [input.preferredScope] : bindingScopes;
+  const scopes = scopeSources
+    .map((source) => Object.fromEntries(input.requiredScopeKeys.flatMap((key) => {
+      const value = stringValue(source[key]);
+      return value ? [[key, value]] : [];
+    })))
+    .filter((scope) => Object.keys(scope).length === input.requiredScopeKeys.length);
+  const distinctScopes = [...new Map(scopes.map((scope) => [
+    JSON.stringify(scope),
+    scope,
+  ])).values()];
+  if (distinctScopes.length !== 1) {
+    return input.candidates;
+  }
+
+  const [scope] = distinctScopes;
+  return input.candidates.filter((candidate) => {
+    const candidateScope = record(candidate.providerScope);
+    return candidateScope && input.requiredScopeKeys.every((key) => candidateScope[key] === scope[key]);
+  });
 }
 
 async function retainHostingCleanup(

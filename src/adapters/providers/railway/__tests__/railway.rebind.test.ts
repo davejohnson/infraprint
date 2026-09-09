@@ -47,18 +47,18 @@ describe('RailwayAdapter stale binding recovery', () => {
       })
       // resolveServiceIdForEnvironment verifies the candidate.
       .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-new' } }],
-          },
+        serviceInstance: {
+          id: 'instance-svc-new-env-new',
+          serviceId: 'svc-new',
+          environmentId: 'env-new',
         },
       })
       // ensureServiceInstanceForEnvironment
       .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-new' } }],
-          },
+        serviceInstance: {
+          id: 'instance-svc-new-env-new',
+          serviceId: 'svc-new',
+          environmentId: 'env-new',
         },
       })
       // variableCollectionUpsert
@@ -105,21 +105,9 @@ describe('RailwayAdapter stale binding recovery', () => {
         },
       })
       // resolveServiceIdForEnvironment rejects the production-only service.
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-production' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce({ serviceInstance: null })
       // ensureServiceInstanceForEnvironment confirms it is still absent in staging.
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-production' } }],
-          },
-        },
-      });
+      .mockResolvedValueOnce({ serviceInstance: null });
 
     const adapter = new RailwayAdapter();
     (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
@@ -162,17 +150,17 @@ describe('RailwayAdapter stale binding recovery', () => {
         },
       })
       .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-staging' } }],
-          },
+        serviceInstance: {
+          id: 'instance-svc-web-env-staging',
+          serviceId: 'svc-web',
+          environmentId: 'env-staging',
         },
       })
       .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-staging' } }],
-          },
+        serviceInstance: {
+          id: 'instance-svc-web-env-staging',
+          serviceId: 'svc-web',
+          environmentId: 'env-staging',
         },
       })
       .mockResolvedValueOnce({ variableCollectionUpsert: true })
@@ -224,10 +212,10 @@ describe('RailwayAdapter stale binding recovery', () => {
         },
       })
       .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-staging' } }],
-          },
+        serviceInstance: {
+          id: 'instance-svc-web-env-staging',
+          serviceId: 'svc-web',
+          environmentId: 'env-staging',
         },
       })
       .mockResolvedValueOnce({
