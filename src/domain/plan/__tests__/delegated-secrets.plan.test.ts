@@ -52,6 +52,29 @@ function observed(): ObservedState {
   };
 }
 
+function replaceWithHypervibeManagedSecrets(
+  project: ReturnType<ProjectRepository['create']>
+): void {
+  new SpecStore().replace(project, {
+    version: 1,
+    project: project.name,
+    secrets: {
+      SESSION_SECRET: {
+        ownership: 'hypervibe',
+        generator: 'random-base64url-32-v1',
+        environments: ['production'],
+      },
+    },
+    environments: {
+      production: {
+        hosting: { provider: 'railway' },
+        services: { web: {} },
+        database: { provider: 'railway' },
+      },
+    },
+  });
+}
+
 describe('PlanService delegated secret inputs', () => {
   let tempDir: string;
   let project: ReturnType<ProjectRepository['create']>;
@@ -114,7 +137,9 @@ describe('PlanService delegated secret inputs', () => {
   });
 
   it('persists an inspectable but non-executable plan when required input is absent', async () => {
-    const result = await new PlanService().plan(project, 'production', { includeEnvFile: false });
+    const envFile = path.join(tempDir, '.env');
+    fs.writeFileSync(envFile, 'ANTHROPIC_API_KEY=\n', 'utf8');
+    const result = await new PlanService().plan(project, 'production', { envFile });
     expect(result).not.toHaveProperty('error');
     const plan = result as Exclude<typeof result, { error: string }>;
     expect(plan.inputRequired).toEqual([
@@ -262,5 +287,111 @@ describe('PlanService delegated secret inputs', () => {
       envVarOverrides: { ANTHROPIC_API_KEY: FRIEND_KEY },
     });
     expect(result).toMatchObject({ error: expect.stringContaining('Use secretRefs') });
+  });
+
+  it('derives, plans, and encrypts Hypervibe-owned values without asking for input', async () => {
+    replaceWithHypervibeManagedSecrets(project);
+
+    const result = await new PlanService().plan(project, 'production', {
+      includeEnvFile: false,
+    });
+
+    expect(result).not.toHaveProperty('error');
+    const plan = result as Exclude<typeof result, { error: string }>;
+    expect(plan.inputRequired).toEqual([]);
+    expect(plan.actions.find((action) => action.id === 'secret:SESSION_SECRET')).toMatchObject({
+      type: 'update',
+      dependsOn: ['service:web'],
+      metadata: {
+        ownership: 'hypervibe',
+        principal: 'hypervibe',
+        generator: 'random-base64url-32-v1',
+        generation: 1,
+        inputProvided: false,
+        valuePrepared: true,
+        services: ['web'],
+      },
+    });
+    expect(plan.actions.find((action) => action.id === 'service:web')?.diff?.map((entry) => entry.field))
+      .toEqual(expect.arrayContaining(['env:SESSION_SECRET']));
+
+    const document = new RunRepository().findById(plan.planRunId)!.plan as Record<string, unknown>;
+    const overrides = document.overrides as Record<string, unknown>;
+    expect(overrides.delegatedSecretKeys).toEqual(['SESSION_SECRET']);
+    const decrypted = getSecretStore().decryptObject<Record<string, unknown>>(
+      overrides.delegatedSecretVarsEncrypted as string
+    );
+    const sessionSecret = decrypted.SESSION_SECRET;
+    const sessionContractIsValid = typeof sessionSecret === 'string'
+      && /^[A-Za-z0-9_-]{43}$/.test(sessionSecret)
+      && Buffer.from(sessionSecret, 'base64url').length === 32;
+    expect(sessionContractIsValid).toBe(true);
+    const serialized = JSON.stringify(document);
+    const serializedContainsGeneratedValue = Object.values(decrypted)
+      .some((value) => typeof value === 'string' && serialized.includes(value));
+    expect(serializedContainsGeneratedValue).toBe(false);
+  });
+
+  it('rejects user input for Hypervibe-owned slots before resolving references or saving a plan', async () => {
+    replaceWithHypervibeManagedSecrets(project);
+    const environment = new EnvironmentRepository().findByProjectAndName(project.id, 'production')!;
+    const runsBefore = new RunRepository().findByEnvironmentId(environment.id).length;
+
+    const result = await new PlanService().plan(project, 'production', {
+      includeEnvFile: false,
+      secretRefs: { SESSION_SECRET: 'env:THIS_REFERENCE_MUST_NOT_BE_READ' },
+    });
+
+    expect(result).toMatchObject({
+      error: expect.stringContaining('secretRefs cannot supply Hypervibe-owned secret keys: SESSION_SECRET'),
+    });
+    expect(new RunRepository().findByEnvironmentId(environment.id)).toHaveLength(runsBefore);
+  });
+
+  it('reserves Hypervibe-owned slots from ordinary env overrides and env files', async () => {
+    replaceWithHypervibeManagedSecrets(project);
+
+    const overrideResult = await new PlanService().plan(project, 'production', {
+      includeEnvFile: false,
+      envVarOverrides: { SESSION_SECRET: 'caller-selected-value' },
+    });
+    expect(overrideResult).toMatchObject({
+      error: expect.stringContaining('Managed secret keys cannot be passed through envVars: SESSION_SECRET'),
+    });
+
+    const envFile = path.join(tempDir, '.env.production');
+    fs.writeFileSync(envFile, 'PUBLIC_LABEL=friend\nSESSION_SECRET=caller-selected-value\n', 'utf8');
+    const fileResult = await new PlanService().plan(project, 'production', { envFile });
+    expect(fileResult).not.toHaveProperty('error');
+    const plan = fileResult as Exclude<typeof fileResult, { error: string }>;
+    const document = new RunRepository().findById(plan.planRunId)!.plan as Record<string, unknown>;
+    const overrides = document.overrides as Record<string, unknown>;
+    expect(overrides.envFileKeys).toEqual(['PUBLIC_LABEL']);
+    expect(overrides.delegatedSecretKeys).toEqual(['SESSION_SECRET']);
+    expect(JSON.stringify(document).includes('caller-selected-value')).toBe(false);
+  });
+
+  it('returns a planning error without saving a run when generated-secret safety is unknown', async () => {
+    replaceWithHypervibeManagedSecrets(project);
+    vi.mocked(adapterFactory.getProviderAdapter).mockResolvedValue({
+      success: true,
+      adapter: {
+        name: 'railway',
+        capabilities: { supportsObserve: false },
+      } as never,
+    });
+    const environment = new EnvironmentRepository().findByProjectAndName(project.id, 'production')!;
+    const runsBefore = new RunRepository().findByEnvironmentId(environment.id).length;
+
+    const result = await new PlanService().plan(project, 'production', {
+      includeEnvFile: false,
+    });
+
+    expect(result).toMatchObject({
+      error: expect.stringContaining('Hypervibe cannot safely plan its managed secrets'),
+    });
+    expect((result as { error: string }).error).toContain('SESSION_SECRET');
+    expect((result as { error: string }).error).toContain('No plan was saved or provider mutation authorized');
+    expect(new RunRepository().findByEnvironmentId(environment.id)).toHaveLength(runsBefore);
   });
 });

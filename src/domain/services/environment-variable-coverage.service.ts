@@ -1,6 +1,6 @@
 import type { EnvironmentSpec, ProjectSpec } from '../spec/spec.schema.js';
 
-type ActiveDeclaration = 'ordinary' | 'env_file' | 'delegated';
+type ActiveDeclaration = 'ordinary' | 'env_file' | 'managed_secret';
 
 export type EnvironmentVariableCoverageIssue = {
   reason: 'missing_environment' | 'mixed_secret_boundary';
@@ -41,7 +41,7 @@ function activeDeclarations(spec: ProjectSpec): Map<string, Map<string, ActiveDe
   }
   for (const [key, secret] of Object.entries(spec.secrets)) {
     for (const environmentName of secret.environments) {
-      if (environmentName.trim().toLowerCase() !== 'local') record(key, environmentName, 'delegated');
+      if (environmentName.trim().toLowerCase() !== 'local') record(key, environmentName, 'managed_secret');
     }
   }
   return declarations;
@@ -61,15 +61,15 @@ export function environmentVariableCoverage(spec: ProjectSpec): EnvironmentVaria
       .map(([name]) => name)
       .sort();
     const kinds = new Set(declarations.values());
-    const delegated = kinds.has('delegated');
+    const managedSecret = kinds.has('managed_secret');
     const nonSecret = kinds.has('ordinary') || kinds.has('env_file');
-    if (delegated && nonSecret) {
+    if (managedSecret && nonSecret) {
       issues.push({
         reason: 'mixed_secret_boundary',
         key,
         declaredIn,
         requiredEnvironments,
-        message: `${key} crosses the delegated-secret and ordinary configuration boundary across release environments.`,
+        message: `${key} crosses the managed-secret and ordinary configuration boundary across release environments.`,
       });
       continue;
     }

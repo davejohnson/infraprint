@@ -7,8 +7,8 @@ import { ignoredOptionWarnings } from '../application/command-options.js';
 
 /**
  * Redact secret-bearing fields when returning stored run plans to chat.
- * Current plans store env var key names only, but runs persisted before
- * that change carry plaintext values in steps[].params.vars — mask them.
+ * Preserve safe key-name metadata, remove encrypted override payloads, and
+ * mask plaintext vars carried by plans persisted before encryption.
  */
 function redactRunPlan(plan: unknown): unknown {
   if (!plan || typeof plan !== 'object') return plan;
@@ -16,9 +16,9 @@ function redactRunPlan(plan: unknown): unknown {
   const redacted: Record<string, unknown> = { ...record };
   const overrides = record.overrides as Record<string, unknown> | undefined;
   if (overrides && typeof overrides === 'object' && !Array.isArray(overrides)) {
-    const redactedOverrides = { ...overrides };
-    delete redactedOverrides.envVarsEncrypted;
-    redacted.overrides = redactedOverrides;
+    redacted.overrides = Object.fromEntries(
+      Object.entries(overrides).filter(([key]) => !key.endsWith('Encrypted'))
+    );
   }
   if (Array.isArray(record.steps)) {
     redacted.steps = record.steps.map((step) => {

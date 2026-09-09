@@ -51,7 +51,7 @@ describe('environmentVariableCoverage', () => {
     expect(excepted).toEqual({ complete: true, issues: [] });
   });
 
-  it('requires delegated secret slots across matching release environments without values', () => {
+  it('requires managed secret slots across matching release environments without values', () => {
     const report = environmentVariableCoverage(spec({
       secrets: {
         RECAPTCHA_SECRET_KEY: { principal: 'github:dave', environments: ['production'] },
@@ -67,7 +67,7 @@ describe('environmentVariableCoverage', () => {
     ]);
   });
 
-  it('rejects mixing delegated secrets and ordinary configuration across environments', () => {
+  it('rejects mixing managed secrets and ordinary configuration across environments', () => {
     const report = environmentVariableCoverage(spec({
       secrets: {
         API_KEY: { principal: 'github:dave', environments: ['production'] },

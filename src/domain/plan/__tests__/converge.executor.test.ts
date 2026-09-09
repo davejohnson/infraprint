@@ -377,6 +377,25 @@ describe('ConvergeExecutor staleness', () => {
 });
 
 describe('ConvergeExecutor execution', () => {
+  it('gives each action handler the durable apply-run identity', async () => {
+    let handlerApplyRunId: string | undefined;
+    const handler = vi.fn(async (_action: PlanAction, context: { applyRunId: string }) => {
+      handlerApplyRunId = context.applyRunId;
+      return { success: true, message: 'ok' };
+    });
+    const planId = storePlan([action({ id: 'service:web' })]);
+
+    const result = await new ConvergeExecutor().execute({
+      planRunId: planId,
+      currentSpecRevision: 1,
+      handler,
+    });
+
+    expect(result.success).toBe(true);
+    expect(handlerApplyRunId).toBe(result.applyRunId);
+    expect(runRepo().findById(handlerApplyRunId!)?.type).toBe('apply');
+  });
+
   it('executes actions in dependency order, skipping noops', async () => {
     const executedIds: string[] = [];
     const handler = vi.fn(async (a: PlanAction) => {
@@ -646,6 +665,7 @@ describe('fingerprintObservedState', () => {
       services: [{
         ...base.services[0],
         customDomains: ['a.com', 'b.com'],
+        envVarKeys: ['B', 'A'],
         envVarHashes: { A: hashEnvValue('1'), B: hashEnvValue('2') },
       }],
     };
@@ -658,6 +678,19 @@ describe('fingerprintObservedState', () => {
       services: [{ ...base.services[0], envVarHashes: { A: hashEnvValue('1'), B: hashEnvValue('CHANGED') } }],
     };
     expect(fingerprintObservedState(changed)).not.toBe(fingerprintObservedState(base));
+  });
+
+  it('changes when a masked environment-variable name appears without a hash', () => {
+    const before: ObservedState = {
+      ...base,
+      services: [{ ...base.services[0], envVarKeys: ['A'], envVarHashes: { A: hashEnvValue('1') } }],
+    };
+    const after: ObservedState = {
+      ...before,
+      services: [{ ...before.services[0], envVarKeys: ['A', 'SESSION_SECRET'] }],
+    };
+
+    expect(fingerprintObservedState(before)).not.toBe(fingerprintObservedState(after));
   });
 
   it('changes when service, database, or cache readiness changes', () => {

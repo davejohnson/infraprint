@@ -1856,6 +1856,64 @@ describe('PlanService.plan', () => {
     expect(unblocked.some((entry) => entry.provider === 'cloudflare')).toBe(false);
   });
 
+  it('requests the complete replacement credential roles when adding Cloudflare Registrar access', () => {
+    const connRepo = new ConnectionRepository();
+    const cloudflare = connRepo.create({
+      provider: 'cloudflare',
+      scope: 'example.com',
+      credentialsEncrypted: getSecretStore().encryptObject({
+        apiToken: 'cfat_dns',
+        accountId: 'account-1',
+      }),
+    });
+    connRepo.updateStatus(cloudflare.id, 'verified');
+
+    const blocked = new PlanService().preflight({
+      hosting: { provider: 'railway' },
+      services: {},
+      domain: 'example.com',
+      domainRegistration: { provider: 'cloudflare', years: 1, register: true },
+      email: { enabled: false },
+      envVars: {},
+    });
+
+    expect(blocked.filter((entry) => entry.provider === 'cloudflare')).toEqual([
+      expect.objectContaining({
+        requiredCredentialKeys: ['apiToken', 'accountId', 'registrarApiToken'],
+        reason: expect.stringContaining('CLOUDFLARE_REGISTRAR_API_TOKEN'),
+      }),
+    ]);
+  });
+
+  it('omits Cloudflare accountId when a user-token connection only needs Registrar replacement', () => {
+    const connRepo = new ConnectionRepository();
+    const cloudflare = connRepo.create({
+      provider: 'cloudflare',
+      scope: 'example.com',
+      credentialsEncrypted: getSecretStore().encryptObject({
+        apiToken: 'cfut_dns',
+        registrarApiToken: 'cfat_wrong_kind',
+      }),
+    });
+    connRepo.updateStatus(cloudflare.id, 'verified');
+
+    const blocked = new PlanService().preflight({
+      hosting: { provider: 'railway' },
+      services: {},
+      domain: 'example.com',
+      domainRegistration: { provider: 'cloudflare', years: 1, register: true },
+      email: { enabled: false },
+      envVars: {},
+    });
+
+    expect(blocked.filter((entry) => entry.provider === 'cloudflare')).toEqual([
+      expect.objectContaining({
+        requiredCredentialKeys: ['apiToken', 'registrarApiToken'],
+        reason: expect.stringContaining('stored registrarApiToken is an Account API Token'),
+      }),
+    ]);
+  });
+
   it('warns when observation fails for a tracked environment', async () => {
     new EnvironmentRepository().create({
       projectId: project.id,
@@ -3130,6 +3188,7 @@ describe('PlanService.plan', () => {
       const envFile = path.join(mkdtempSync(path.join(tmpdir(), 'hypervibe-env-file-')), '.env');
       writeFileSync(envFile, [
         'SENDGRID_API_KEY=SG.local-secret',
+        'SESSION_SECRET=',
         'NODE_ENV=from-dotenv',
         'WEBHOOK_URL=http://localhost:4040/hook',
         'LOCAL_DEBUG_FLAG=true',
@@ -3175,10 +3234,12 @@ describe('PlanService.plan', () => {
       expect(web.diff?.some((entry) => entry.field === 'env:NODE_ENV')).toBe(false);
       expect(web.diff?.some((entry) => entry.field === 'env:LOCAL_DEBUG_FLAG')).toBe(false);
       expect(web.diff?.some((entry) => entry.field === 'env:WEBHOOK_URL')).toBe(false);
+      expect(web.diff?.some((entry) => entry.field === 'env:SESSION_SECRET')).toBe(false);
       expect(plan.warnings).toContainEqual(expect.stringContaining(`Loaded 1 deploy env var(s) from ${envFile}`));
       expect(plan.warnings).toContainEqual(expect.stringContaining('Ignored 2 .env key(s) that do not match envFile policy: LOCAL_DEBUG_FLAG, NODE_ENV'));
       expect(plan.warnings).toContainEqual(expect.stringContaining('Skipped 1 .env key(s) with local-only values in runtime mode: WEBHOOK_URL'));
       expect(plan.warnings).toContainEqual(expect.stringContaining('Skipped 2 provider-only .env key(s): NPM_TOKEN, RAILWAY_API_TOKEN'));
+      expect(plan.warnings).toContainEqual(expect.stringContaining('Missing values for 1 selected .env key(s): SESSION_SECRET'));
 
       const doc = new RunRepository().findById(plan.planRunId)!.plan as Record<string, unknown>;
       const overrides = doc.overrides as Record<string, unknown>;

@@ -170,6 +170,21 @@ export interface PlanActionAuthority {
   };
 }
 
+/**
+ * Confirmation is part of persisted mutation authority, not a caller-only
+ * acknowledgement. A consequential transition is authorized only when both
+ * the reviewed action retained its confirmation marker and the caller names
+ * that exact action id.
+ */
+export function hasExactPlanActionConfirmationAuthority(
+  action: PlanAction,
+  confirmationRequired: boolean,
+  confirmedActionIds: ReadonlySet<string>
+): boolean {
+  return !confirmationRequired
+    || (action.requiresConfirm === true && confirmedActionIds.has(action.id));
+}
+
 function authority(
   action: PlanAction,
   capability: PlanMutationCapability
@@ -256,6 +271,37 @@ function metadataPositiveIntegerString(action: PlanAction, key: string): string 
 function metadataSha256(action: PlanAction, key: string): string | undefined {
   const value = metadataString(action, key);
   return value && /^[a-f0-9]{64}$/.test(value) ? value : undefined;
+}
+
+function managedSecretAuthorityMetadataIsValid(action: PlanAction): boolean {
+  const ownership = metadataString(action, 'ownership');
+  const principal = metadataString(action, 'principal');
+  const services = metadataStringArray(action, 'services');
+  if (!principal || !services?.length || new Set(services).size !== services.length) {
+    return false;
+  }
+
+  // Ownership was absent on v1 delegated-secret plans. Continue accepting
+  // those persisted plans while requiring the complete generated contract for
+  // Hypervibe-owned values.
+  if (ownership === undefined || ownership === 'delegated') {
+    return true;
+  }
+  if (ownership !== 'hypervibe' || principal !== 'hypervibe') {
+    return false;
+  }
+
+  const generator = metadataString(action, 'generator');
+  const generation = metadataPositiveInteger(action, 'generation');
+  return generator === 'random-base64url-32-v1'
+    && generation !== undefined
+    && metadataSha256(action, 'expectedValueHash') !== undefined
+    && metadataBoolean(action, 'inputProvided') === false
+    && metadataBoolean(action, 'valuePrepared') === true
+    && (
+      action.metadata?.bindingOnly === undefined
+      || metadataBoolean(action, 'bindingOnly') !== undefined
+    );
 }
 
 function cacheDesiredConfigIsPinned(action: PlanAction): boolean {
@@ -951,8 +997,7 @@ export function resolvePlanActionAuthority(
     && exactResource(action, 'secret')
     && action.type === 'update'
     && action.id === delegatedSecretActionId(action.resource.name)
-    && Boolean(metadataString(action, 'principal'))
-    && (metadataStringArray(action, 'services')?.length ?? 0) > 0
+    && managedSecretAuthorityMetadataIsValid(action)
   ) {
     return authority(action, 'hosting.delegated-secret.sync');
   }

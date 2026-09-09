@@ -1,7 +1,20 @@
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'fs';
+import { randomUUID } from 'crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'fs';
 import path from 'path';
 import { projectSpecSchema, type ProjectSpec } from './spec.schema.js';
 import { primaryWorkspaceDirectory } from '../../lib/workspace-context.js';
+import {
+  detectGitRemoteUrl,
+  normalizeGitRemoteIdentity,
+  parseRepositoryPathFromRemote,
+} from '../../lib/git-remote.js';
+import {
+  ensureCommentedEnvFile,
+  ensureRepoEnvTemplate,
+  ensureRepoEnvFilesIgnored,
+  specLocalEnvRequirements,
+  type RepoEnvFileWrite,
+} from './repo-env-file.js';
 
 export interface RepoSpecFile {
   root: string;
@@ -14,18 +27,18 @@ export interface RepoSpecFile {
 export interface RepoSpecWrite {
   root: string;
   path: string;
-  envTemplate: RepoEnvTemplateWrite;
+  envTemplate: RepoEnvFileWrite;
+  localEnv: RepoEnvFileWrite;
 }
 
-export interface RepoEnvTemplateWrite {
-  path: string;
-  addedKeys: string[];
+export interface RepoSpecWritePreflight {
+  root: string;
+  project: string;
+  gitignore: { path: string; updated: boolean };
 }
 
 const HYPERVIBE_DIR = '.hypervibe';
 const SPEC_FILE = 'spec.json';
-const ENV_TEMPLATE_FILE = '.env.example';
-const RECAPTCHA_ENV_KEYS = ['RECAPTCHA_SITE_KEY', 'RECAPTCHA_SECRET_KEY'] as const;
 
 export function repoSpecEnabled(): boolean {
   const disabled = process.env.HYPERVIBE_DISABLE_REPO_SPEC?.trim().toLowerCase();
@@ -59,39 +72,86 @@ export function repoSpecPath(root: string): string {
   return path.join(root, HYPERVIBE_DIR, SPEC_FILE);
 }
 
-function envTemplateKeys(content: string): Set<string> {
-  const keys = new Set<string>();
-  for (const line of content.split(/\r?\n/)) {
-    const match = line.match(/^\s*#?\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
-    if (match?.[1]) keys.add(match[1]);
-  }
-  return keys;
+export interface RepositoryProjectIdentity {
+  projectName?: string;
+  gitRemoteUrl?: string;
 }
 
 /**
- * Keep product-wide, value-free runtime slots in the conventional repo
- * template. `.env.example` is never a deploy input; real values remain in
- * `.env.<environment>` and enter provider state only through plan/apply.
+ * Derive the repository identity used by both fresh-project selection and
+ * repo-backed spec writes. A configured remote is stronger than the checkout
+ * directory name; a remote-less repository falls back to its basename.
  */
-export function ensureRepoEnvTemplate(root: string): RepoEnvTemplateWrite {
-  const templatePath = path.join(root, ENV_TEMPLATE_FILE);
-  const existing = existsSync(templatePath) ? readFileSync(templatePath, 'utf8') : '';
-  const existingKeys = envTemplateKeys(existing);
-  const addedKeys = RECAPTCHA_ENV_KEYS.filter((key) => !existingKeys.has(key));
+export function repositoryProjectIdentity(root: string): RepositoryProjectIdentity {
+  const gitRemoteUrl = detectGitRemoteUrl(root) ?? undefined;
+  const repositoryPath = parseRepositoryPathFromRemote(gitRemoteUrl);
+  const remoteProjectName = repositoryPath?.split('/').filter(Boolean).at(-1);
+  const directoryName = path.basename(root) || undefined;
+  return {
+    ...(remoteProjectName || directoryName ? { projectName: remoteProjectName ?? directoryName } : {}),
+    ...(gitRemoteUrl ? { gitRemoteUrl } : {}),
+  };
+}
 
-  if (addedKeys.length > 0) {
-    const prefix = existing.length > 0 && !existing.endsWith('\n') ? `${existing}\n` : existing;
-    const separator = prefix.trim().length > 0 ? '\n' : '';
-    const block = [
-      '# reCAPTCHA',
-      '# The site key is public; keep the secret key server-side.',
-      ...addedKeys.map((key) => `${key}=`),
-      '',
-    ].join('\n');
-    writeFileSync(templatePath, `${prefix}${separator}${block}`, 'utf8');
+export function repositoryMatchesProjectIdentity(
+  root: string,
+  projectName: string,
+  expectedGitRemoteUrl?: string
+): boolean {
+  const identity = repositoryProjectIdentity(root);
+  const actualRemote = normalizeGitRemoteIdentity(identity.gitRemoteUrl);
+  const expectedRemote = normalizeGitRemoteIdentity(expectedGitRemoteUrl);
+  if (expectedGitRemoteUrl?.trim()) {
+    // A stored remote is stronger identity evidence than a coincidental
+    // checkout basename. If the current origin cannot be read or either side
+    // cannot be normalized safely, fail closed instead of falling back.
+    return Boolean(actualRemote && expectedRemote && actualRemote === expectedRemote);
+  }
+  return Boolean(
+    identity.projectName
+    && identity.projectName.toLowerCase() === projectName.trim().toLowerCase()
+  );
+}
+
+/**
+ * Validate the repository boundary before any durable desired-state write.
+ * This is deliberately separate from writeRepoSpecFile so callers that also
+ * journal a revision can fail before either the repo spec or journal changes.
+ */
+export function preflightRepoSpecWrite(
+  spec: ProjectSpec,
+  startDir = primaryWorkspaceDirectory(),
+  projectGitRemoteUrl?: string
+): RepoSpecWritePreflight | null {
+  if (!repoSpecEnabled()) {
+    return null;
   }
 
-  return { path: templatePath, addedKeys };
+  const root = findRepoRoot(startDir);
+  if (!root) {
+    return null;
+  }
+
+  const existing = readRepoSpecFile(root);
+  if (existing && existing.spec.project !== spec.project) {
+    return null;
+  }
+  if (
+    !existing
+    && !repositoryMatchesProjectIdentity(
+      root,
+      spec.project,
+      spec.gitRemoteUrl ?? projectGitRemoteUrl
+    )
+  ) {
+    return null;
+  }
+
+  return {
+    root,
+    project: spec.project,
+    gitignore: ensureRepoEnvFilesIgnored(root),
+  };
 }
 
 export function readRepoSpecFile(startDir = primaryWorkspaceDirectory()): RepoSpecFile | null {
@@ -132,27 +192,56 @@ export function readRepoSpecFile(startDir = primaryWorkspaceDirectory()): RepoSp
   return { root, path: specPath, document, spec: parsed.data };
 }
 
-export function writeRepoSpecFile(spec: ProjectSpec, startDir = primaryWorkspaceDirectory()): RepoSpecWrite | null {
-  if (!repoSpecEnabled()) {
-    return null;
+export function writePreflightedRepoSpecFile(
+  spec: ProjectSpec,
+  preflight: RepoSpecWritePreflight
+): RepoSpecWrite {
+  if (preflight.project !== spec.project) {
+    throw new Error('Refusing to write a repo spec with a preflight prepared for another project.');
   }
 
-  const root = findRepoRoot(startDir);
-  if (!root) {
-    return null;
-  }
+  // Prepare the ancillary dotenv files before advancing the committed source
+  // of truth. A failed local/template write may leave only safe, value-free
+  // placeholder additions behind; it must not publish a spec that the revision
+  // journal never records.
+  const requirements = specLocalEnvRequirements(spec);
+  const localEnv = ensureCommentedEnvFile(path.join(preflight.root, '.env'), requirements, {
+    activateEmptyCommentedAssignments: true,
+    createMode: 0o600,
+  });
+  const envTemplate = ensureRepoEnvTemplate(preflight.root, requirements);
 
-  // A writer must distinguish a missing file from corrupt/conflicting desired
-  // state just as strictly as a reader. Repair or intentionally delete a bad
-  // file first; never make a lifecycle write silently erase the evidence.
-  const existing = readRepoSpecFile(root);
-  if (existing && existing.spec.project !== spec.project) {
-    return null;
-  }
-
-  const dir = path.join(root, HYPERVIBE_DIR);
+  const dir = path.join(preflight.root, HYPERVIBE_DIR);
   mkdirSync(dir, { recursive: true });
-  const specPath = repoSpecPath(root);
-  writeFileSync(specPath, `${JSON.stringify(spec, null, 2)}\n`, 'utf8');
-  return { root, path: specPath, envTemplate: ensureRepoEnvTemplate(root) };
+  const specPath = repoSpecPath(preflight.root);
+  const stagedSpecPath = path.join(dir, `.${SPEC_FILE}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(stagedSpecPath, `${JSON.stringify(spec, null, 2)}\n`, {
+      encoding: 'utf8',
+      flag: 'wx',
+      mode: 0o644,
+    });
+    renameSync(stagedSpecPath, specPath);
+  } finally {
+    rmSync(stagedSpecPath, { force: true });
+  }
+
+  return {
+    root: preflight.root,
+    path: specPath,
+    envTemplate,
+    localEnv: {
+      ...localEnv,
+      gitignorePath: preflight.gitignore.path,
+      gitignoreUpdated: preflight.gitignore.updated,
+    },
+  };
+}
+
+export function writeRepoSpecFile(spec: ProjectSpec, startDir = primaryWorkspaceDirectory()): RepoSpecWrite | null {
+  // A writer must distinguish a missing file from corrupt/conflicting desired
+  // state just as strictly as a reader. It must also establish the local-env
+  // safety boundary before overwriting desired state.
+  const preflight = preflightRepoSpecWrite(spec, startDir);
+  return preflight ? writePreflightedRepoSpecFile(spec, preflight) : null;
 }

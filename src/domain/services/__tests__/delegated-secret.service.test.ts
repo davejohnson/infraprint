@@ -14,6 +14,8 @@ import {
 } from '../delegated-secret.service.js';
 
 const FRIEND_KEY = 'sk-ant-api03-friend-value';
+const GENERATED_KEY = 'SESSION_SECRET';
+const GENERATED_VALUE = 'generated-session-secret-test-value';
 
 function spec() {
   return projectSpecSchema.parse({
@@ -34,7 +36,33 @@ function spec() {
   });
 }
 
-function observed(hash?: string): ObservedState {
+function generatedSpec() {
+  return projectSpecSchema.parse({
+    version: 1,
+    project: 'generated-secret-app',
+    secrets: {
+      [GENERATED_KEY]: {
+        ownership: 'hypervibe',
+        generator: 'random-base64url-32-v1' as const,
+        generation: 1,
+        environments: ['production'],
+      },
+    },
+    environments: {
+      production: {
+        hosting: { provider: 'railway' },
+        services: { web: {} },
+      },
+    },
+  });
+}
+
+function observedSecret(params: {
+  key: string;
+  hash?: string;
+  presentWithoutHash?: boolean;
+}): ObservedState {
+  const present = params.hash !== undefined || params.presentWithoutHash === true;
   return {
     provider: 'railway',
     observedAt: new Date().toISOString(),
@@ -45,14 +73,18 @@ function observed(hash?: string): ObservedState {
       workloadKind: 'web',
       customDomains: [],
       config: {},
-      envVarKeys: hash ? ['ANTHROPIC_API_KEY'] : [],
-      envVarHashes: hash ? { ANTHROPIC_API_KEY: hash } : {},
+      envVarKeys: present ? [params.key] : [],
+      envVarHashes: params.hash ? { [params.key]: params.hash } : {},
       status: 'running',
     }],
     databases: [],
     partial: false,
     warnings: [],
   };
+}
+
+function observed(hash?: string): ObservedState {
+  return observedSecret({ key: 'ANTHROPIC_API_KEY', ...(hash ? { hash } : {}) });
 }
 
 describe('delegated-secret.service', () => {
@@ -69,13 +101,367 @@ describe('delegated-secret.service', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('requires explicit input for missing or unaccepted live values', () => {
+  it('plans a first-time missing random secret without user input or confirmation', () => {
+    const planned = planDelegatedSecrets({
+      spec: generatedSpec(),
+      environmentName: 'production',
+      hostingProvider: 'railway',
+      environment: { platformBindings: {} },
+      observed: observedSecret({ key: GENERATED_KEY }),
+      generatedValues: { [GENERATED_KEY]: GENERATED_VALUE },
+    });
+
+    expect(planned.inputRequired).toEqual([]);
+    expect(planned.blockers).toEqual([]);
+    expect(planned.warnings).toEqual([]);
+    expect(planned.desiredEnvVars).toEqual({ [GENERATED_KEY]: GENERATED_VALUE });
+    expect(planned.actions).toHaveLength(1);
+    expect(planned.actions[0]).toMatchObject({
+      id: `secret:${GENERATED_KEY}`,
+      type: 'update',
+      verified: true,
+      metadata: {
+        ownership: 'hypervibe',
+        principal: 'hypervibe',
+        generator: 'random-base64url-32-v1',
+        generation: 1,
+        expectedValueHash: hashEnvValue(GENERATED_VALUE),
+        inputProvided: false,
+        valuePrepared: true,
+        services: ['web'],
+      },
+    });
+    expect(planned.actions[0]).not.toHaveProperty('requiresConfirm');
+    expect(JSON.stringify(planned.actions)).not.toContain(GENERATED_VALUE);
+  });
+
+  it('plans a verified noop when the generated binding and live hash match', () => {
+    const expectedHash = hashEnvValue(GENERATED_VALUE);
+    const planned = planDelegatedSecrets({
+      spec: generatedSpec(),
+      environmentName: 'production',
+      hostingProvider: 'railway',
+      environment: {
+        platformBindings: {
+          delegatedEnvBindings: [{
+            name: GENERATED_KEY,
+            principal: 'hypervibe',
+            valueHash: expectedHash,
+            source: 'hypervibe-generated',
+            generator: 'random-base64url-32-v1',
+            generation: 1,
+            syncedAt: '2026-09-08T00:00:00.000Z',
+            applyRunId: 'apply-generated-1',
+            actionId: `secret:${GENERATED_KEY}`,
+          }],
+        },
+      },
+      observed: observedSecret({ key: GENERATED_KEY, hash: expectedHash }),
+      generatedValues: { [GENERATED_KEY]: GENERATED_VALUE },
+    });
+
+    expect(planned.inputRequired).toEqual([]);
+    expect(planned.blockers).toEqual([]);
+    expect(planned.desiredEnvVars).toEqual({});
+    expect(planned.actions[0]).toMatchObject({
+      type: 'noop',
+      verified: true,
+      metadata: {
+        ownership: 'hypervibe',
+        generator: 'random-base64url-32-v1',
+        generation: 1,
+        expectedValueHash: expectedHash,
+      },
+    });
+    expect(planned.actions[0]).not.toHaveProperty('requiresConfirm');
+  });
+
+  it('blocks when a same-generation binding cannot be reproduced locally', () => {
+    const acceptedHash = hashEnvValue('value-derived-by-original-local-key');
+    const planned = planDelegatedSecrets({
+      spec: generatedSpec(),
+      environmentName: 'production',
+      hostingProvider: 'railway',
+      environment: {
+        platformBindings: {
+          delegatedEnvBindings: [{
+            name: GENERATED_KEY,
+            principal: 'hypervibe',
+            valueHash: acceptedHash,
+            source: 'hypervibe-generated',
+            generator: 'random-base64url-32-v1',
+            generation: 1,
+            syncedAt: '2026-09-08T00:00:00.000Z',
+            applyRunId: 'apply-generated-1',
+            actionId: `secret:${GENERATED_KEY}`,
+          }],
+        },
+      },
+      observed: observedSecret({ key: GENERATED_KEY, hash: acceptedHash }),
+      generatedValues: { [GENERATED_KEY]: GENERATED_VALUE },
+    });
+
+    expect(planned.desiredEnvVars).toEqual({});
+    expect(planned.inputRequired).toEqual([]);
+    expect(planned.blockers).toEqual([
+      expect.objectContaining({ key: GENERATED_KEY, reason: expect.stringContaining('cannot reproduce') }),
+    ]);
+    expect(planned.actions[0]).toMatchObject({
+      type: 'update',
+      verified: true,
+      metadata: {
+        expectedValueHash: hashEnvValue(GENERATED_VALUE),
+        blockedReason: 'hypervibe_secret_key_mismatch',
+      },
+    });
+    expect(planned.actions[0]).not.toHaveProperty('requiresConfirm');
+    expect(planned.warnings[0]).toContain('Restore the original Hypervibe secret key');
+  });
+
+  it('confirmation-gates replacing an existing conflicting random value', () => {
+    const planned = planDelegatedSecrets({
+      spec: generatedSpec(),
+      environmentName: 'production',
+      hostingProvider: 'railway',
+      environment: { platformBindings: {} },
+      observed: observedSecret({
+        key: GENERATED_KEY,
+        hash: hashEnvValue('existing-random-live-value'),
+      }),
+      generatedValues: { [GENERATED_KEY]: GENERATED_VALUE },
+    });
+
+    expect(planned.blockers).toEqual([]);
+    expect(planned.inputRequired).toEqual([]);
+    expect(planned.desiredEnvVars).toEqual({ [GENERATED_KEY]: GENERATED_VALUE });
+    expect(planned.actions[0]).toMatchObject({
+      type: 'update',
+      verified: true,
+      requiresConfirm: true,
+      metadata: {
+        ownership: 'hypervibe',
+        expectedValueHash: hashEnvValue(GENERATED_VALUE),
+      },
+    });
+    expect(planned.warnings[0]).toContain('confirmation-gated');
+  });
+
+  it('blocks a masked live secret without an accepted generated binding', () => {
+    const planned = planDelegatedSecrets({
+      spec: generatedSpec(),
+      environmentName: 'production',
+      hostingProvider: 'railway',
+      environment: { platformBindings: {} },
+      observed: observedSecret({ key: GENERATED_KEY, presentWithoutHash: true }),
+      generatedValues: { [GENERATED_KEY]: GENERATED_VALUE },
+    });
+
+    expect(planned.desiredEnvVars).toEqual({});
+    expect(planned.blockers).toEqual([
+      expect.objectContaining({ key: GENERATED_KEY, reason: expect.stringContaining('could not be observed') }),
+    ]);
+    expect(planned.actions[0]).toMatchObject({
+      type: 'update',
+      verified: false,
+      metadata: { blockedReason: 'hypervibe_secret_observation_unknown' },
+    });
+    expect(planned.actions[0]).not.toHaveProperty('requiresConfirm');
+  });
+
+  it('treats an absent key as unknown when service environment observation is incomplete', () => {
+    const live = observedSecret({ key: GENERATED_KEY });
+    live.partial = true;
+    live.completeness = { services: 'unknown' };
+    live.warnings = ['Failed to read variables for "web"'];
+
+    const planned = planDelegatedSecrets({
+      spec: generatedSpec(),
+      environmentName: 'production',
+      hostingProvider: 'railway',
+      environment: { platformBindings: {} },
+      observed: live,
+      generatedValues: { [GENERATED_KEY]: GENERATED_VALUE },
+    });
+
+    expect(planned.desiredEnvVars).toEqual({});
+    expect(planned.blockers).toEqual([
+      expect.objectContaining({ key: GENERATED_KEY, reason: expect.stringContaining('could not be observed') }),
+    ]);
+    expect(planned.actions[0]).toMatchObject({
+      type: 'update',
+      verified: false,
+      metadata: { blockedReason: 'hypervibe_secret_observation_unknown' },
+    });
+  });
+
+  it.each([
+    ['missing', { envVarKeys: [], envVarHashes: {} }],
+    ['mismatched', {
+      envVarKeys: [GENERATED_KEY],
+      envVarHashes: { [GENERATED_KEY]: hashEnvValue('different-live-value') },
+    }],
+  ])('does not hide a proven %s destination behind a masked destination noop', (_condition, secondService) => {
+    const expectedHash = hashEnvValue(GENERATED_VALUE);
+    const twoServiceSpec = projectSpecSchema.parse({
+      ...generatedSpec(),
+      environments: {
+        production: {
+          hosting: { provider: 'railway' },
+          services: { web: {}, worker: {} },
+        },
+      },
+    });
+    const live = observedSecret({ key: GENERATED_KEY, presentWithoutHash: true });
+    live.services.push({
+      ...live.services[0],
+      name: 'worker',
+      externalId: 'service-2',
+      ...secondService,
+    });
+    live.completeness = { services: 'complete' };
+
+    const planned = planDelegatedSecrets({
+      spec: twoServiceSpec,
+      environmentName: 'production',
+      hostingProvider: 'railway',
+      environment: {
+        platformBindings: {
+          delegatedEnvBindings: [{
+            name: GENERATED_KEY,
+            principal: 'hypervibe',
+            valueHash: expectedHash,
+            source: 'hypervibe-generated',
+            generator: 'random-base64url-32-v1',
+            generation: 1,
+            syncedAt: '2026-09-08T00:00:00.000Z',
+            applyRunId: 'apply-generated-1',
+            actionId: `secret:${GENERATED_KEY}`,
+          }],
+        },
+      },
+      observed: live,
+      generatedValues: { [GENERATED_KEY]: GENERATED_VALUE },
+    });
+
+    expect(planned.actions[0]).toMatchObject({
+      type: 'update',
+      verified: false,
+      metadata: { blockedReason: 'hypervibe_secret_observation_unknown' },
+    });
+    expect(planned.actions[0]).not.toHaveProperty('requiresConfirm');
+    expect(planned.blockers).toEqual([
+      expect.objectContaining({
+        key: GENERATED_KEY,
+        reason: expect.stringContaining('could not be observed'),
+      }),
+    ]);
+    expect(planned.desiredEnvVars).toEqual({});
+  });
+
+  it('preserves an accepted value when masked destinations have no known absence or drift', () => {
+    const expectedHash = hashEnvValue(GENERATED_VALUE);
+    const twoServiceSpec = projectSpecSchema.parse({
+      ...generatedSpec(),
+      environments: {
+        production: {
+          hosting: { provider: 'railway' },
+          services: { web: {}, worker: {} },
+        },
+      },
+    });
+    const live = observedSecret({ key: GENERATED_KEY, presentWithoutHash: true });
+    live.services.push({
+      ...live.services[0],
+      name: 'worker',
+      externalId: 'service-2',
+      envVarKeys: [GENERATED_KEY],
+      envVarHashes: { [GENERATED_KEY]: expectedHash },
+    });
+    live.completeness = { services: 'complete' };
+
+    const planned = planDelegatedSecrets({
+      spec: twoServiceSpec,
+      environmentName: 'production',
+      hostingProvider: 'railway',
+      environment: {
+        platformBindings: {
+          delegatedEnvBindings: [{
+            name: GENERATED_KEY,
+            principal: 'hypervibe',
+            valueHash: expectedHash,
+            source: 'hypervibe-generated',
+            generator: 'random-base64url-32-v1',
+            generation: 1,
+            syncedAt: '2026-09-08T00:00:00.000Z',
+            applyRunId: 'apply-generated-1',
+            actionId: `secret:${GENERATED_KEY}`,
+          }],
+        },
+      },
+      observed: live,
+      generatedValues: { [GENERATED_KEY]: GENERATED_VALUE },
+    });
+
+    expect(planned.blockers).toEqual([]);
+    expect(planned.desiredEnvVars).toEqual({});
+    expect(planned.actions[0]).toMatchObject({ type: 'noop', verified: false });
+  });
+
+  it('records only generated-secret hash and provenance after a successful action', () => {
+    const project = new ProjectRepository().create({
+      name: 'generated-secret-app',
+      defaultPlatform: 'railway',
+    });
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'production',
+      platformBindings: { provider: 'railway' },
+    });
+
+    const updated = recordDelegatedSecretBindings({
+      environment,
+      spec: generatedSpec(),
+      environmentName: 'production',
+      suppliedValues: { [GENERATED_KEY]: GENERATED_VALUE },
+      applyRunId: 'apply-generated-1',
+      receipts: [{ actionId: `secret:${GENERATED_KEY}`, status: 'succeeded' }],
+      now: '2026-09-08T00:00:00.000Z',
+    });
+
+    const bindings = parseDelegatedSecretBindings(updated);
+    expect(bindings).toEqual([{
+      name: GENERATED_KEY,
+      principal: 'hypervibe',
+      valueHash: hashEnvValue(GENERATED_VALUE),
+      source: 'hypervibe-generated',
+      generator: 'random-base64url-32-v1',
+      generation: 1,
+      syncedAt: '2026-09-08T00:00:00.000Z',
+      applyRunId: 'apply-generated-1',
+      actionId: `secret:${GENERATED_KEY}`,
+    }]);
+    expect(Object.keys(bindings[0]).sort()).toEqual([
+      'actionId',
+      'applyRunId',
+      'generation',
+      'generator',
+      'name',
+      'principal',
+      'source',
+      'syncedAt',
+      'valueHash',
+    ]);
+    expect(JSON.stringify(updated.platformBindings)).not.toContain(GENERATED_VALUE);
+  });
+
+  it('keeps delegated secrets on the explicit-input flow for missing or unaccepted live values', () => {
     const missing = planDelegatedSecrets({
       spec: spec(),
       environmentName: 'production',
       hostingProvider: 'railway',
       environment: { platformBindings: {} },
       observed: observed(),
+      generatedValues: { ANTHROPIC_API_KEY: 'must-not-be-used-for-delegated-input' },
     });
     expect(missing.inputRequired).toEqual([
       expect.objectContaining({ key: 'ANTHROPIC_API_KEY', principal: 'github:alice' }),
@@ -85,6 +471,7 @@ describe('delegated-secret.service', () => {
       type: 'update',
       metadata: { inputRequired: true, inputProvided: false },
     });
+    expect(missing.desiredEnvVars).toEqual({});
 
     const unaccepted = planDelegatedSecrets({
       spec: spec(),

@@ -82,6 +82,61 @@ function provider(
 }
 
 describe('ProviderRegistry lifecycle capabilities', () => {
+  it('rejects local env metadata that names a missing credential role', () => {
+    const registry = new ProviderRegistry();
+    const invalid = provider('bad-local-env', 'ai');
+    invalid.metadata.credentials = {
+      localEnvInputs: [{
+        envKey: 'HYPERVIBE_BAD_TOKEN',
+        credentialKeys: ['apiToken'],
+        comment: 'Token for the test provider',
+      }],
+    };
+
+    expect(() => registry.register(invalid))
+      .toThrow('references unknown credential key "apiToken"');
+  });
+
+  it('rejects multiple generated dotenv slots for the same credential role', () => {
+    const registry = new ProviderRegistry();
+    const invalid = provider('duplicate-local-role', 'ai');
+    invalid.metadata.credentials = {
+      localEnvInputs: [
+        {
+          envKey: 'HYPERVIBE_PRIMARY_TOKEN',
+          credentialKeys: ['token'],
+          comment: 'Canonical token for the test provider',
+        },
+        {
+          envKey: 'HYPERVIBE_COMPAT_TOKEN',
+          credentialKeys: ['token'],
+          comment: 'Compatibility token for the test provider',
+        },
+      ],
+    };
+
+    expect(() => registry.register(invalid))
+      .toThrow('credential role "token" is assigned to both "HYPERVIBE_PRIMARY_TOKEN" and "HYPERVIBE_COMPAT_TOKEN"');
+  });
+
+  it('allows one canonical dotenv slot to satisfy multiple credential roles', () => {
+    const registry = new ProviderRegistry();
+    const combined = provider('combined-local-role', 'ai');
+    combined.metadata.credentialsSchema = z.object({
+      apiToken: z.string(),
+      packageReadToken: z.string(),
+    });
+    combined.metadata.credentials = {
+      localEnvInputs: [{
+        envKey: 'HYPERVIBE_COMBINED_TOKEN',
+        credentialKeys: ['apiToken', 'packageReadToken'],
+        comment: 'One intentionally shared token for both provider roles',
+      }],
+    };
+
+    expect(() => registry.register(combined)).not.toThrow();
+  });
+
   it('derives lifecycle support from registered adapter capabilities', () => {
     const registry = new ProviderRegistry();
     registry.register(provider('host', 'deployment'));

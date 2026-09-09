@@ -42,7 +42,7 @@ import { CACHE_OPERATIONS, planCache } from '../services/cache-plan.service.js';
 import { planDatabaseResilience, DATABASE_RESILIENCE_OPERATIONS } from '../services/database-resilience-plan.service.js';
 import {
   addDomainRegistrationDependency,
-  cloudflareRegistrarCredentialProblem,
+  cloudflareRegistrarCredentialRequirement,
   planCloudflareDomainRegistration,
 } from '../services/domain-registration.service.js';
 import {
@@ -66,14 +66,17 @@ import {
   planStorage,
   storageEnvKeys,
 } from '../services/storage-plan.service.js';
-import { formatConnectionGuidance } from '../services/connection-guidance.js';
+import { credentialFieldsFromSchema, formatConnectionGuidance } from '../services/connection-guidance.js';
 import { defaultDeployEnvFilePath, loadDeployEnvFile } from '../services/deploy-env-file.js';
 import { cloudflareScopeHintsForDomain } from '../services/domain-scope.js';
 import {
   delegatedSecretInputsForEnvironment,
+  managedSecretsForEnvironment,
   planDelegatedSecrets,
   type DelegatedSecretInputRequirement,
 } from '../services/delegated-secret.service.js';
+import { deriveHypervibeSecretValues } from '../services/hypervibe-secret-value.js';
+import { withReceiptValidatedManagedSecretBindings } from '../services/managed-secret-binding-receipts.js';
 import { resolveSecretValueRef } from '../services/secret-value-ref.js';
 import {
   githubCollaborationConnectionBlock,
@@ -137,10 +140,19 @@ export interface EnvironmentPlan {
   /** Delegated values that must be supplied in a new hv_plan call before apply. */
   inputRequired: DelegatedSecretInputRequirement[];
   /** Missing/unverified provider connections that block apply. */
-  blocked: Array<{ provider: string; reason: string; scope?: string; policy?: 'hard' | 'action-scoped-if-independent-actions'; actionIds?: string[] }>;
+  blocked: Array<{ provider: string; reason: string; scope?: string; policy?: 'hard' | 'action-scoped-if-independent-actions'; actionIds?: string[]; requiredCredentialKeys?: string[] }>;
 }
 
 export const HOSTING_ENVIRONMENT_ENSURE_OPERATION = 'hostingEnvironmentEnsure';
+
+function providerRequiredCredentialKeys(provider: string): string[] {
+  const metadata = providerRegistry.getMetadata(provider);
+  return metadata
+    ? credentialFieldsFromSchema(metadata.credentialsSchema)
+      ?.filter((field) => field.required)
+      .map((field) => field.name) ?? []
+    : [];
+}
 
 function projectWithSpecGitRemoteUrl(project: Project, spec: ProjectSpec): Project {
   const gitRemoteUrl = spec.gitRemoteUrl?.trim();
@@ -761,8 +773,8 @@ export class PlanService {
   }
 
   /** Connections that must exist+verify before apply can run. */
-  preflight(environmentSpec: EnvironmentSpec, environmentName?: string, projectSpec?: ProjectSpec): Array<{ provider: string; reason: string; scope?: string; policy?: 'hard' | 'action-scoped-if-independent-actions' }> {
-    const blocked: Array<{ provider: string; reason: string; scope?: string; policy?: 'hard' | 'action-scoped-if-independent-actions' }> = [];
+  preflight(environmentSpec: EnvironmentSpec, environmentName?: string, projectSpec?: ProjectSpec): Array<{ provider: string; reason: string; scope?: string; policy?: 'hard' | 'action-scoped-if-independent-actions'; requiredCredentialKeys?: string[] }> {
+    const blocked: Array<{ provider: string; reason: string; scope?: string; policy?: 'hard' | 'action-scoped-if-independent-actions'; requiredCredentialKeys?: string[] }> = [];
     const required: Array<{ provider: string; scopeHints?: string[] }> = [
       { provider: environmentSpec.hosting.provider },
     ];
@@ -824,6 +836,7 @@ export class PlanService {
         const scope = requirement.scopeHints?.[0];
         blocked.push({
           provider: requirement.provider,
+          requiredCredentialKeys: providerRequiredCredentialKeys(requirement.provider),
           reason: `No verified ${requirement.provider}${scope ? ` connection for ${scope}` : ' connection'}. ${formatConnectionGuidance(requirement.provider, { scope })}`,
           policy: providerRegistry.getMetadata(requirement.provider)?.orchestration?.connections?.missingConnectionPolicy ?? 'hard',
           ...(scope ? { scope } : {}),
@@ -831,12 +844,13 @@ export class PlanService {
       }
     }
     if (environmentSpec.domainRegistration?.register && environmentSpec.domain) {
-      const registrarProblem = cloudflareRegistrarCredentialProblem(environmentSpec.domain);
-      if (registrarProblem) {
+      const registrarRequirement = cloudflareRegistrarCredentialRequirement(environmentSpec.domain);
+      if (registrarRequirement) {
         const scope = cloudflareScopeHintsForDomain(environmentSpec.domain)[0];
         blocked.push({
           provider: 'cloudflare',
-          reason: registrarProblem,
+          requiredCredentialKeys: registrarRequirement.requiredCredentialKeys,
+          reason: registrarRequirement.reason,
           policy: 'hard',
           ...(scope ? { scope } : {}),
         });
@@ -847,8 +861,8 @@ export class PlanService {
 
   /** Provider connections needed by an isolated cross-environment data copy.
    * Unrelated hosting, email, DNS, and CI connections cannot block this stage. */
-  providerPreflight(providers: string[]): Array<{ provider: string; reason: string; policy: 'hard' }> {
-    const blocked: Array<{ provider: string; reason: string; policy: 'hard' }> = [];
+  providerPreflight(providers: string[]): Array<{ provider: string; reason: string; policy: 'hard'; requiredCredentialKeys?: string[] }> {
+    const blocked: Array<{ provider: string; reason: string; policy: 'hard'; requiredCredentialKeys?: string[] }> = [];
     for (const provider of [...new Set(providers)].sort()) {
       const verified = providerRegistry.connectionProviders(provider).some((connectionProvider) =>
         this.connectionRepo.findAllByProvider(connectionProvider).some((connection) => connection.status === 'verified')
@@ -856,6 +870,7 @@ export class PlanService {
       if (!verified) {
         blocked.push({
           provider,
+          requiredCredentialKeys: providerRequiredCredentialKeys(provider),
           reason: `No verified ${provider} connection. ${formatConnectionGuidance(provider)}`,
           policy: 'hard',
         });
@@ -1607,10 +1622,23 @@ export class PlanService {
         };
       }
     }
+    const managedSecretSlots = new Map(managedSecretsForEnvironment(specResult.spec, environmentName));
     const delegatedSecretSlots = new Map(delegatedSecretInputsForEnvironment(specResult.spec, environmentName));
+    const reservedSecretKeys = new Set([
+      ...managedSecretSlots.keys(),
+      ...delegatedSecretSlots.keys(),
+    ]);
     const requestedSecretRefs = options?.secretRefs && Object.keys(options.secretRefs).length > 0
       ? options.secretRefs
       : undefined;
+    const hypervibeOwnedSecretRefs = Object.keys(requestedSecretRefs ?? {}).filter(
+      (key) => managedSecretSlots.get(key)?.ownership === 'hypervibe'
+    );
+    if (hypervibeOwnedSecretRefs.length > 0) {
+      return {
+        error: `secretRefs cannot supply Hypervibe-owned secret keys: ${hypervibeOwnedSecretRefs.join(', ')}. Hypervibe generates these values automatically; remove the references and re-run hv_plan.`,
+      };
+    }
     if (serviceFilter && requestedSecretRefs) {
       return {
         error: 'Delegated secret inputs require a full environment plan; remove services= and re-run hv_plan with secretRefs.',
@@ -1652,10 +1680,11 @@ export class PlanService {
         error: `Messaging-managed keys cannot be passed through envVars: ${messagingOverrideCollisions.join(', ')}. Configure environments.${environmentName}.messaging instead.`,
       };
     }
-    const delegatedOverrideCollisions = Object.keys(envVarOverrides ?? {}).filter((key) => delegatedSecretSlots.has(key));
-    if (delegatedOverrideCollisions.length > 0) {
+    const managedSecretOverrideCollisions = Object.keys(envVarOverrides ?? {})
+      .filter((key) => reservedSecretKeys.has(key));
+    if (managedSecretOverrideCollisions.length > 0) {
       return {
-        error: `Delegated secret keys cannot be passed through envVars: ${delegatedOverrideCollisions.join(', ')}. Use secretRefs with env:, dotenv:, file:, or a secret-manager reference.`,
+        error: `Managed secret keys cannot be passed through envVars: ${managedSecretOverrideCollisions.join(', ')}. Hypervibe-owned values are generated automatically. Use secretRefs only for delegated secret slots.`,
       };
     }
     const unknownSecretRefs = Object.keys(requestedSecretRefs ?? {}).filter((key) => !delegatedSecretSlots.has(key));
@@ -1681,6 +1710,16 @@ export class PlanService {
         error: `Failed to resolve delegated secret input: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
+    let generatedSecretValues: Record<string, string> = {};
+    if (!serviceFilter) {
+      try {
+        generatedSecretValues = deriveHypervibeSecretValues(specResult.spec, environmentName);
+      } catch {
+        return {
+          error: 'Hypervibe could not prepare its managed secret values. Check the local secret-store configuration and re-run hv_plan. No plan was saved or provider mutation authorized.',
+        };
+      }
+    }
     let envFile: ReturnType<typeof loadDeployEnvFile> = null;
     try {
       const envFilePolicy = environmentSpec.envFile;
@@ -1704,7 +1743,7 @@ export class PlanService {
       }
       const excludedEnvKeys = Array.from(new Set([
         ...(envFilePolicy?.exclude ?? []),
-        ...delegatedSecretSlots.keys(),
+        ...reservedSecretKeys,
         ...retiredEnvKeys,
       ]));
       envFile = loadDeployEnvFile({
@@ -1802,15 +1841,28 @@ export class PlanService {
       };
     }
     const delegatedSecrets = serviceFilter
-      ? { actions: [], desiredEnvVars: {}, inputRequired: [], warnings: [] }
+      ? { actions: [], desiredEnvVars: {}, inputRequired: [], warnings: [], blockers: [] }
       : planDelegatedSecrets({
         spec: specResult.spec,
         environmentName,
         hostingProvider: environmentSpec.hosting.provider,
-        environment: environmentForObserve,
+        environment: withReceiptValidatedManagedSecretBindings(environmentForObserve, this.runRepo),
         observed,
         suppliedValues: delegatedSecretValues,
+        generatedValues: generatedSecretValues,
       });
+    if (delegatedSecrets.blockers.length > 0) {
+      const detail = delegatedSecrets.blockers
+        .map((blocker) => `${blocker.key}: ${blocker.reason}`)
+        .join('; ');
+      return {
+        error: `Hypervibe cannot safely plan its managed secrets. ${detail}. No plan was saved or provider mutation authorized.`,
+      };
+    }
+    const managedSecretValues = {
+      ...delegatedSecretValues,
+      ...generatedSecretValues,
+    };
     const local = this.buildLocalSnapshot(projectForPlan, environment, effectiveBindings);
     const localDatabase = local.components.find((component) => component.type === 'postgres');
     const localDatabaseProvider = recordValue(localDatabase?.bindings, 'provider');
@@ -1882,7 +1934,7 @@ export class PlanService {
         .flatMap((service) => Object.keys(service.databaseEnvAliases ?? {})),
       ...Object.keys(managedCacheEnvVars ?? {}),
       ...Object.keys(managedQueueEnvVars ?? {}),
-      ...delegatedSecretSlots.keys(),
+      ...reservedSecretKeys,
       ...stripeManagedEnvKeys(environmentSpec),
       ...(environmentSpec.email.enabled ? EMAIL_MANAGED_ENV_KEYS : []),
       ...(environmentSpec.messaging ? MESSAGING_MANAGED_ENV_KEYS : []),
@@ -2228,6 +2280,27 @@ export class PlanService {
         action.dependsOn = Array.from(new Set([
           ...(action.dependsOn ?? []),
           providerEnvironmentAction.id,
+        ]));
+      }
+    }
+    for (const managedSecretAction of delegatedSecrets.actions) {
+      if (managedSecretAction.type === 'noop') continue;
+      const serviceNames = Array.isArray(managedSecretAction.metadata?.services)
+        ? managedSecretAction.metadata.services.filter((name): name is string => typeof name === 'string')
+        : [];
+      const serviceDependencies = actions
+        .filter((action) => (
+          action.resource.kind === 'service'
+          && action.id === `service:${action.resource.name}`
+          && serviceNames.includes(action.resource.name)
+          && action.type !== 'noop'
+          && action.type !== 'destroy'
+        ))
+        .map((action) => action.id);
+      if (serviceDependencies.length > 0) {
+        managedSecretAction.dependsOn = Array.from(new Set([
+          ...(managedSecretAction.dependsOn ?? []),
+          ...serviceDependencies,
         ]));
       }
     }
@@ -2605,6 +2678,9 @@ export class PlanService {
       if (envFile.localValueKeys.length > 0) {
         envFileWarnings.push(`Skipped ${envFile.localValueKeys.length} .env key(s) with local-only values in runtime mode: ${envFile.localValueKeys.join(', ')}.`);
       }
+      if (envFile.emptyKeys.length > 0) {
+        envFileWarnings.push(`Missing values for ${envFile.emptyKeys.length} selected .env key(s): ${envFile.emptyKeys.join(', ')}. Fill them before apply.`);
+      }
       if (shadowedByManaged.length > 0) {
         envFileWarnings.push(`Ignored ${shadowedByManaged.length} .env key(s) because Hypervibe manages them from infrastructure: ${shadowedByManaged.join(', ')}.`);
       }
@@ -2615,7 +2691,7 @@ export class PlanService {
 
     const overrides = serviceFilter
       || envVarOverrides
-      || Object.keys(delegatedSecretValues).length > 0
+      || Object.keys(managedSecretValues).length > 0
       || (envFileVars && Object.keys(envFileVars).length > 0)
       ? {
         ...(serviceFilter ? { services: serviceFilter } : {}),
@@ -2632,10 +2708,10 @@ export class PlanService {
             envVarsEncrypted: getSecretStore().encryptObject(envVarOverrides),
           }
           : {}),
-        ...(Object.keys(delegatedSecretValues).length > 0
+        ...(Object.keys(managedSecretValues).length > 0
           ? {
-            delegatedSecretKeys: Object.keys(delegatedSecretValues).sort(),
-            delegatedSecretVarsEncrypted: getSecretStore().encryptObject(delegatedSecretValues),
+            delegatedSecretKeys: Object.keys(managedSecretValues).sort(),
+            delegatedSecretVarsEncrypted: getSecretStore().encryptObject(managedSecretValues),
           }
           : {}),
       }

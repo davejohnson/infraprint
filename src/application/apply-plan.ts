@@ -2,6 +2,7 @@ import { PlanService } from '../domain/plan/plan.service.js';
 import {
   ConvergeExecutor,
   fingerprintObservedState,
+  type ActionExecutionContext,
   type ActionResult,
   type ConvergeResult,
 } from '../domain/plan/converge.executor.js';
@@ -24,7 +25,9 @@ import { applyQueueAction } from '../domain/services/queue-plan.service.js';
 import { resolveQueueEnvVars } from '../domain/services/queue-env.js';
 import { applyStorageAction, resolveStorageServiceEnvVars } from '../domain/services/storage-plan.service.js';
 import {
-  recordDelegatedSecretBindings,
+  liveHashesForSecret,
+  parseDelegatedSecretBindings,
+  recordDelegatedSecretBinding,
   type DelegatedSecretInputRequirement,
 } from '../domain/services/delegated-secret.service.js';
 import { recordRuntimeRolloutRequirements } from '../domain/services/runtime-rollout.service.js';
@@ -66,6 +69,7 @@ import {
   DOMAIN_DETACH_OPERATION,
 } from '../domain/services/domain-attach-policy.js';
 import {
+  credentialFieldsFromSchema,
   connectionSetupDetails,
   GITHUB_TOKEN_URLS,
 } from '../domain/services/connection-guidance.js';
@@ -82,7 +86,7 @@ import { getSecretStore } from '../adapters/secrets/secret-store.js';
 import type { Project } from '../domain/entities/project.entity.js';
 import type { Component } from '../domain/entities/component.entity.js';
 import type { Environment } from '../domain/entities/environment.entity.js';
-import type { ObservedState } from '../domain/ports/observe.port.js';
+import { hashEnvValue, type ObservedState } from '../domain/ports/observe.port.js';
 import {
   parseHostingBindings,
   parseHostingServiceCreateRecovery,
@@ -124,7 +128,10 @@ import {
 import { applyLoadBalancerAction } from '../domain/services/load-balancer-plan.service.js';
 import { parseGitHubRepoFromRemote } from '../lib/git-remote.js';
 import type { CommandContext } from './context.js';
-import { resolvePlanActionAuthority } from '../domain/plan/action-authority.js';
+import {
+  hasExactPlanActionConfirmationAuthority,
+  resolvePlanActionAuthority,
+} from '../domain/plan/action-authority.js';
 import { applyDatabaseResilienceAction } from './apply-database-resilience.js';
 import { applyDataMigrationAction } from './apply-data-migration.js';
 import { applyMaintenanceAction } from './apply-maintenance.js';
@@ -328,13 +335,15 @@ export type ConnectionBlock = {
   scope?: string;
   policy?: 'hard' | 'action-scoped-if-independent-actions';
   actionIds?: string[];
+  /** Exact provider credential roles required by this block. */
+  requiredCredentialKeys?: string[];
 };
 
 function uniqueConnectionBlocks(blocks: ConnectionBlock[]): ConnectionBlock[] {
   const seen = new Set<string>();
   const output: ConnectionBlock[] = [];
   for (const block of blocks) {
-    const key = `${block.provider}:${block.scope ?? ''}:${block.reason ?? ''}`;
+    const key = `${block.provider}:${block.scope ?? ''}:${block.reason ?? ''}:${[...(block.requiredCredentialKeys ?? [])].sort().join(',')}`;
     if (seen.has(key)) {
       continue;
     }
@@ -348,13 +357,62 @@ export function connectionProviders(blocks: ConnectionBlock[]): string[] {
   return Array.from(new Set(blocks.map((block) => block.provider))).sort();
 }
 
+export interface ConnectionLocalEnvInput {
+  envKey: string;
+  credentialKeys: string[];
+  comment: string;
+}
+
+function requiredCredentialKeys(block: ConnectionBlock): string[] {
+  if (block.requiredCredentialKeys) return block.requiredCredentialKeys;
+  const metadata = providerRegistry.getMetadata(block.provider);
+  return metadata
+    ? credentialFieldsFromSchema(metadata.credentialsSchema)
+      ?.filter((field) => field.required)
+      .map((field) => field.name) ?? []
+    : [];
+}
+
+/** Select only dotenv inputs relevant to the exact missing credential roles. */
+export function connectionLocalEnvInputs(
+  blocks: ConnectionBlock[]
+): ConnectionLocalEnvInput[] {
+  const byKey = new Map<string, ConnectionLocalEnvInput>();
+  for (const block of uniqueConnectionBlocks(blocks)) {
+    const required = new Set(requiredCredentialKeys(block));
+    if (required.size === 0) continue;
+    for (const provider of providerRegistry.connectionProviders(block.provider)) {
+      for (const input of providerRegistry.getMetadata(provider)?.credentials?.localEnvInputs ?? []) {
+        if (!input.credentialKeys.some((key) => required.has(key))) continue;
+        if (!byKey.has(input.envKey)) {
+          byKey.set(input.envKey, {
+            envKey: input.envKey,
+            credentialKeys: [...input.credentialKeys],
+            comment: input.comment,
+          });
+        }
+      }
+    }
+  }
+  return [...byKey.values()].sort((left, right) => left.envKey.localeCompare(right.envKey));
+}
+
 function providerConnectionSetup(
   block: ConnectionBlock,
   options: { project?: string; gitRemoteUrl?: string } = {}
 ) {
   const scope = block.scope
     ?? (block.provider === 'github' ? parseGitHubRepoFromRemote(options.gitRemoteUrl) ?? undefined : undefined);
-  return connectionSetupDetails(block.provider, { scope, project: options.project });
+  const details = connectionSetupDetails(block.provider, {
+    scope,
+    project: options.project,
+    requiredCredentialKeys: requiredCredentialKeys(block),
+  });
+  const localEnvInputs = connectionLocalEnvInputs([block]);
+  return {
+    ...details,
+    ...(localEnvInputs.length > 0 ? { localEnvInputs } : {}),
+  };
 }
 
 export function connectionRecoveryHint(
@@ -370,7 +428,7 @@ export function connectionRecoveryHint(
     .join('; ');
   const commands = setup.map((entry) => entry.credentialExample).join('; ');
   const packageReadNeeded = options.includePackageRead
-    || uniqueBlocks.some((block) => /packageReadToken|IMAGE_REGISTRY_|GHCR|GitHub Actions/i.test(block.reason ?? ''));
+    || uniqueBlocks.some((block) => requiredCredentialKeys(block).includes('packageReadToken'));
   const packageReadHint = packageReadNeeded
     ? ' For GitHub Actions image deploys, the recommended combined classic PAT link preselects repo, workflow, and read:packages. A read:packages-only token cannot manage repository workflows.'
     : '';
@@ -382,7 +440,7 @@ export function connectionRecoveryDetails(
   blocks: ConnectionBlock[],
   options: { project?: string; gitRemoteUrl?: string } = {}
 ): {
-  connectionSetup: ReturnType<typeof connectionSetupDetails>[];
+  connectionSetup: ReturnType<typeof providerConnectionSetup>[];
 } {
   return {
     connectionSetup: uniqueConnectionBlocks(blocks)
@@ -475,6 +533,9 @@ export function splitActionScopedConnectionBlocks(
     const hasImageRegistrySecret = missing.some((name) => name.startsWith('IMAGE_REGISTRY_'));
     return [{
       provider: hasImageRegistrySecret ? 'github' : String(action.metadata?.provider ?? action.resource.provider),
+      ...(hasImageRegistrySecret
+        ? { requiredCredentialKeys: ['apiToken', 'packageReadToken'] }
+        : {}),
       reason: hasImageRegistrySecret
         ? `GitHub Actions deploy ${action.resource.name} is missing GHCR image pull credentials (${missing.join(', ')}). Connect GitHub with apiToken for repo/workflow API access plus packageReadToken for read:packages (create: ${GITHUB_TOKEN_URLS.packageRead}) before relying on push-to-deploy.`
         : `GitHub Actions deploy ${action.resource.name} is missing provider secrets (${missing.join(', ')}). Connect and verify ${String(action.metadata?.provider ?? action.resource.provider)} before relying on push-to-deploy.`,
@@ -886,6 +947,7 @@ export async function executePlanApply(ctx: CommandContext, params: {
   const delegatedSecretEnvVars = overrides?.delegatedSecretVarsEncrypted
     ? getSecretStore().decryptObject<Record<string, string>>(overrides.delegatedSecretVarsEncrypted)
     : undefined;
+  const confirmedActionIds = new Set(params.confirmActions);
   const buildDeployBootstrapParams = async () => {
     let bootstrapParams = specToBootstrapParams(applyProject.name, envName, envSpec, spec.runtime);
     bootstrapParams = applyEnvFileVarsToBootstrapParams(bootstrapParams, envFileEnvVars);
@@ -983,7 +1045,10 @@ export async function executePlanApply(ctx: CommandContext, params: {
     return deployBootstrap;
   };
 
-  const handler = async (action: PlanAction): Promise<ActionResult> => {
+  const handler = async (
+    action: PlanAction,
+    executionContext: ActionExecutionContext
+  ): Promise<ActionResult> => {
     const blockedReason = stringField(asRecord(action.metadata), 'blockedReason');
     if (blockedReason) {
       return {
@@ -1270,36 +1335,164 @@ export async function executePlanApply(ctx: CommandContext, params: {
       return applyStorageAction({ project: applyProject, envName, environmentSpec: envSpec, action });
     }
     if (capability === 'hosting.delegated-secret.sync') {
-      const value = delegatedSecretEnvVars?.[action.resource.name];
+      const key = action.resource.name;
+      const value = delegatedSecretEnvVars?.[key];
       const latestEnvironment = ctx.repos.environments.findByProjectAndName(project.id, envName);
-      const destinationServices = stringArrayField(asRecord(action.metadata), 'services');
-      const invalidDestination = destinationServices.find((serviceName) => !envSpec.services[serviceName]);
+      const metadata = asRecord(action.metadata);
+      const destinationServices = stringArrayField(metadata, 'services');
+      const expectedServices = Object.keys(envSpec.services).sort();
+      const declaredSecret = spec.secrets[key];
+      const plannedOwnership = stringField(metadata, 'ownership') ?? 'delegated';
+      const destinationsMatch = destinationServices.length === expectedServices.length
+        && new Set(destinationServices).size === destinationServices.length
+        && [...destinationServices].sort().every((serviceName, index) => serviceName === expectedServices[index]);
+
       if (value === undefined || !latestEnvironment) {
         return {
           success: false,
-          message: `Cannot sync delegated secret ${action.resource.name}`,
+          message: `Cannot sync managed application secret ${key}`,
           error: value === undefined
-            ? 'The reviewed plan does not contain the delegated secret value.'
+            ? 'The reviewed plan does not contain the encrypted secret value.'
             : `Environment "${envName}" is not tracked locally.`,
         };
       }
       if (
         action.resource.provider !== envSpec.hosting.provider
-        || destinationServices.length === 0
-        || invalidDestination
+        || !declaredSecret
+        || !declaredSecret.environments.includes(envName)
+        || plannedOwnership !== declaredSecret.ownership
+        || !destinationsMatch
       ) {
-        return {
-          success: false,
-          status: 'blocked',
-          message: `Delegated secret action ${action.id} has invalid destination authority`,
-          error: action.resource.provider !== envSpec.hosting.provider
+        return blockedActionIdentity(
+          action,
+          action.resource.provider !== envSpec.hosting.provider
             ? `Plan targets ${action.resource.provider}, but ${envName} uses ${envSpec.hosting.provider}.`
-            : invalidDestination
-              ? `Service "${invalidDestination}" is not declared in ${envName}.`
-              : 'The reviewed action does not declare any destination services.',
+            : !declaredSecret || !declaredSecret.environments.includes(envName)
+              ? `${key} is not a managed runtime secret for ${envName}.`
+              : plannedOwnership !== declaredSecret.ownership
+                ? `${key} ownership changed after planning.`
+                : `The reviewed destinations must be exactly: ${expectedServices.join(', ')}.`
+        );
+      }
+
+      const hypervibeOwned = declaredSecret.ownership === 'hypervibe';
+      let bindingOnly = false;
+      if (declaredSecret.ownership === 'delegated') {
+        if (
+          stringField(metadata, 'principal') !== declaredSecret.principal
+          || metadata?.bindingOnly === true
+        ) {
+          return blockedActionIdentity(
+            action,
+            `The delegated owner for ${key} must remain ${declaredSecret.principal}.`
+          );
+        }
+      } else {
+        const generation = metadata?.generation;
+        const expectedValueHash = hashEnvValue(value);
+        if (
+          stringField(metadata, 'principal') !== 'hypervibe'
+          || stringField(metadata, 'generator') !== declaredSecret.generator
+          || generation !== declaredSecret.generation
+          || stringField(metadata, 'expectedValueHash') !== expectedValueHash
+        ) {
+          return blockedActionIdentity(
+            action,
+            `The reviewed Hypervibe generator, generation, or value fingerprint for ${key} no longer matches.`
+          );
+        }
+
+        const binding = parseDelegatedSecretBindings(latestEnvironment)
+          .find((candidate) => candidate.name === key);
+        const bindingIdentityMatches = binding?.source === 'hypervibe-generated'
+          && binding.principal === 'hypervibe'
+          && binding.generator === declaredSecret.generator
+          && binding.generation === declaredSecret.generation;
+        const bindingMatches = bindingIdentityMatches && binding.valueHash === expectedValueHash;
+        if (bindingIdentityMatches && !bindingMatches) {
+          return blockedActionIdentity(
+            action,
+            `The accepted ${key} fingerprint cannot be reproduced with the current Hypervibe encryption key.`
+          );
+        }
+
+        const liveState = liveHashesForSecret(observed, destinationServices, key);
+        if (liveState.hasUnknownDestination) {
+          return blockedActionIdentity(
+            action,
+            `The current live value for ${key} is not observable, so this action cannot install or replace it.`
+          );
+        }
+
+        bindingOnly = liveState.state === 'consistent'
+          && liveState.hash === expectedValueHash;
+        if ((metadata?.bindingOnly === true) !== bindingOnly) {
+          return blockedActionIdentity(
+            action,
+            bindingOnly
+              ? `${key} already matches and authorizes only value-free binding reconciliation.`
+              : `${key} does not match the value required for binding-only reconciliation.`
+          );
+        }
+
+        const changingAcceptedGeneration = Boolean(binding && !bindingMatches);
+        const hasConflictingLiveValue = liveState.hashes
+          .some((liveHash) => liveHash !== expectedValueHash);
+        const replacingLiveValue = !bindingOnly
+          && (changingAcceptedGeneration || hasConflictingLiveValue);
+        if (!hasExactPlanActionConfirmationAuthority(
+          action,
+          replacingLiveValue,
+          confirmedActionIds
+        )) {
+          return blockedActionIdentity(
+            action,
+            `Replacing ${key} requires the persisted confirmation marker and explicit confirmation of action ${action.id}.`
+          );
+        }
+      }
+
+      if (bindingOnly) {
+        try {
+          recordDelegatedSecretBinding({
+            environment: latestEnvironment,
+            spec,
+            environmentName: envName,
+            key,
+            value,
+            applyRunId: executionContext.applyRunId,
+            actionId: action.id,
+          });
+        } catch (error) {
+          return {
+            success: false,
+            message: `Failed to record managed application secret ${key}`,
+            error: error instanceof Error ? error.message : String(error),
+            data: {
+              requestedCount: destinationServices.length,
+              appliedCount: 0,
+              failedCount: 0,
+              skippedCount: destinationServices.length,
+              bindingRecorded: false,
+              failureStage: 'binding',
+            },
+          };
+        }
+        return {
+          success: true,
+          message: `Recorded existing Hypervibe-managed application secret ${key} without changing its live value`,
+          data: {
+            requestedCount: destinationServices.length,
+            appliedCount: 0,
+            failedCount: 0,
+            skippedCount: destinationServices.length,
+            bindingRecorded: true,
+          },
         };
       }
+
       const failures: string[] = [];
+      let appliedCount = 0;
       let deploymentDeferred = false;
       let runtimeRolloutRequired = false;
       const rolloutBaselines: Record<string, unknown> = {};
@@ -1319,6 +1512,7 @@ export async function executePlanApply(ctx: CommandContext, params: {
         if (!receipt.success) {
           failures.push(`${serviceName}: ${receipt.error ?? receipt.message}`);
         } else {
+          appliedCount += 1;
           const receiptData = asRecord(receipt.data);
           if (receiptData?.deploymentDeferred === true) {
             deploymentDeferred = true;
@@ -1331,26 +1525,54 @@ export async function executePlanApply(ctx: CommandContext, params: {
           }
         }
       }
-      return failures.length > 0
-        ? {
-            success: false,
-            message: `Failed to sync delegated secret ${action.resource.name}`,
-            error: failures.join('; '),
-          }
-        : {
-            success: true,
-            message: `Synced delegated secret ${action.resource.name} to ${destinationServices.length} service(s)`,
-            ...(deploymentDeferred || runtimeRolloutRequired
-              ? {
-                data: {
-                  ...(deploymentDeferred ? { deploymentDeferred: true } : {}),
-                  ...(runtimeRolloutRequired ? { runtimeRolloutRequired: true } : {}),
-                  services: destinationServices,
-                  ...(Object.keys(rolloutBaselines).length > 0 ? { rolloutBaselines } : {}),
-                },
-              }
-              : {}),
-          };
+      const counts = {
+        requestedCount: destinationServices.length,
+        appliedCount,
+        failedCount: failures.length,
+        skippedCount: 0,
+      };
+      if (failures.length > 0) {
+        return {
+          success: false,
+          message: `Failed to sync managed application secret ${key}`,
+          error: failures.join('; '),
+          data: { ...counts, bindingRecorded: false, failureStage: 'provider' },
+        };
+      }
+
+      try {
+        recordDelegatedSecretBinding({
+          environment: latestEnvironment,
+          spec,
+          environmentName: envName,
+          key,
+          value,
+          applyRunId: executionContext.applyRunId,
+          actionId: action.id,
+        });
+      } catch (error) {
+        return {
+          success: false,
+          message: `Synced ${key}, but failed to record its accepted fingerprint`,
+          error: error instanceof Error ? error.message : String(error),
+          data: { ...counts, bindingRecorded: false, failureStage: 'binding' },
+        };
+      }
+
+      return {
+        success: true,
+        message: hypervibeOwned
+          ? `Installed Hypervibe-managed application secret ${key} on ${appliedCount} service(s)`
+          : `Synced delegated secret ${key} to ${appliedCount} service(s)`,
+        data: {
+          ...counts,
+          bindingRecorded: true,
+          ...(deploymentDeferred ? { deploymentDeferred: true } : {}),
+          ...(runtimeRolloutRequired ? { runtimeRolloutRequired: true } : {}),
+          services: destinationServices,
+          ...(Object.keys(rolloutBaselines).length > 0 ? { rolloutBaselines } : {}),
+        },
+      };
     }
     if (capability === 'stripe.hosting-env.sync') {
       const latestEnvironment = ctx.repos.environments.findByProjectAndName(project.id, envName);
@@ -1627,17 +1849,7 @@ export async function executePlanApply(ctx: CommandContext, params: {
   }
 
   if (result.applyRunId) {
-    let latestEnvironment = ctx.repos.environments.findByProjectAndName(project.id, envName);
-    if (latestEnvironment && delegatedSecretEnvVars && Object.keys(delegatedSecretEnvVars).length > 0) {
-      latestEnvironment = recordDelegatedSecretBindings({
-        environment: latestEnvironment,
-        spec,
-        environmentName: envName,
-        suppliedValues: delegatedSecretEnvVars,
-        applyRunId: result.applyRunId,
-        receipts: result.receipts,
-      });
-    }
+    const latestEnvironment = ctx.repos.environments.findByProjectAndName(project.id, envName);
     if (latestEnvironment) {
       recordRuntimeRolloutRequirements({
         environment: latestEnvironment,

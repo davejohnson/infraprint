@@ -84,3 +84,108 @@ describe.skipIf(process.platform === 'win32')('SecretStore local key security', 
     );
   });
 });
+
+describe('SecretStore deterministic secret derivation', () => {
+  it('matches the pinned version-one derivation vector', () => {
+    process.env.HYPERVIBE_SECRET_KEY = '00'.repeat(32);
+
+    const derived = getSecretStore().deriveSecret('application-secret', {
+      environment: 'production',
+      generation: '1',
+      key: 'SESSION_SECRET',
+      project: 'hypervibe',
+    });
+
+    expect(derived).toHaveLength(32);
+    expect(derived.toString('hex')).toBe(
+      '71c00c858b6e4e15f34b9e86c0e9afa826fadd1fae683fe894ab7878db2d17aa'
+    );
+    derived.fill(0);
+  });
+
+  it('is stable for canonically equivalent context', () => {
+    process.env.HYPERVIBE_SECRET_KEY = '11'.repeat(32);
+    const store = getSecretStore();
+    const first = store.deriveSecret('application-secret', {
+      project: 'hypervibe',
+      environment: 'production',
+    });
+    const reordered = store.deriveSecret('application-secret', {
+      environment: 'production',
+      project: 'hypervibe',
+    });
+
+    expect(reordered).toEqual(first);
+    first.fill(0);
+    reordered.fill(0);
+  });
+
+  it('separates domains, context fields, and ambiguous concatenations', () => {
+    process.env.HYPERVIBE_SECRET_KEY = '22'.repeat(32);
+    const store = getSecretStore();
+    const baseline = store.deriveSecret('application-secret', {
+      environment: 'production',
+      generation: '1',
+      project: 'hypervibe',
+    });
+    const otherDomain = store.deriveSecret('other-secret', {
+      environment: 'production',
+      generation: '1',
+      project: 'hypervibe',
+    });
+    const otherContext = store.deriveSecret('application-secret', {
+      environment: 'staging',
+      generation: '1',
+      project: 'hypervibe',
+    });
+    const nextGeneration = store.deriveSecret('application-secret', {
+      environment: 'production',
+      generation: '2',
+      project: 'hypervibe',
+    });
+    const firstBoundary = store.deriveSecret('application-secret', {
+      first: 'ab',
+      second: 'c',
+    });
+    const secondBoundary = store.deriveSecret('application-secret', {
+      first: 'a',
+      second: 'bc',
+    });
+
+    expect(otherDomain).not.toEqual(baseline);
+    expect(otherContext).not.toEqual(baseline);
+    expect(nextGeneration).not.toEqual(baseline);
+    expect(secondBoundary).not.toEqual(firstBoundary);
+    for (const secret of [
+      baseline,
+      otherDomain,
+      otherContext,
+      nextGeneration,
+      firstBoundary,
+      secondBoundary,
+    ]) {
+      secret.fill(0);
+    }
+  });
+
+  it('derives the same material after reopening the persisted local key', () => {
+    const first = getSecretStore().deriveSecret('application-secret', {
+      environment: 'production',
+      generation: '1',
+      key: 'SESSION_SECRET',
+      project: 'hypervibe',
+    });
+
+    SecretStore.resetInstance();
+    const afterRestart = getSecretStore().deriveSecret('application-secret', {
+      environment: 'production',
+      generation: '1',
+      key: 'SESSION_SECRET',
+      project: 'hypervibe',
+    });
+
+    expect(afterRestart).toEqual(first);
+    first.fill(0);
+    afterRestart.fill(0);
+  });
+});

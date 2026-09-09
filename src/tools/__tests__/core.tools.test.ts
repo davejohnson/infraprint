@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { expectActionableConnectionSetup, parseToolEnvelope } from './tool-result.js';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -27,6 +27,7 @@ import { createToolContext } from '../../application/context.js';
 import { SpecStore } from '../../domain/spec/spec.store.js';
 import { projectSpecSchema } from '../../domain/spec/spec.schema.js';
 import type { PlanAction } from '../../domain/plan/plan.types.js';
+import { deriveHypervibeSecretValues } from '../../domain/services/hypervibe-secret-value.js';
 
 let tempDir: string;
 
@@ -245,10 +246,20 @@ describe('hv_spec', () => {
         project: 'fresh-agent-app',
         spec: {
           project: 'fresh-agent-app',
+          devops: {
+            code: {
+              provider: 'github',
+              scope: 'davejohnson/fresh-agent-app',
+              repository: { state: 'present', management: 'external', visibility: 'private', defaultBranch: 'main' },
+            },
+            ci: { provider: 'github-actions', runner: { mode: 'provider-hosted' } },
+            canonicalEnvironment: 'staging',
+          },
           environments: {
             staging: {
               hosting: { provider: 'railway' },
               services: { web: { startCommand: 'npm start' } },
+              deploy: { strategy: 'branch', trigger: 'ci', branch: 'main' },
             },
           },
         },
@@ -271,6 +282,18 @@ describe('hv_spec', () => {
         project: 'fresh-agent-app',
         runtime: { kind: 'node', version: '24' },
       });
+      const initializedLocalEnv = readFileSync(path.join(repoDir, '.env'), 'utf8');
+      for (const key of ['HYPERVIBE_GITHUB_TOKEN', 'HYPERVIBE_RAILWAY_TOKEN']) {
+        expect(initializedLocalEnv).toMatch(new RegExp(`# Hypervibe: [^\\n]+\\n${key}=`));
+      }
+      expect(initialized.data.localEnv.addedKeys).toEqual([
+        'HYPERVIBE_GITHUB_TOKEN',
+        'HYPERVIBE_RAILWAY_TOKEN',
+      ]);
+      expect(initializedLocalEnv).toContain('GitHub API token for repository and workflow management');
+      expect(initializedLocalEnv).not.toContain('GitHub Packages read token');
+
+      rmSync(path.join(repoDir, '.env'));
 
       const plan = await t.call('hv_plan', {
         project: 'fresh-agent-app',
@@ -280,6 +303,15 @@ describe('hv_spec', () => {
       expect(plan.data.blocked).toContainEqual(expect.objectContaining({
         provider: 'railway',
       }));
+      expect(plan.data.blocked).toContainEqual(expect.objectContaining({
+        provider: 'github',
+      }));
+      expect(plan.data.localEnv.addedKeys).toEqual([
+        'HYPERVIBE_GITHUB_TOKEN',
+        'HYPERVIBE_RAILWAY_TOKEN',
+        'NODE_AUTH_TOKEN',
+      ]);
+      expect(readFileSync(path.join(repoDir, '.env'), 'utf8')).toContain('HYPERVIBE_GITHUB_TOKEN=');
     } finally {
       if (t) await t.close();
       process.chdir(oldCwd);
@@ -289,6 +321,229 @@ describe('hv_spec', () => {
         process.env.HYPERVIBE_DISABLE_REPO_SPEC = oldDisable;
       }
       rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('refreshes local-spec env placeholders only from the matching project checkout', async () => {
+    const oldCwd = process.cwd();
+    const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+    const repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-local-spec-')));
+    const projectName = path.basename(repoDir);
+    execFileSync('git', ['init', '--quiet'], { cwd: repoDir });
+    process.env.HYPERVIBE_DISABLE_REPO_SPEC = '1';
+    process.chdir(repoDir);
+    let t: Awaited<ReturnType<typeof makeClient>> | undefined;
+
+    try {
+      t = await makeClient();
+      const set = await t.call('hv_spec', {
+        spec: {
+          project: projectName,
+          secrets: {
+            SESSION_SECRET: {
+              principal: 'github:owner',
+              environments: ['staging'],
+            },
+          },
+          environments: {
+            staging: {
+              hosting: { provider: 'railway' },
+              services: { web: { startCommand: 'npm start' } },
+            },
+          },
+        },
+      });
+
+      expect(set.ok).toBe(true);
+      expect(set.data.specSource).toEqual({ kind: 'local' });
+      expect(readFileSync(path.join(repoDir, '.env'), 'utf8'))
+        .toMatch(/# Hypervibe: [^\n]+\nSESSION_SECRET=/);
+      expect(readFileSync(path.join(repoDir, '.gitignore'), 'utf8')).toContain('/.env');
+    } finally {
+      if (t) await t.close();
+      process.chdir(oldCwd);
+      if (oldDisable === undefined) delete process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+      else process.env.HYPERVIBE_DISABLE_REPO_SPEC = oldDisable;
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps hv_spec and hv_plan from writing local-project env slots into a checkout with a conflicting repo spec', async () => {
+    const oldCwd = process.cwd();
+    const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+    const parentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-conflicting-checkout-')));
+    const repoDir = path.join(parentDir, 'selected-local-app');
+    mkdirSync(repoDir);
+    execFileSync('git', ['init', '--quiet'], { cwd: repoDir });
+    execFileSync('git', [
+      'remote',
+      'add',
+      'origin',
+      'git@github.com:davejohnson/selected-local-app.git',
+    ], { cwd: repoDir });
+    process.chdir(repoDir);
+    let t: Awaited<ReturnType<typeof makeClient>> | undefined;
+
+    try {
+      process.env.HYPERVIBE_DISABLE_REPO_SPEC = '1';
+      const project = new ProjectRepository().create({
+        name: 'selected-local-app',
+        gitRemoteUrl: 'git@github.com:davejohnson/selected-local-app.git',
+        defaultPlatform: 'railway',
+        policies: {},
+      });
+      new SpecStore().replace(project, {
+        version: 1,
+        project: project.name,
+        gitRemoteUrl: project.gitRemoteUrl,
+        secrets: {
+          SESSION_SECRET: {
+            principal: 'github:owner',
+            environments: ['production'],
+          },
+        },
+        environments: {
+          production: {
+            hosting: { provider: 'railway' },
+            services: { web: { startCommand: 'npm start' } },
+          },
+        },
+      });
+
+      const foreignSpec = projectSpecSchema.parse({
+        version: 1,
+        project: 'foreign-checkout-app',
+        environments: {
+          production: {
+            hosting: { provider: 'railway' },
+            services: { web: { startCommand: 'npm start' } },
+          },
+        },
+      });
+      mkdirSync(path.join(repoDir, '.hypervibe'));
+      const specPath = path.join(repoDir, '.hypervibe', 'spec.json');
+      const foreignDocument = `${JSON.stringify(foreignSpec, null, 2)}\n`;
+      writeFileSync(specPath, foreignDocument, 'utf8');
+      process.env.HYPERVIBE_DISABLE_REPO_SPEC = '0';
+      t = await makeClient();
+
+      const updated = await t.call('hv_spec', {
+        project: project.name,
+        spec: {
+          secrets: {
+            SECOND_SECRET: {
+              principal: 'github:owner',
+              environments: ['production'],
+            },
+          },
+        },
+      });
+      expect(updated.ok).toBe(true);
+      expect(updated.data.specSource).toEqual({ kind: 'local' });
+      expect(updated.data.localEnv).toBeNull();
+      expect(updated.data.envTemplate).toBeNull();
+
+      const plan = await t.call('hv_plan', {
+        project: project.name,
+        env: 'production',
+      });
+      expect(plan.ok).toBe(true);
+      expect(plan.data.specSource).toEqual({ kind: 'local' });
+      expect(plan.data.localEnv).toBeUndefined();
+      expect(readFileSync(specPath, 'utf8')).toBe(foreignDocument);
+      for (const fileName of ['.env', '.env.example', '.env.production', '.gitignore']) {
+        expect(existsSync(path.join(repoDir, fileName))).toBe(false);
+      }
+    } finally {
+      if (t) await t.close();
+      process.chdir(oldCwd);
+      if (oldDisable === undefined) delete process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+      else process.env.HYPERVIBE_DISABLE_REPO_SPEC = oldDisable;
+      rmSync(parentDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      label: 'a different origin',
+      origin: 'git@github.com:someone-else/selected-project-b.git',
+    },
+    { label: 'no readable origin', origin: undefined },
+  ])('keeps hv_spec from claiming a same-named spec-less checkout with $label', async ({ origin }) => {
+    const oldCwd = process.cwd();
+    const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+    const parentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-unrelated-checkout-')));
+    const repoDir = path.join(parentDir, 'selected-project-b');
+    mkdirSync(repoDir);
+    execFileSync('git', ['init', '--quiet'], { cwd: repoDir });
+    if (origin) {
+      execFileSync('git', ['remote', 'add', 'origin', origin], { cwd: repoDir });
+    }
+    writeFileSync(path.join(repoDir, 'tracked.txt'), 'tracked-before\n', 'utf8');
+    execFileSync('git', ['add', '--', 'tracked.txt'], { cwd: repoDir });
+    writeFileSync(path.join(repoDir, 'untracked.txt'), 'untracked-before\n', 'utf8');
+    process.chdir(repoDir);
+    let t: Awaited<ReturnType<typeof makeClient>> | undefined;
+
+    try {
+      process.env.HYPERVIBE_DISABLE_REPO_SPEC = '1';
+      const project = new ProjectRepository().create({
+        name: 'selected-project-b',
+        gitRemoteUrl: 'git@github.com:davejohnson/selected-project-b.git',
+        defaultPlatform: 'railway',
+        policies: {},
+      });
+      new SpecStore().replace(project, {
+        version: 1,
+        project: project.name,
+        gitRemoteUrl: project.gitRemoteUrl,
+        environments: {
+          production: {
+            hosting: { provider: 'railway' },
+            services: { web: { startCommand: 'npm start' } },
+          },
+        },
+      });
+      const statusBefore = execFileSync(
+        'git',
+        ['status', '--porcelain=v1', '--untracked-files=all'],
+        { cwd: repoDir, encoding: 'utf8' }
+      );
+
+      process.env.HYPERVIBE_DISABLE_REPO_SPEC = '0';
+      t = await makeClient();
+      const updated = await t.call('hv_spec', {
+        project: project.name,
+        spec: {
+          secrets: {
+            SESSION_SECRET: {
+              principal: 'github:owner',
+              environments: ['production'],
+            },
+          },
+        },
+      });
+
+      expect(updated.ok).toBe(true);
+      expect(updated.data.specSource).toEqual({ kind: 'local' });
+      expect(updated.data.localEnv).toBeNull();
+      expect(updated.data.envTemplate).toBeNull();
+      expect(readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8')).toBe('tracked-before\n');
+      expect(readFileSync(path.join(repoDir, 'untracked.txt'), 'utf8')).toBe('untracked-before\n');
+      expect(execFileSync(
+        'git',
+        ['status', '--porcelain=v1', '--untracked-files=all'],
+        { cwd: repoDir, encoding: 'utf8' }
+      )).toBe(statusBefore);
+      for (const fileName of ['.env', '.env.example', '.gitignore', '.hypervibe']) {
+        expect(existsSync(path.join(repoDir, fileName))).toBe(false);
+      }
+    } finally {
+      if (t) await t.close();
+      process.chdir(oldCwd);
+      if (oldDisable === undefined) delete process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+      else process.env.HYPERVIBE_DISABLE_REPO_SPEC = oldDisable;
+      rmSync(parentDir, { recursive: true, force: true });
     }
   });
 
@@ -738,6 +993,12 @@ describe('hv_spec', () => {
       provider: 'github',
       project: 'connection-check-app',
     });
+    expect(github.connectionSetup.localEnvInputs.map((input: { envKey: string }) => input.envKey)).toEqual([
+      'HYPERVIBE_GITHUB_TOKEN',
+    ]);
+    expect(cloudflare.connectionSetup.localEnvInputs.map((input: { envKey: string }) => input.envKey)).toEqual([
+      'CLOUDFLARE_API_TOKEN',
+    ]);
     expect(set.hint).toContain('This task needs provider access that is not connected on this Mac');
     expect(set.hint).toContain('connectionSetup');
     expect(set.next).toEqual(['hv_connections', 'hv_plan']);
@@ -815,7 +1076,7 @@ describe('hv_spec', () => {
     const oldCwd = process.cwd();
     const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
     const repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-team-spec-')));
-    mkdirSync(path.join(repoDir, '.git'));
+    execFileSync('git', ['init', '--quiet'], { cwd: repoDir });
     mkdirSync(path.join(repoDir, '.hypervibe'));
     const specPath = path.join(repoDir, '.hypervibe', 'spec.json');
     const repoSpec = {
@@ -1047,6 +1308,53 @@ describe('hv_plan / hv_status / hv_apply', () => {
     expect(adapterSpy).not.toHaveBeenCalled();
     expect(new RunRepository().findByProjectId(project.id)).toEqual([]);
     await t.close();
+  });
+
+  it('refuses an unsafe tracked .env before persisting a plan', async () => {
+    const oldCwd = process.cwd();
+    const oldDisable = process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+    const repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'hypervibe-plan-env-safety-')));
+    const projectName = path.basename(repoDir);
+    execFileSync('git', ['init', '--quiet'], { cwd: repoDir });
+    process.chdir(repoDir);
+    process.env.HYPERVIBE_DISABLE_REPO_SPEC = '1';
+    const project = new ProjectRepository().create({ name: projectName });
+    new SpecStore().replace(project, {
+      version: 1,
+      project: projectName,
+      environments: {
+        staging: {
+          hosting: { provider: 'railway' },
+          services: { web: { startCommand: 'npm start' } },
+        },
+      },
+    });
+    writeFileSync(path.join(repoDir, '.env'), 'LOCAL_VALUE=test-only\n', 'utf8');
+    execFileSync('git', ['add', '--force', '.env'], { cwd: repoDir });
+    process.env.HYPERVIBE_DISABLE_REPO_SPEC = '0';
+    let t: Awaited<ReturnType<typeof makeClient>> | undefined;
+
+    try {
+      t = await makeClient();
+      const runsBefore = new RunRepository().findByProjectId(project.id);
+
+      const plan = await t.call('hv_plan', { project: projectName, env: 'staging' });
+
+      expect(plan).toMatchObject({
+        ok: false,
+        error: {
+          code: 'INTERNAL',
+          message: expect.stringContaining('git already tracks .env'),
+        },
+      });
+      expect(new RunRepository().findByProjectId(project.id)).toEqual(runsBefore);
+    } finally {
+      if (t) await t.close();
+      process.chdir(oldCwd);
+      if (oldDisable === undefined) delete process.env.HYPERVIBE_DISABLE_REPO_SPEC;
+      else process.env.HYPERVIBE_DISABLE_REPO_SPEC = oldDisable;
+      rmSync(repoDir, { recursive: true, force: true });
+    }
   });
 
   it('plans creates for a fresh environment and blocks without connections', async () => {
@@ -1316,7 +1624,19 @@ describe('hv_plan / hv_status / hv_apply', () => {
     expect(plan.data.blocked).toContainEqual(expect.objectContaining({
       provider: 'cloudflare',
       reason: expect.stringContaining('CLOUDFLARE_REGISTRAR_API_TOKEN'),
+      requiredCredentialKeys: ['apiToken', 'accountId', 'registrarApiToken'],
     }));
+    const cloudflareSetup = plan.data.connectionSetup.find(
+      (entry: { provider: string }) => entry.provider === 'cloudflare'
+    );
+    expect(cloudflareSetup.localEnvInputs.map((input: { envKey: string }) => input.envKey)).toEqual([
+      'CLOUDFLARE_ACCOUNT_ID',
+      'CLOUDFLARE_API_TOKEN',
+      'CLOUDFLARE_REGISTRAR_API_TOKEN',
+    ]);
+    expect(cloudflareSetup.credentialExample).toContain(
+      'credentialsMap={"apiToken":"CLOUDFLARE_API_TOKEN","accountId":"CLOUDFLARE_ACCOUNT_ID","registrarApiToken":"CLOUDFLARE_REGISTRAR_API_TOKEN"}'
+    );
     expect(plan.data.blocked).toContainEqual(expect.objectContaining({
       reason: expect.stringContaining('https://dash.cloudflare.com/profile/api-tokens'),
     }));
@@ -2060,6 +2380,117 @@ describe('hv_plan / hv_status / hv_apply', () => {
     expect(status.data.inSync).toBe(false);
     const drift = status.data.drift.find((a: { id: string }) => a.id === 'service:web');
     expect(drift.type).toBe('update');
+    await t.close();
+  });
+
+  it('reports binding-only drift when a local managed-secret binding has a failed receipt', async () => {
+    const t = await makeClient();
+    const project = new ProjectRepository().create({
+      name: 'failed-secret-binding-status-app',
+      defaultPlatform: 'railway',
+    });
+    const spec = projectSpecSchema.parse({
+      version: 1,
+      project: project.name,
+      secrets: {
+        SESSION_SECRET: {
+          ownership: 'hypervibe',
+          generator: 'random-base64url-32-v1',
+          generation: 1,
+          environments: ['production'],
+        },
+      },
+      environments: {
+        production: {
+          hosting: { provider: 'railway' },
+          services: { web: { startCommand: 'npm start' } },
+        },
+      },
+    });
+    new SpecStore().replace(project, spec);
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'production',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'rp-1',
+        environmentId: 're-1',
+        services: { web: { serviceId: 's-1' } },
+      },
+    });
+    new ServiceRepository().create({
+      projectId: project.id,
+      name: 'web',
+      buildConfig: { workloadKind: 'web', startCommand: 'npm start' },
+      envVarSpec: {},
+    });
+    const runs = new RunRepository();
+    const plan = runs.create({
+      projectId: project.id,
+      environmentId: environment.id,
+      type: 'plan',
+      plan: {},
+    });
+    const reservation = runs.reserveApply({
+      projectId: project.id,
+      environmentId: environment.id,
+      planRunId: plan.id,
+      environmentName: environment.name,
+      specRevision: 1,
+    });
+    if (!reservation.reserved) throw new Error('Expected a local apply reservation');
+    runs.addReceipt(reservation.run.id, {
+      step: 'secret:SESSION_SECRET',
+      status: 'failure',
+      error: 'repository export failed',
+      timestamp: new Date().toISOString(),
+    });
+    runs.updateStatus(reservation.run.id, 'failed', 'repository export failed');
+    const generatedValue = deriveHypervibeSecretValues(spec, 'production').SESSION_SECRET;
+    new EnvironmentRepository().updatePlatformBindings(environment.id, {
+      delegatedEnvBindings: [{
+        name: 'SESSION_SECRET',
+        principal: 'hypervibe',
+        valueHash: hashEnvValue(generatedValue),
+        source: 'hypervibe-generated',
+        generator: 'random-base64url-32-v1',
+        generation: 1,
+        syncedAt: new Date().toISOString(),
+        applyRunId: reservation.run.id,
+        actionId: 'secret:SESSION_SECRET',
+      }],
+    });
+    verifyRailwayConnection();
+    mockObserved({
+      provider: 'railway',
+      observedAt: new Date().toISOString(),
+      projectExists: true,
+      projectId: 'rp-1',
+      environmentId: 're-1',
+      services: [{
+        name: 'web',
+        externalId: 's-1',
+        workloadKind: 'web',
+        customDomains: [],
+        config: { startCommand: 'npm start' },
+        envVarKeys: ['SESSION_SECRET'],
+        envVarHashes: { SESSION_SECRET: hashEnvValue(generatedValue) },
+        status: 'running',
+      }],
+      databases: [],
+      partial: false,
+      warnings: [],
+    });
+
+    const status = await t.call('hv_status', { project: project.name, env: 'production' });
+
+    expect(status.ok).toBe(true);
+    expect(status.data.inSync).toBe(false);
+    expect(status.data.drift).toContainEqual(expect.objectContaining({
+      id: 'secret:SESSION_SECRET',
+      type: 'update',
+      metadata: expect.objectContaining({ bindingOnly: true }),
+    }));
     await t.close();
   });
 

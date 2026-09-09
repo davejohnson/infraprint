@@ -650,6 +650,7 @@ const GUIDANCE: Record<string, ConnectionGuidance> = {
     setupUrl: GITHUB_TOKEN_URLS.combined,
     setupUrls: [
       { label: 'Create recommended combined classic token', url: GITHUB_TOKEN_URLS.combined },
+      { label: 'Create pre-filled classic API token', url: GITHUB_TOKEN_URLS.api },
       { label: 'Create pre-filled fine-grained repository token', url: GITHUB_TOKEN_URLS.fineGrained },
       { label: 'Create optional classic GHCR package token', url: GITHUB_TOKEN_URLS.packageRead },
       { label: 'GitHub fine-grained permission reference', url: 'https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens' },
@@ -660,10 +661,11 @@ const GUIDANCE: Record<string, ConnectionGuidance> = {
       'For the one-token classic PAT setup, grant repo, workflow, and read:packages. Hypervibe uses it for API management and package/image reads.',
       `For private GHCR image pulls, packageReadToken must have read:packages — create it here: ${GITHUB_TOKEN_URLS.packageRead}. This can be the same classic PAT only when that PAT also has repo + workflow + read:packages.`,
     ],
-    credentialExample: 'hv_connections provider="github" scope="owner/repository" credentialsRef="dotenv:/absolute/path/.env#NODE_AUTH_TOKEN"',
+    credentialExample: 'hv_connections provider="github" scope="owner/repository" credentialsRef="dotenv:/absolute/path/.env#HYPERVIBE_GITHUB_TOKEN"',
     notes: [
-      'Save the PAT as NODE_AUTH_TOKEN in an existing gitignored .env file, replace /absolute/path in the Connect command with that file\'s directory, and let the agent call hv_connections. Alternatively, export NODE_AUTH_TOKEN before starting Hypervibe and use credentialsRef="env:NODE_AUTH_TOKEN".',
-      'NODE_AUTH_TOKEN, HYPERVIBE_GITHUB_TOKEN, and HYPERVIBE_GITHUB_PACKAGES_TOKEN are accepted as aliases when resolving GitHub credentials. Use NODE_AUTH_TOKEN when npm also needs the token.',
+      'Save the repository-management PAT as HYPERVIBE_GITHUB_TOKEN in an existing gitignored .env file, replace /absolute/path in the Connect command with that file\'s directory, and let the agent call hv_connections.',
+      'Keep a read:packages-only NODE_AUTH_TOKEN separate from HYPERVIBE_GITHUB_TOKEN. When both roles are needed, map apiToken to HYPERVIBE_GITHUB_TOKEN and packageReadToken to NODE_AUTH_TOKEN.',
+      'NODE_AUTH_TOKEN, HYPERVIBE_GITHUB_TOKEN, and HYPERVIBE_GITHUB_PACKAGES_TOKEN remain accepted as aliases for compatibility when one explicitly referenced value supplies the requested scalar credential.',
       'An explicitly referenced variable wins. If it is absent and multiple aliases contain different values, Hypervibe blocks instead of guessing.',
       'A read:packages-only token cannot manage repository infrastructure; use it only as packageReadToken.',
       'The fine-grained creation link pre-fills the token name, 90-day expiry, and core repository permissions. You must still choose the resource owner and only the repositories Hypervibe should manage.',
@@ -969,14 +971,31 @@ export function getConnectionGuidance(provider: string): ConnectionGuidance | un
 
 function credentialExample(
   guidance: ConnectionGuidance,
-  options: { scope?: string; project?: string } = {}
+  options: { scope?: string; project?: string; requiredCredentialKeys?: string[] } = {}
 ): string {
   let example = guidance.credentialExample;
   switch (guidance.provider) {
-    case 'cloudflare':
+    case 'cloudflare': {
+      const required = new Set(options.requiredCredentialKeys ?? []);
+      if (options.requiredCredentialKeys && required.has('registrarApiToken')) {
+        const credentialsMap = {
+          apiToken: 'CLOUDFLARE_API_TOKEN',
+          ...(required.has('accountId') ? { accountId: 'CLOUDFLARE_ACCOUNT_ID' } : {}),
+          registrarApiToken: 'CLOUDFLARE_REGISTRAR_API_TOKEN',
+        };
+        example = `hv_connections provider="cloudflare" scope="example.com" credentialsRef="dotenv:/absolute/path/.env" credentialsMap=${JSON.stringify(credentialsMap)}`;
+      } else if (options.requiredCredentialKeys && required.has('accountId')) {
+        example = 'hv_connections provider="cloudflare" scope="example.com" credentialsRef="dotenv:/absolute/path/.env" credentialsMap={"apiToken":"CLOUDFLARE_API_TOKEN","accountId":"CLOUDFLARE_ACCOUNT_ID"}';
+      } else if (options.requiredCredentialKeys) {
+        example = 'hv_connections provider="cloudflare" scope="example.com" credentialsRef="dotenv:/absolute/path/.env#CLOUDFLARE_API_TOKEN"';
+      }
       if (options.scope) example = example.replaceAll('scope="example.com"', `scope="${options.scope}"`);
       break;
+    }
     case 'github':
+      if (options.requiredCredentialKeys?.includes('packageReadToken')) {
+        example = 'hv_connections provider="github" scope="owner/repository" credentialsRef="dotenv:/absolute/path/.env" credentialsMap={"apiToken":"HYPERVIBE_GITHUB_TOKEN","packageReadToken":"NODE_AUTH_TOKEN"}';
+      }
       if (options.scope) example = example.replace('scope="owner/repository"', `scope="${options.scope}"`);
       break;
     case 'database':
@@ -1005,7 +1024,7 @@ function credentialExample(
 
 export function connectionSetupDetails(
   provider: string,
-  options: { scope?: string; project?: string } = {}
+  options: { scope?: string; project?: string; requiredCredentialKeys?: string[] } = {}
 ): ConnectionSetupDetails {
   const guidance = getConnectionGuidance(provider);
   if (!guidance) {
@@ -1027,14 +1046,20 @@ export function connectionSetupDetails(
     ? guidance.setupUrls.map((entry) => `${entry.label}: ${entry.url}`)
     : guidance.setupUrl ? [guidance.setupUrl] : [];
 
+  const recommendedSetupUrl = provider === 'github'
+    ? options.requiredCredentialKeys?.includes('packageReadToken')
+      ? GITHUB_TOKEN_URLS.combined
+      : GITHUB_TOKEN_URLS.api
+    : guidance.setupUrl ?? guidance.setupUrls?.[0]?.url;
+
   return {
     provider,
     ...(options.project ? { project: options.project } : {}),
     ...(options.scope ? { scope: options.scope } : {}),
     displayName: guidance.displayName,
     tokenType: guidance.tokenType,
-    ...((guidance.setupUrl ?? guidance.setupUrls?.[0]?.url)
-      ? { recommendedSetupUrl: guidance.setupUrl ?? guidance.setupUrls?.[0]?.url }
+    ...(recommendedSetupUrl
+      ? { recommendedSetupUrl }
       : {}),
     setupUrls,
     requiredPermissions: guidance.permissions,
