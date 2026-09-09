@@ -2,7 +2,11 @@ import type { EnvironmentRepository } from '../../db/repositories/environment.re
 import type { Project } from '../../../domain/entities/project.entity.js';
 import type { Environment } from '../../../domain/entities/environment.entity.js';
 import type { Component, ComponentType } from '../../../domain/entities/component.entity.js';
-import type { IProviderAdapter } from '../../../domain/ports/provider.port.js';
+import type {
+  HostingServiceDeleteOptions,
+  HostingServiceDeleteScope,
+  IProviderAdapter,
+} from '../../../domain/ports/provider.port.js';
 import type { ObservedCache } from '../../../domain/ports/observe.port.js';
 import type {
   CacheEngine,
@@ -26,7 +30,7 @@ interface RailwayCacheOps {
       data?: Record<string, unknown>;
     };
   }>;
-  deleteService?(serviceId: string): Promise<{ success: boolean; error?: string }>;
+  deleteService?(serviceId: string, target: HostingServiceDeleteScope, options: HostingServiceDeleteOptions): Promise<{ success: boolean; error?: string }>;
   resolveServiceVolume?(
     target: RailwayVolumeTarget,
     expectedVolumeId?: string
@@ -451,7 +455,24 @@ export function createRailwayCacheAdapter(params: {
           error: `Railway volume ${volumeId} cannot be safely deleted because scoped volume cleanup is unavailable.`,
         };
       }
-      const deletedService = await railway.deleteService(component.externalId);
+      const boundEnvironmentId = boundEnvironment
+        ? (boundEnvironment.platformBindings as Record<string, unknown>).environmentId
+        : undefined;
+      const targetEnvironmentId = retainedCleanup
+        ? scopedEnvironmentId
+        : boundEnvironmentId;
+      if (typeof targetEnvironmentId !== 'string' || targetEnvironmentId.length === 0) {
+        return {
+          success: false,
+          message: `Refusing to destroy Railway Redis service ${component.externalId}`,
+          error: 'The durable Railway environment scope is missing; project-only service deletion is unsafe.',
+        };
+      }
+      const deletedService = await railway.deleteService(component.externalId, {
+        scope: 'environment',
+        projectId: scopedProjectId,
+        environmentId: targetEnvironmentId,
+      }, { allowMutation: true });
       if (!deletedService.success) {
         return {
           success: false,

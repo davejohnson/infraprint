@@ -74,6 +74,7 @@ export interface LocalSnapshot {
       externalId?: string;
       engine?: string;
       name?: string;
+      resourceKind?: string;
       providerScope?: Record<string, string>;
     };
     /** Exact abandoned cache identity retained only for isolated, confirmation-gated cleanup. */

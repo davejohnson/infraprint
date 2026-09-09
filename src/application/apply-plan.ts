@@ -82,8 +82,16 @@ import { getSecretStore } from '../adapters/secrets/secret-store.js';
 import type { Project } from '../domain/entities/project.entity.js';
 import type { Component } from '../domain/entities/component.entity.js';
 import type { Environment } from '../domain/entities/environment.entity.js';
-import { parseHostingBindings } from '../domain/ports/hosting.port.js';
-import type { IProviderAdapter } from '../domain/ports/provider.port.js';
+import type { ObservedState } from '../domain/ports/observe.port.js';
+import {
+  parseHostingBindings,
+  parseHostingServiceCreateRecovery,
+} from '../domain/ports/hosting.port.js';
+import type {
+  HostingServiceDeleteOptions,
+  HostingServiceDeleteScope,
+  IProviderAdapter,
+} from '../domain/ports/provider.port.js';
 import { providerRegistry } from '../domain/registry/provider.registry.js';
 import { runEnvironmentTask } from '../domain/services/environment-task.service.js';
 import {
@@ -122,6 +130,8 @@ import { applyDataMigrationAction } from './apply-data-migration.js';
 import { applyMaintenanceAction } from './apply-maintenance.js';
 import { bindingIdentityFingerprint } from '../domain/services/binding-identity.js';
 import { firstProviderSpecValidationFailure } from '../domain/services/provider-spec-validation.js';
+import { findActiveDatastoreBindingConflict } from './active-datastore-binding.js';
+import { findLocalProviderBoundaryUse } from './local-provider-boundary.js';
 
 /**
  * The shared plan-apply pipeline: connection gating, TOCTOU re-observe,
@@ -137,6 +147,29 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 function stringField(record: Record<string, unknown> | null, key: string): string | undefined {
   const value = record?.[key];
   return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+}
+
+function serviceDeleteTarget(action: PlanAction): { serviceId: string; scope: HostingServiceDeleteScope } | null {
+  const metadata = asRecord(action.metadata);
+  const providerScope = asRecord(metadata?.providerScope);
+  const scope = stringField(metadata, 'deleteScope');
+  const serviceId = stringField(metadata, 'externalId');
+  const projectId = stringField(providerScope, 'projectId');
+  const environmentId = stringField(providerScope, 'environmentId');
+  if (!serviceId || !projectId) return null;
+  if (scope === 'project') {
+    return { serviceId, scope: { scope, projectId } };
+  }
+  if (scope === 'environment' && environmentId) {
+    return { serviceId, scope: { scope, projectId, environmentId } };
+  }
+  return null;
+}
+
+function providerServiceDeleteScope(provider: string): 'environment' | 'project' | null {
+  const boundary = providerRegistry.getMetadata(provider)?.lifecycle?.hosting?.teardownBoundary;
+  if (!boundary) return null;
+  return boundary === 'environment' ? 'environment' : 'project';
 }
 
 function stringArrayField(record: Record<string, unknown> | null, key: string): string[] {
@@ -1470,7 +1503,7 @@ export async function executePlanApply(ctx: CommandContext, params: {
       return destroyRetainedResource(ctx, applyProject, envName, action);
     }
     if (capability === 'hosting.task-service.destroy') {
-      return destroyTaskService(applyProject, action);
+      return destroyTaskService(ctx, applyProject, envName, action, observed);
     }
     if (capability === 'hosting.previous-service.destroy') {
       return destroyPreviousHostingService(ctx, applyProject, envName, action);
@@ -1482,7 +1515,7 @@ export async function executePlanApply(ctx: CommandContext, params: {
       return destroyPreviousHostingBoundary(ctx, applyProject, envName, action, 'project');
     }
     if (capability === 'hosting.service.destroy') {
-      return destroyService(ctx, applyProject, spec, envName, action);
+      return destroyService(ctx, applyProject, spec, envName, action, observed);
     }
     if (capability === 'domain.configure') {
       return applyDomain(ctx, applyProject, envName, envSpec, action);
@@ -1634,6 +1667,85 @@ function projectSpecReferencesService(spec: ProjectSpec, serviceName: string): b
 
 function environmentHasBinding(environment: Environment, serviceName: string): boolean {
   return Boolean(serviceBindingFor(environment, serviceName));
+}
+
+function localServiceBindingUse(params: {
+  ctx: CommandContext;
+  provider: string;
+  projectId: string;
+  serviceId: string;
+  exclude?: { environmentId: string; source: 'current' | 'previous'; serviceName: string };
+}): { environment: Environment; state: 'bound' | 'unknown' } | null {
+  const environments = params.ctx.repos.projects.findAll()
+    .flatMap((project) => params.ctx.repos.environments.findByProjectId(project.id));
+  for (const environment of environments) {
+    const platform = asRecord(environment.platformBindings);
+    const sources = [
+      { source: 'current' as const, bindings: platform },
+      { source: 'previous' as const, bindings: asRecord(platform?.previousHosting) },
+    ];
+    for (const candidate of sources) {
+      const candidateProvider = stringField(candidate.bindings, 'provider');
+      const rawServices = candidate.bindings?.services;
+      const rawRecoveries = candidate.bindings?.serviceCreateRecovery;
+      if (!candidateProvider) {
+        if (rawServices !== undefined || rawRecoveries !== undefined) {
+          return { environment, state: 'unknown' };
+        }
+        continue;
+      }
+      if (candidateProvider === params.provider) {
+        const projectId = stringField(candidate.bindings, 'projectId');
+        if (!projectId) return { environment, state: 'unknown' };
+        if (rawServices !== undefined) {
+          const services = asRecord(rawServices);
+          if (!services) return { environment, state: 'unknown' };
+          for (const [serviceName, rawBinding] of Object.entries(services)) {
+            if (params.exclude
+              && params.exclude.environmentId === environment.id
+              && params.exclude.source === candidate.source
+              && params.exclude.serviceName === serviceName) {
+              continue;
+            }
+            const binding = asRecord(rawBinding);
+            const boundId = stringField(binding, 'serviceId') ?? stringField(binding, 'jobName');
+            if (!serviceName.trim() || !binding || !boundId) {
+              return { environment, state: 'unknown' };
+            }
+            if (boundId === params.serviceId) {
+              return {
+                environment,
+                state: projectId === params.projectId ? 'bound' : 'unknown',
+              };
+            }
+          }
+        }
+      }
+
+      if (rawRecoveries === undefined) continue;
+      const recoveries = asRecord(rawRecoveries);
+      if (!recoveries) return { environment, state: 'unknown' };
+      for (const [recoveryName, rawRecovery] of Object.entries(recoveries)) {
+        const recoveryRecord = asRecord(rawRecovery);
+        const rawProvider = stringField(recoveryRecord, 'provider');
+        if (!recoveryName.trim() || !recoveryRecord || !rawProvider) {
+          return { environment, state: 'unknown' };
+        }
+        if (rawProvider !== params.provider) continue;
+        const recovery = parseHostingServiceCreateRecovery(rawRecovery);
+        if (!recovery || !recovery.providerScope.projectId) {
+          return { environment, state: 'unknown' };
+        }
+        if (recovery.serviceId === params.serviceId) {
+          return {
+            environment,
+            state: recovery.providerScope.projectId === params.projectId ? 'bound' : 'unknown',
+          };
+        }
+      }
+    }
+  }
+  return null;
 }
 
 async function ensureHostingProject(
@@ -2234,15 +2346,91 @@ async function applyDomain(
 }
 
 async function destroyTaskService(
+  ctx: CommandContext,
   project: Project,
-  action: PlanAction
+  envName: string,
+  action: PlanAction,
+  observed: ObservedState | null
 ): Promise<ActionResult> {
-  const serviceId = stringField(asRecord(action.metadata), 'externalId');
-  if (!serviceId) {
+  const target = serviceDeleteTarget(action);
+  if (!target) {
     return {
       success: false,
-      message: 'Task service cleanup target is missing provider id',
-      error: `No externalId recorded for ${action.resource.name}. Re-run hv_plan.`,
+      message: 'Task service cleanup target is incomplete',
+      error: `No exact provider service scope was recorded for ${action.resource.name}. Re-run hv_plan.`,
+    };
+  }
+  const environment = ctx.repos.environments.findByProjectAndName(project.id, envName);
+  const bindings = asRecord(environment?.platformBindings);
+  const currentProjectId = stringField(bindings, 'projectId');
+  const currentEnvironmentId = stringField(bindings, 'environmentId');
+  if (
+    !environment
+    || stringField(bindings, 'provider') !== action.resource.provider
+    || target.scope.scope !== providerServiceDeleteScope(action.resource.provider)
+    || target.scope.projectId !== currentProjectId
+    || (target.scope.scope === 'environment' && target.scope.environmentId !== currentEnvironmentId)
+  ) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Task service cleanup scope changed after planning',
+      error: 'The current provider project/environment no longer matches the reviewed task cleanup target. Re-run hv_plan.',
+    };
+  }
+  const plannedFingerprint = stringField(asRecord(action.metadata), 'bindingsFingerprint');
+  const taskIdentity = {
+    provider: action.resource.provider,
+    projectId: target.scope.projectId,
+    ...(target.scope.scope === 'environment'
+      ? { environmentId: target.scope.environmentId }
+      : {}),
+    serviceName: action.resource.name,
+    serviceId: target.serviceId,
+  };
+  if (!plannedFingerprint || bindingIdentityFingerprint(taskIdentity) !== plannedFingerprint) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Task cleanup identity does not match the reviewed target',
+      error: 'The task provider, name, scope, or external id changed after planning. Re-run hv_plan.',
+    };
+  }
+  if (
+    !observed
+    || observed.provider !== action.resource.provider
+    || observed.completeness?.services !== 'complete'
+    || observed.projectId !== target.scope.projectId
+    || (target.scope.scope === 'environment' && observed.environmentId !== target.scope.environmentId)
+  ) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Task service observation is incomplete',
+      error: 'A complete fresh observation of the exact provider project/environment is required before task cleanup.',
+    };
+  }
+  const identityMatches = observed.services.filter((service) => (
+    service.name === action.resource.name || service.externalId === target.serviceId
+  ));
+  const exactMatches = identityMatches.filter((service) => (
+    service.name === action.resource.name && service.externalId === target.serviceId
+  ));
+  if (identityMatches.length > 1 || (identityMatches.length === 1 && exactMatches.length !== 1)) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Task service observation does not match the reviewed identity',
+      error: 'Fresh observation found a duplicate or mismatched task name/provider id. No provider mutation was attempted.',
+    };
+  }
+  const observedPresent = exactMatches.length === 1;
+  if (!observedPresent && target.scope.scope === 'project') {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Project-scoped task service absence requires exact provider verification',
+      error: 'The aggregate service inventory is not sufficient to authorize a project-scoped provider mutation.',
     };
   }
 
@@ -2250,16 +2438,34 @@ async function destroyTaskService(
   if (!adapterResult.success || !adapterResult.adapter) {
     return { success: false, message: `${action.resource.provider} adapter unavailable`, error: adapterResult.error };
   }
-  const adapter = adapterResult.adapter as { deleteService?: (serviceId: string) => Promise<{ success: boolean; error?: string; message?: string }> };
+  const adapter = adapterResult.adapter as { deleteService?: (serviceId: string, scope: HostingServiceDeleteScope, options: HostingServiceDeleteOptions) => Promise<{ success: boolean; error?: string; message?: string; alreadyAbsent?: boolean }> };
   if (typeof adapter.deleteService !== 'function') {
     return {
       success: false,
       message: `${action.resource.provider} does not support service deletion via Hypervibe`,
-      error: `Manual cleanup required: ${action.resource.provider} service ${serviceId}`,
+      error: `Manual cleanup required: ${action.resource.provider} service ${target.serviceId}`,
     };
   }
 
-  const deleted = await adapter.deleteService(serviceId);
+  const sharedBinding = localServiceBindingUse({
+    ctx,
+    provider: action.resource.provider,
+    projectId: target.scope.projectId,
+    serviceId: target.serviceId,
+  });
+  if (target.scope.scope === 'project' && sharedBinding) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Task cleanup target is shared by a managed service binding',
+      error: `${sharedBinding.environment.name} still binds or may bind the reviewed provider resource. Hypervibe will not issue a project-scoped service deletion.`,
+    };
+  }
+  const deleted = await adapter.deleteService(
+    target.serviceId,
+    target.scope,
+    { allowMutation: observedPresent && sharedBinding === null }
+  );
   if (!deleted.success) {
     return {
       success: false,
@@ -2267,11 +2473,23 @@ async function destroyTaskService(
       error: deleted.error,
     };
   }
+  if (!observedPresent && deleted.alreadyAbsent !== true) {
+    return {
+      success: false,
+      message: `Failed to verify leftover task service ${action.resource.name} was already absent`,
+      error: 'The environment-scoped provider adapter did not return an exact already-absent result; no cleanup was reported.',
+    };
+  }
 
   return {
     success: true,
-    message: `Deleted leftover task service ${action.resource.name}${deleted.message ? ` (${deleted.message})` : ''}`,
-    data: { serviceId },
+    message: deleted.alreadyAbsent
+      ? `Leftover task service ${action.resource.name} is already absent from the exact provider scope`
+      : `Deleted leftover task service ${action.resource.name}${deleted.message ? ` (${deleted.message})` : ''}`,
+    data: {
+      serviceId: target.serviceId,
+      ...(deleted.alreadyAbsent ? { alreadyAbsent: true } : {}),
+    },
   };
 }
 
@@ -2294,6 +2512,7 @@ async function destroyPreviousHostingService(
   const services = asRecord(previousHosting?.services) ?? {};
   const binding = asRecord(services[action.resource.name]);
   const serviceId = stringField(binding, 'serviceId') ?? stringField(binding, 'jobName');
+  const target = serviceDeleteTarget(action);
   const cleanupBoundary = stringField(asRecord(action.metadata), 'cleanupBoundary');
   const reviewedServiceId = stringField(asRecord(action.metadata), 'serviceId');
   if (
@@ -2302,6 +2521,12 @@ async function destroyPreviousHostingService(
     || !['services', 'project'].includes(cleanupBoundary ?? '')
     || !serviceId
     || reviewedServiceId !== serviceId
+    || !target
+    || target.scope.scope !== providerServiceDeleteScope(action.resource.provider)
+    || target.serviceId !== serviceId
+    || target.scope.projectId !== stringField(previousHosting, 'projectId')
+    || (target.scope.scope === 'environment'
+      && target.scope.environmentId !== stringField(previousHosting, 'environmentId'))
   ) {
     return {
       success: false,
@@ -2315,7 +2540,7 @@ async function destroyPreviousHostingService(
   if (!adapterResult.success || !adapterResult.adapter) {
     return { success: false, message: `${action.resource.provider} adapter unavailable`, error: adapterResult.error };
   }
-  const adapter = adapterResult.adapter as { name: string; deleteService?: (serviceId: string) => Promise<{ success: boolean; error?: string; message?: string }> };
+  const adapter = adapterResult.adapter as { name: string; deleteService?: (serviceId: string, scope: HostingServiceDeleteScope, options: HostingServiceDeleteOptions) => Promise<{ success: boolean; error?: string; message?: string }> };
   if (typeof adapter.deleteService !== 'function') {
     return {
       success: false,
@@ -2324,7 +2549,30 @@ async function destroyPreviousHostingService(
     };
   }
 
-  const deleted = await adapter.deleteService(serviceId);
+  const sharedBinding = localServiceBindingUse({
+    ctx,
+    provider: action.resource.provider,
+    projectId: target.scope.projectId,
+    serviceId: target.serviceId,
+    exclude: {
+      environmentId: environment.id,
+      source: 'previous',
+      serviceName: action.resource.name,
+    },
+  });
+  if (target.scope.scope === 'project' && sharedBinding) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Previous-provider service target is shared by another binding',
+      error: `${sharedBinding.environment.name} still binds or may bind the reviewed provider resource. Hypervibe will not issue a project-scoped service deletion.`,
+    };
+  }
+  const deleted = await adapter.deleteService(
+    target.serviceId,
+    target.scope,
+    { allowMutation: sharedBinding === null }
+  );
   if (!deleted.success) {
     return {
       success: false,
@@ -2380,6 +2628,42 @@ async function destroyPreviousHostingBoundary(
     };
   }
 
+  const declaredBoundary = providerRegistry.getMetadata(retainedProvider)
+    ?.lifecycle?.hosting?.teardownBoundary;
+  if (declaredBoundary !== boundary) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: `Previous-provider ${boundary} target no longer matches provider capabilities`,
+      error: `The retained ${retainedProvider} cleanup boundary is ${declaredBoundary ?? 'unknown'}, not ${boundary}. Re-run hv_plan before deleting provider infrastructure.`,
+    };
+  }
+
+  const localUse = findLocalProviderBoundaryUse(
+    ctx,
+    boundary === 'environment'
+      ? {
+          boundary,
+          provider: retainedProvider,
+          projectId: retainedProjectId,
+          environmentId: retainedEnvironmentId!,
+        }
+      : {
+          boundary,
+          provider: retainedProvider,
+          projectId: retainedProjectId,
+        },
+    { localEnvironmentId: environment.id }
+  );
+  if (localUse) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: `Previous-provider ${boundary} target is still used locally`,
+      error: `${localUse.projectName}/${localUse.environmentName} has ${localUse.scopeState === 'exact' ? 'an exact' : 'an incompletely scoped'} ${localUse.source} binding for the reviewed ${retainedProvider} ${boundary}. Resolve that binding before deleting provider infrastructure.`,
+    };
+  }
+
   const adapterResult = await adapterFactory.getProviderAdapter(action.resource.provider, project);
   if (!adapterResult.success || !adapterResult.adapter) {
     return { success: false, message: `${action.resource.provider} adapter unavailable`, error: adapterResult.error };
@@ -2418,7 +2702,8 @@ async function destroyService(
   project: Project,
   spec: ProjectSpec,
   envName: string,
-  action: PlanAction
+  action: PlanAction,
+  observed: ObservedState | null
 ): Promise<ActionResult> {
   const environment = ctx.repos.environments.findByProjectAndName(project.id, envName);
   if (!environment) {
@@ -2434,13 +2719,117 @@ async function destroyService(
       error: `No local serviceId binding for "${action.resource.name}" in ${envName}.`,
     };
   }
-  const plannedServiceId = stringField(action.metadata ?? null, 'externalId');
-  if (!plannedServiceId || plannedServiceId !== serviceId) {
+  if (spec.environments[envName]?.services[action.resource.name]) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Service is present in the current desired spec',
+      error: `Service "${action.resource.name}" is desired again. Re-run hv_plan before deleting provider infrastructure.`,
+    };
+  }
+  const target = serviceDeleteTarget(action);
+  const currentBindings = asRecord(environment.platformBindings);
+  const currentProvider = stringField(currentBindings, 'provider');
+  const currentProjectId = stringField(currentBindings, 'projectId');
+  const currentEnvironmentId = stringField(currentBindings, 'environmentId');
+  const currentBindingIdentity = currentProvider && currentProjectId
+    ? {
+        provider: currentProvider,
+        projectId: currentProjectId,
+        ...(target?.scope.scope === 'environment' && currentEnvironmentId
+          ? { environmentId: currentEnvironmentId }
+          : {}),
+        serviceName: action.resource.name,
+        serviceId,
+      }
+    : undefined;
+  const plannedBindingsFingerprint = stringField(asRecord(action.metadata), 'bindingsFingerprint');
+  if (
+    !target
+    || target.scope.scope !== providerServiceDeleteScope(action.resource.provider)
+    || target.serviceId !== serviceId
+    || target.scope.projectId !== currentProjectId
+    || (target.scope.scope === 'environment' && target.scope.environmentId !== currentEnvironmentId)
+    || currentProvider !== action.resource.provider
+    || !currentBindingIdentity
+    || !plannedBindingsFingerprint
+    || bindingIdentityFingerprint(currentBindingIdentity) !== plannedBindingsFingerprint
+  ) {
     return {
       success: false,
       status: 'blocked',
       message: 'Service destroy target changed after planning',
-      error: `The reviewed destroy targets ${plannedServiceId ?? '(missing id)'}, but the current local binding is ${serviceId}. Re-run hv_plan before deleting provider infrastructure.`,
+      error: 'The current provider, project, environment, or service binding differs from the reviewed destroy target. Re-run hv_plan before deleting provider infrastructure.',
+    };
+  }
+
+  if (
+    !observed
+    || observed.provider !== action.resource.provider
+    || observed.completeness?.services !== 'complete'
+    || observed.projectId !== target.scope.projectId
+    || (target.scope.scope === 'environment' && observed.environmentId !== target.scope.environmentId)
+  ) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Service destroy observation is incomplete',
+      error: 'A complete fresh observation of the exact provider project/environment is required before service cleanup.',
+    };
+  }
+  const observedIdentityMatches = observed.services.filter((service) => service.externalId === target.serviceId);
+  if (
+    observedIdentityMatches.length > 1
+    || (observedIdentityMatches.length === 1
+      && observedIdentityMatches[0]!.name !== action.resource.name)
+  ) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Observed service identity does not match the reviewed destroy target',
+      error: 'The provider id is duplicated or now belongs to another logical service. No provider mutation or local cleanup was attempted.',
+    };
+  }
+
+  const clearLocalBinding = (): void => {
+    removeServiceBinding(environment.id, environment, action.resource.name);
+    const stillBound = ctx.repos.environments
+      .findByProjectId(project.id)
+      .some((candidate) => environmentHasBinding(candidate, action.resource.name));
+    const stillDesired = projectSpecReferencesService(spec, action.resource.name);
+    if (!stillBound && !stillDesired) {
+      const service = ctx.repos.services.findByProjectAndName(project.id, action.resource.name);
+      if (service) ctx.repos.services.delete(service.id);
+    }
+  };
+  const observedPresent = observedIdentityMatches.length === 1;
+  if (!observedPresent && target.scope.scope === 'project') {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Project-scoped service absence requires exact provider verification',
+      error: 'The aggregate service inventory is not sufficient to authorize local cleanup or a project-scoped provider mutation.',
+    };
+  }
+
+  const sharedBinding = localServiceBindingUse({
+    ctx,
+    provider: action.resource.provider,
+    projectId: target.scope.projectId,
+    serviceId: target.serviceId,
+    exclude: {
+      environmentId: environment.id,
+      source: 'current',
+      serviceName: action.resource.name,
+    },
+  });
+  if (target.scope.scope === 'project' && sharedBinding) {
+    const conflict = sharedBinding.environment;
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Service destroy target is shared by another environment',
+      error: `${conflict.name} still binds the reviewed provider resource. Hypervibe will not issue a project-scoped service deletion.`,
     };
   }
 
@@ -2463,7 +2852,11 @@ async function destroyService(
     };
   }
 
-  const deleted = await adapterResult.adapter.deleteService(serviceId);
+  const deleted = await adapterResult.adapter.deleteService(
+    target.serviceId,
+    target.scope,
+    { allowMutation: observedPresent && sharedBinding === null }
+  );
   if (!deleted.success) {
     return {
       success: false,
@@ -2471,22 +2864,21 @@ async function destroyService(
       error: deleted.error,
     };
   }
-
-  removeServiceBinding(environment.id, environment, action.resource.name);
-  const stillBound = ctx.repos.environments
-    .findByProjectId(project.id)
-    .some((candidate) => environmentHasBinding(candidate, action.resource.name));
-  const stillDesired = projectSpecReferencesService(spec, action.resource.name);
-  if (!stillBound && !stillDesired) {
-    const service = ctx.repos.services.findByProjectAndName(project.id, action.resource.name);
-    if (service) {
-      ctx.repos.services.delete(service.id);
-    }
+  if (!observedPresent && deleted.alreadyAbsent !== true) {
+    return {
+      success: false,
+      message: `Failed to verify ${action.resource.provider} service ${action.resource.name} was already absent`,
+      error: 'The environment-scoped provider adapter did not return an exact already-absent result; the local binding was preserved.',
+    };
   }
+
+  clearLocalBinding();
 
   return {
     success: true,
-    message: `Destroyed ${action.resource.provider} service ${action.resource.name} and removed the ${envName} binding`,
+    message: deleted.alreadyAbsent
+      ? `${action.resource.provider} service target for ${action.resource.name} was already absent; removed only the ${envName} binding`
+      : `Destroyed ${action.resource.provider} service ${action.resource.name} and removed the ${envName} binding`,
   };
 }
 
@@ -2637,6 +3029,7 @@ async function destroyRetainedDatabase(
   const provider = stringField(retained, 'provider');
   const externalId = stringField(retained, 'externalId');
   const engine = stringField(retained, 'engine');
+  const resourceKind = stringField(retained, 'resourceKind');
   const retainedName = stringField(retained, 'name');
   const providerScope = asRecord(retained?.providerScope);
   const plannedScope = asRecord(metadata?.providerScope);
@@ -2644,6 +3037,7 @@ async function destroyRetainedDatabase(
     provider !== action.resource.provider
     || externalId !== stringField(metadata, 'externalId')
     || engine !== action.resource.name
+    || resourceKind !== stringField(metadata, 'resourceKind')
     || !providerScope
     || !plannedScope
     || Object.keys(providerScope).length === 0
@@ -2657,6 +3051,21 @@ async function destroyRetainedDatabase(
       status: 'blocked',
       message: 'Retained database cleanup identity changed after planning',
       error: 'Re-run hv_plan before deleting any data-bearing provider resource.',
+    };
+  }
+
+  const activeBinding = findActiveDatastoreBindingConflict(ctx, {
+    componentType: 'postgres',
+    provider: provider!,
+    externalId: externalId!,
+    providerScope: providerScope as Record<string, string>,
+  });
+  if (activeBinding) {
+    return {
+      success: false,
+      status: 'blocked',
+      message: 'Retained database target became an active local binding after import',
+      error: `${activeBinding.projectName}/${activeBinding.environmentName} binds the same provider id with ${activeBinding.scopeState} scope. Use its ordinary desired-state database destroy lifecycle.`,
     };
   }
 
@@ -2726,6 +3135,7 @@ async function destroyRetainedDatabase(
       providerScope,
       ...providerScope,
       retainedCleanup: true,
+      ...(resourceKind ? { resourceKind } : {}),
     },
     createdAt: environment.createdAt,
     updatedAt: environment.updatedAt,
@@ -2778,19 +3188,21 @@ async function destroyRetainedDatabase(
           error: 'The live provider scope no longer matches the reviewed binding. No deletion was attempted.',
         };
       }
-      const destroyed = await adapterResult.adapter.destroy(component);
-      if (!destroyed.success) {
-        return { success: false, message: destroyed.message, error: destroyed.error };
-      }
-      const after = await adapterResult.adapter.observeDatabase(environment, component);
-      if (after) {
-        return {
-          success: false,
-          status: 'blocked',
-          message: 'Provider acknowledged deletion but the retained database is still present',
-          error: `Database ${externalId} remains observable; its cleanup binding was preserved.`,
-        };
-      }
+    }
+    // Always invoke idempotent teardown. Provider-owned dependents such as a
+    // Railway volume can survive after the primary database instance is absent.
+    const destroyed = await adapterResult.adapter.destroy(component);
+    if (!destroyed.success) {
+      return { success: false, message: destroyed.message, error: destroyed.error };
+    }
+    const after = await adapterResult.adapter.observeDatabase(environment, component);
+    if (after) {
+      return {
+        success: false,
+        status: 'blocked',
+        message: 'Provider acknowledged deletion but the retained database is still present',
+        error: `Database ${externalId} remains observable; its cleanup binding was preserved.`,
+      };
     }
     clearBinding();
     return {
@@ -2858,25 +3270,21 @@ async function destroyRetainedCache(
     };
   }
 
-  const localComponents = ctx.repos.components.findByEnvironmentId(environment.id);
-  const activeMatches = localComponents.filter((candidate) => {
-    const bindings = asRecord(candidate.bindings);
-    return candidate.type === 'redis'
-      && (
-        candidate.externalId
-        ?? stringField(bindings, 'instanceId')
-        ?? stringField(bindings, 'serviceId')
-      ) === externalId
-      && stringField(bindings, 'provider') === provider;
+  const activeBinding = findActiveDatastoreBindingConflict(ctx, {
+    componentType: 'redis',
+    provider: provider!,
+    externalId: externalId!,
+    providerScope: providerScope as Record<string, string>,
   });
-  if (activeMatches.length > 0) {
+  if (activeBinding) {
     return {
       success: false,
       status: 'blocked',
       message: 'Retained cache target became an active local binding after import',
-      error: 'Use the ordinary desired-state cache destroy lifecycle; retained cleanup cannot delete an active component.',
+      error: `${activeBinding.projectName}/${activeBinding.environmentName} binds the same provider id with ${activeBinding.scopeState} scope. Use its ordinary desired-state cache destroy lifecycle.`,
     };
   }
+  const localComponents = ctx.repos.components.findByEnvironmentId(environment.id);
   const matchingUnresolvedComponents = localComponents.filter((candidate) => {
     const bindings = asRecord(candidate.bindings);
     const marker = parseUnresolvedDatastoreMutation(bindings, 'cache');

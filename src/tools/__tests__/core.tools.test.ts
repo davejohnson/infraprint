@@ -2763,6 +2763,7 @@ describe('hv_plan / hv_status / hv_apply', () => {
         },
       ],
       databases: [],
+      completeness: { services: 'complete' },
       partial: false,
       warnings: [],
     };
@@ -2794,7 +2795,13 @@ describe('hv_plan / hv_status / hv_apply', () => {
       requiresConfirm: true,
     }));
     expect(storedPlanAction(plan.data.planId, 'service:daily:destroy')?.metadata)
-      .toEqual({ externalId: 's-daily' });
+      .toEqual({
+        operation: 'hostingServiceDestroy',
+        externalId: 's-daily',
+        deleteScope: 'environment',
+        providerScope: { projectId: 'rp-1', environmentId: 'rail-env-1' },
+        bindingsFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+      });
     expect(plan.data.unmanaged).not.toContainEqual(expect.objectContaining({ kind: 'service', name: 'daily' }));
 
     const apply = await t.call('hv_apply', {
@@ -2803,7 +2810,11 @@ describe('hv_plan / hv_status / hv_apply', () => {
       confirmActions: ['service:daily:destroy'],
     });
     expect(apply.ok).toBe(true);
-    expect(deleteService).toHaveBeenCalledWith('s-daily');
+    expect(deleteService).toHaveBeenCalledWith(
+      's-daily',
+      { scope: 'environment', projectId: 'rp-1', environmentId: 'rail-env-1' },
+      { allowMutation: true }
+    );
     expect(apply.data.receipts).toContainEqual(expect.objectContaining({
       actionId: 'service:daily:destroy',
       status: 'succeeded',
@@ -2814,6 +2825,116 @@ describe('hv_plan / hv_status / hv_apply', () => {
     expect(services).toMatchObject({ web: { serviceId: 's-web' } });
     expect(services.daily).toBeUndefined();
     expect(new ServiceRepository().findByProjectAndName(project.id, 'daily')).toBeNull();
+    await t.close();
+  });
+
+  it('clears a removed service binding without deleting a provider-confirmed absent service', async () => {
+    const t = await makeClient();
+    await t.call('hv_spec', { spec: SPEC });
+    verifyRailwayConnection();
+
+    const project = new ProjectRepository().findByName('core-spec-app')!;
+    const environment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'staging',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'rp-1',
+        environmentId: 'rail-env-1',
+        services: {
+          web: { serviceId: 's-web' },
+          daily: { serviceId: 's-daily' },
+        },
+      },
+    });
+    const productionEnvironment = new EnvironmentRepository().create({
+      projectId: project.id,
+      name: 'production',
+      platformBindings: {
+        provider: 'railway',
+        projectId: 'rp-1',
+        environmentId: 'rail-env-production',
+        services: { daily: { serviceId: 's-daily' } },
+      },
+    });
+    new ServiceRepository().create({
+      projectId: project.id,
+      name: 'daily',
+      buildConfig: { workloadKind: 'cron', cronSchedule: '0 8 * * *' },
+    });
+
+    const observedState: ObservedState = {
+      provider: 'railway',
+      observedAt: new Date().toISOString(),
+      projectExists: true,
+      projectId: 'rp-1',
+      environmentId: 'rail-env-1',
+      services: [{
+        name: 'web', externalId: 's-web', workloadKind: 'web', customDomains: [],
+        config: { startCommand: 'npm start' },
+        sourceState: 'disconnected',
+        envVarKeys: ['NODE_ENV'], envVarHashes: { NODE_ENV: hashEnvValue('staging') },
+        status: 'running',
+      }],
+      databases: [],
+      completeness: { services: 'complete' },
+      partial: false,
+      warnings: [],
+    };
+    const deleteService = vi.fn(async () => ({ success: true, alreadyAbsent: true }));
+    const adapter = {
+      name: 'railway',
+      capabilities: {
+        supportedBuilders: ['nixpacks'], supportedComponents: ['postgres'],
+        supportsAutoWiring: true, supportsHealthChecks: true, supportsCronSchedule: true,
+        supportsReleaseCommand: false, supportsMultiEnvironment: true, managedTls: true,
+        supportsObserve: true,
+      },
+      connect: async () => {}, verify: async () => ({ success: true }),
+      ensureProject: async () => ({ success: true, message: 'ok' }),
+      ensureComponent: async () => { throw new Error('unused'); },
+      deploy: async () => { throw new Error('hosting deploy should not run for service binding cleanup'); },
+      setEnvVars: async () => ({ success: true, message: 'ok' }),
+      observe: async () => observedState,
+      deleteService,
+    };
+    vi.spyOn(adapterFactory, 'getProviderAdapter').mockResolvedValue({ success: true, adapter } as any);
+    vi.spyOn(adapterFactory, 'getHostingAdapter').mockResolvedValue({ success: true, adapter } as any);
+
+    const plan = await t.call('hv_plan', { project: 'core-spec-app', env: 'staging' });
+    expect(plan.ok).toBe(true);
+    expect(plan.data.actions).toContainEqual(expect.objectContaining({
+      id: 'service:daily:destroy',
+      type: 'destroy',
+      verified: true,
+      requiresConfirm: true,
+      reason: expect.stringContaining('absent from the target provider scope'),
+    }));
+
+    const apply = await t.call('hv_apply', {
+      project: 'core-spec-app',
+      planId: plan.data.planId,
+      confirmActions: ['service:daily:destroy'],
+    });
+    expect(apply.ok).toBe(true);
+    expect(deleteService).toHaveBeenCalledWith(
+      's-daily',
+      { scope: 'environment', projectId: 'rp-1', environmentId: 'rail-env-1' },
+      { allowMutation: false }
+    );
+    expect(apply.data.receipts).toContainEqual(expect.objectContaining({
+      actionId: 'service:daily:destroy',
+      status: 'succeeded',
+      message: expect.stringContaining('removed only the staging binding'),
+    }));
+
+    const updatedEnvironment = new EnvironmentRepository().findById(environment.id)!;
+    const services = updatedEnvironment.platformBindings.services as Record<string, unknown>;
+    expect(services).toMatchObject({ web: { serviceId: 's-web' } });
+    expect(services.daily).toBeUndefined();
+    expect(new EnvironmentRepository().findById(productionEnvironment.id)?.platformBindings.services)
+      .toMatchObject({ daily: { serviceId: 's-daily' } });
+    expect(new ServiceRepository().findByProjectAndName(project.id, 'daily')).not.toBeNull();
     await t.close();
   });
 
@@ -2869,6 +2990,7 @@ describe('hv_plan / hv_status / hv_apply', () => {
         },
       ],
       databases: [],
+      completeness: { services: 'complete' },
       partial: false,
       warnings: [],
     };
@@ -2902,11 +3024,18 @@ describe('hv_plan / hv_status / hv_apply', () => {
     expect(storedPlanAction(plan.data.planId, 'service:hv-task-123:destroy')?.metadata).toEqual({
       operation: 'taskServiceCleanup',
       externalId: 'task-svc-1',
+      deleteScope: 'environment',
+      providerScope: { projectId: 'rp-1', environmentId: 'rail-env-1' },
+      bindingsFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
 
     const apply = await t.call('hv_apply', { project: 'task-cleanup-app', planId: plan.data.planId });
     expect(apply.ok).toBe(true);
-    expect(deleteService).toHaveBeenCalledWith('task-svc-1');
+    expect(deleteService).toHaveBeenCalledWith(
+      'task-svc-1',
+      { scope: 'environment', projectId: 'rp-1', environmentId: 'rail-env-1' },
+      { allowMutation: true }
+    );
     expect(apply.data.receipts).toContainEqual(expect.objectContaining({
       actionId: 'service:hv-task-123:destroy',
       status: 'succeeded',
@@ -3444,7 +3573,11 @@ describe('hv_plan / hv_status / hv_apply', () => {
       actionId: 'service:web:previous-destroy',
       status: 'succeeded',
     }));
-    expect(deleteService).toHaveBeenCalledWith('gcp-project-web');
+    expect(deleteService).toHaveBeenCalledWith(
+      'gcp-project-web',
+      { scope: 'project', projectId: 'gcp-project' },
+      { allowMutation: true }
+    );
 
     const updated = new EnvironmentRepository().findById(environment.id)!;
     expect((updated.platformBindings as Record<string, unknown>).previousHosting ?? null).toBeNull();

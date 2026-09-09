@@ -210,19 +210,7 @@ export async function inspectRailwayResources(
           if (request.id && service.railwayId !== request.id) continue;
           if (request.name && service.name.toLowerCase() !== request.name.toLowerCase()) continue;
           const environmentIds = Object.keys(service.instancesByEnv);
-          if (resource === 'cache') {
-            for (const environmentId of environmentIds) {
-              resources.push({
-                id: service.railwayId,
-                name: service.name,
-                engine: expectedEngine,
-                status: 'unknown',
-                resourceKind: 'service',
-                project: { id: project.id, name: project.name },
-                providerScope: { projectId: project.id, environmentId },
-              });
-            }
-          } else {
+          for (const environmentId of environmentIds) {
             resources.push({
               id: service.railwayId,
               name: service.name,
@@ -230,7 +218,7 @@ export async function inspectRailwayResources(
               status: 'unknown',
               resourceKind: 'service',
               project: { id: project.id, name: project.name },
-              providerScope: { projectId: project.id },
+              providerScope: { projectId: project.id, environmentId },
             });
           }
         }

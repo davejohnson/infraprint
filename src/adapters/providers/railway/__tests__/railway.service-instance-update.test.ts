@@ -3,6 +3,16 @@ import { RailwayAdapter } from '../railway.adapter.js';
 import type { Environment } from '../../../../domain/entities/environment.entity.js';
 import type { Service } from '../../../../domain/entities/service.entity.js';
 
+function serviceEnvironmentInstance(serviceId: string, environmentId: string) {
+  return {
+    serviceInstance: {
+      id: `instance-${serviceId}-${environmentId}`,
+      serviceId,
+      environmentId,
+    },
+  };
+}
+
 describe('RailwayAdapter service instance updates', () => {
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -117,13 +127,7 @@ describe('RailwayAdapter service instance updates', () => {
   it('attaches a custom domain and returns Railway-required DNS records', async () => {
     const request = vi.fn()
       // ensureServiceInstanceForEnvironment
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-prod' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('svc-web', 'env-prod'))
       // getCustomDomainStatus before create
       .mockResolvedValueOnce({
         service: {
@@ -251,13 +255,7 @@ describe('RailwayAdapter service instance updates', () => {
     };
     const request = vi.fn()
       // ensureServiceInstanceForEnvironment
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-prod' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('svc-web', 'env-prod'))
       // getCustomDomainStatus before refresh
       .mockResolvedValueOnce(domainObservation)
       // customDomainUpdate
@@ -297,13 +295,7 @@ describe('RailwayAdapter service instance updates', () => {
 
   it('does not refresh an existing verified custom domain', async () => {
     const request = vi.fn()
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-prod' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('svc-web', 'env-prod'))
       .mockResolvedValueOnce({
         service: {
           serviceInstances: {
@@ -435,9 +427,7 @@ describe('RailwayAdapter service instance updates', () => {
     };
     const request = vi.fn()
       // ensureServiceInstanceForEnvironment
-      .mockResolvedValueOnce({
-        service: { serviceInstances: { edges: [{ node: { environmentId: 'env-prod' } }] } },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('svc-web', 'env-prod'))
       // getCustomDomainStatus before delete
       .mockResolvedValueOnce({
         service: {
@@ -540,9 +530,7 @@ describe('RailwayAdapter service instance updates', () => {
   it('blocks custom-domain mutation when Railway returns duplicate identities', async () => {
     const duplicate = (id: string) => ({ id, domain: 'usebillforge.com', status: { verified: false } });
     const request = vi.fn()
-      .mockResolvedValueOnce({
-        service: { serviceInstances: { edges: [{ node: { environmentId: 'env-prod' } }] } },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('svc-web', 'env-prod'))
       .mockResolvedValueOnce({
         service: {
           serviceInstances: {
@@ -576,9 +564,7 @@ describe('RailwayAdapter service instance updates', () => {
   it('does not recreate until Railway confirms the old custom domain is absent', async () => {
     const existingDomain = { id: 'cd-old', domain: 'usebillforge.com', status: { verified: false } };
     const request = vi.fn()
-      .mockResolvedValueOnce({
-        service: { serviceInstances: { edges: [{ node: { environmentId: 'env-prod' } }] } },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('svc-web', 'env-prod'))
       .mockResolvedValueOnce({
         service: {
           serviceInstances: {
@@ -729,13 +715,7 @@ describe('RailwayAdapter service instance updates', () => {
         },
       })
       // ensureServiceInstanceForEnvironment
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-prod' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('svc-web', 'env-prod'))
       // redeploy
       .mockResolvedValueOnce({
         serviceInstanceRedeploy: true,
@@ -813,13 +793,7 @@ describe('RailwayAdapter service instance updates', () => {
           },
         },
       })
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-prod' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('svc-worker', 'env-prod'))
       .mockResolvedValueOnce({
         serviceInstanceRedeploy: true,
       });
@@ -875,21 +849,9 @@ describe('RailwayAdapter service instance updates', () => {
         },
       })
       // resolveServiceIdForEnvironment: bound/name-matched service only exists in production.
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-prod' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce({ serviceInstance: null })
       // ensureServiceInstanceForEnvironment confirms the bound service is still production-only.
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-prod' } }],
-          },
-        },
-      });
+      .mockResolvedValueOnce({ serviceInstance: null });
 
     const adapter = new RailwayAdapter();
     (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
@@ -956,13 +918,7 @@ describe('RailwayAdapter service instance updates', () => {
         },
       })
       // ensureServiceInstanceForEnvironment
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-prod' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('svc-web', 'env-prod'))
       // redeploy
       .mockResolvedValueOnce({
         serviceInstanceRedeploy: true,
@@ -1007,6 +963,10 @@ describe('RailwayAdapter service instance updates', () => {
     const result = await adapter.deploy(service, environment, { DATABASE_URL: 'postgres://db' });
 
     expect(result.receipt.success).toBe(true);
+    expect(result.receipt.data).toMatchObject({
+      createdService: true,
+      providerResourceName: 'web',
+    });
     expect(updateServiceInstanceConfig).toHaveBeenCalledWith({
       serviceId: 'svc-web',
       environmentId: 'env-prod',
@@ -1043,13 +1003,7 @@ describe('RailwayAdapter service instance updates', () => {
           },
         },
       })
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'env-prod' } }],
-          },
-        },
-      });
+      .mockResolvedValueOnce(serviceEnvironmentInstance('svc-web', 'env-prod'));
 
     const adapter = new RailwayAdapter();
     (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
@@ -1152,12 +1106,7 @@ describe('RailwayAdapter service instance updates', () => {
       .mockResolvedValueOnce({
         project: { services: { edges: [{ node: { id: 'svc-recovered', name: 'web-staging' } }] } },
       })
-      .mockResolvedValueOnce({
-        service: {
-          id: 'svc-recovered',
-          serviceInstances: { edges: [{ node: { environmentId: 'env-staging' } }] },
-        },
-      });
+      .mockResolvedValueOnce(serviceEnvironmentInstance('svc-recovered', 'env-staging'));
     const adapter = new RailwayAdapter();
     (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
     const environment: Environment = {

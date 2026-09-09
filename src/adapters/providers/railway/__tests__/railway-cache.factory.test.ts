@@ -208,7 +208,15 @@ describe('Railway cache adapter', () => {
 
     expect(result.success).toBe(true);
     expect(resolveServiceVolume).toHaveBeenCalledWith(volumeTarget, undefined);
-    expect(deleteService).toHaveBeenCalledWith('redis-service-1');
+    expect(deleteService).toHaveBeenCalledWith(
+      'redis-service-1',
+      {
+        scope: 'environment',
+        projectId: 'rail-project-1',
+        environmentId: 'rail-environment-1',
+      },
+      { allowMutation: true }
+    );
     expect(deleteVolume).toHaveBeenCalledWith('redis-volume-recovered', volumeTarget);
   });
 

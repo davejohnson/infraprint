@@ -15,6 +15,44 @@ import { parseHostingServiceCreateRecovery } from '../ports/hosting.port.js';
 
 type PreviousHostingBinding = NonNullable<NonNullable<LocalSnapshot['bindings']>['previousHosting']>;
 
+function serviceDeleteMetadata(input: {
+  serviceId: string;
+  provider?: string;
+  projectId?: string;
+  environmentId?: string;
+  serviceName?: string;
+  scope?: 'environment' | 'project';
+  operation?: 'hostingServiceDestroy' | 'taskServiceCleanup' | 'previousHostingDestroy';
+}): Record<string, unknown> {
+  const deleteScope = input.scope;
+  const providerScope = input.projectId && deleteScope
+    ? {
+        projectId: input.projectId,
+        ...(deleteScope === 'environment' && input.environmentId
+          ? { environmentId: input.environmentId }
+          : {}),
+      }
+    : undefined;
+  const bindingIdentity = input.provider && providerScope && input.serviceName
+    ? {
+        provider: input.provider,
+        projectId: input.projectId,
+        ...(deleteScope === 'environment' && input.environmentId
+          ? { environmentId: input.environmentId }
+          : {}),
+        serviceName: input.serviceName,
+        serviceId: input.serviceId,
+      }
+    : undefined;
+  return {
+    ...(input.operation ? { operation: input.operation } : {}),
+    externalId: input.serviceId,
+    ...(deleteScope ? { deleteScope } : {}),
+    ...(providerScope ? { providerScope } : {}),
+    ...(bindingIdentity ? { bindingsFingerprint: bindingIdentityFingerprint(bindingIdentity) } : {}),
+  };
+}
+
 function runtimeDescription(runtime: ProjectRuntimeSpec | undefined): string {
   if (!runtime) return 'undeclared';
   return [
@@ -64,6 +102,11 @@ export function diffRetainedHostingCleanup(input: {
           previousProvider: previousHosting.provider,
           cleanupBoundary,
           ...(serviceId ? { serviceId } : {}),
+          ...(serviceId ? serviceDeleteMetadata({
+            serviceId,
+            projectId: previousHosting.projectId,
+            scope: 'project',
+          }) : {}),
         },
       });
     }
@@ -142,6 +185,8 @@ export function diffEnvironment(input: {
   };
   /** Provider-declared ownership boundary for the retained, abandoned host. */
   previousHostingTeardownBoundary?: 'services' | 'environment' | 'project';
+  /** Provider-declared context required to delete one bound service. */
+  hostingServiceDeleteScope?: 'environment' | 'project';
   /** Provider-declared environment custom-domain lifecycle. Omission fails closed. */
   customDomainManagement?: 'managed' | 'unsupported';
   customDomainTrafficProxy?: 'supported' | 'dns-only';
@@ -681,7 +726,15 @@ export function diffEnvironment(input: {
         live.name,
         true,
         'Leftover Hypervibe one-off task service',
-        { operation: 'taskServiceCleanup', externalId: live.externalId },
+        serviceDeleteMetadata({
+          operation: 'taskServiceCleanup',
+          serviceId: live.externalId,
+          provider,
+          projectId: local.bindings?.projectId,
+          environmentId: local.bindings?.environmentId,
+          serviceName: live.name,
+          scope: input.hostingServiceDeleteScope,
+        }),
         false
       ));
       plannedServiceDestroys.add(live.name);
@@ -703,7 +756,15 @@ export function diffEnvironment(input: {
         boundName,
         true,
         `Service "${boundName}" was removed from the spec and is managed by Hypervibe`,
-        { externalId: binding!.serviceId }
+        serviceDeleteMetadata({
+          operation: 'hostingServiceDestroy',
+          serviceId: binding!.serviceId!,
+          provider,
+          projectId: local.bindings?.projectId,
+          environmentId: local.bindings?.environmentId,
+          serviceName: boundName,
+          scope: input.hostingServiceDeleteScope,
+        })
       ));
       plannedServiceDestroys.add(boundName);
     } else {
@@ -713,14 +774,31 @@ export function diffEnvironment(input: {
 
   for (const [name, binding] of Object.entries(localServiceBindings)) {
     if (spec.services[name] || plannedServiceDestroys.has(name) || !binding?.serviceId) continue;
+    const liveIdentityMatches = serviceObservationKnown
+      ? (observed?.services ?? []).filter((service) => service.externalId === binding.serviceId)
+      : [];
+    if (liveIdentityMatches.length > 0) {
+      warnings.push(
+        `Removed service binding "${name}" points to provider id ${binding.serviceId}, which is still observed as ${liveIdentityMatches.map((service) => `"${service.name}"`).join(', ')}. Automatic deletion is blocked until the identity conflict is resolved.`
+      );
+      continue;
+    }
     const absenceVerified = Boolean(observed && serviceObservationKnown);
     actions.push(serviceDestroyAction(
       name,
       absenceVerified,
       absenceVerified
-        ? `Service "${name}" was removed from the spec and its bound provider id is already absent`
+        ? `Service "${name}" was removed from the spec and its bound service is absent from the target provider scope`
         : `Service "${name}" was removed from the spec and has a local ${provider} binding`,
-      { externalId: binding.serviceId }
+      serviceDeleteMetadata({
+        operation: 'hostingServiceDestroy',
+        serviceId: binding.serviceId,
+        provider,
+        projectId: local.bindings?.projectId,
+        environmentId: local.bindings?.environmentId,
+        serviceName: name,
+        scope: input.hostingServiceDeleteScope,
+      })
     ));
     plannedServiceDestroys.add(name);
   }

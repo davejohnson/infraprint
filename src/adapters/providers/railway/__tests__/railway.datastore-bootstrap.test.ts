@@ -13,6 +13,16 @@ function makeEnv(bindings: Record<string, unknown>): Environment {
   };
 }
 
+function serviceEnvironmentInstance(serviceId: string, environmentId: string) {
+  return {
+    serviceInstance: {
+      id: `instance-${serviceId}-${environmentId}`,
+      serviceId,
+      environmentId,
+    },
+  };
+}
+
 function volumeInventory(
   environmentId: string,
   volumes: Array<{
@@ -70,13 +80,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
       .mockResolvedValueOnce({
         serviceCreate: { id: 'rail-svc-redis-1', name: 'redis-db-staging' },
       })
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'rail-env-1' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('rail-svc-redis-1', 'rail-env-1'))
       .mockResolvedValueOnce({ variableCollectionUpsert: true })
       .mockResolvedValueOnce(volumeInventory('rail-env-1'))
       .mockResolvedValueOnce({ volumeCreate: { id: 'redis-volume-1' } })
@@ -148,13 +152,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
         serviceCreate: { id: 'rail-svc-db-1', name: 'postgres-db-staging' },
       })
       // ensureServiceInstanceForEnvironment
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'rail-env-1' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('rail-svc-db-1', 'rail-env-1'))
       // variableCollectionUpsert
       .mockResolvedValueOnce({
         variableCollectionUpsert: true,
@@ -225,13 +223,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
       .mockResolvedValueOnce({
         serviceCreate: { id: 'rail-svc-db-1', name: 'postgres-db-staging' },
       })
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'rail-env-1' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('rail-svc-db-1', 'rail-env-1'))
       .mockResolvedValueOnce({
         variableCollectionUpsert: true,
       })
@@ -273,9 +265,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
       })
       .mockResolvedValueOnce({ project: { services: { edges: [] } } })
       .mockResolvedValueOnce({ serviceCreate: { id: 'rail-svc-db-1', name: 'postgres-db-staging' } })
-      .mockResolvedValueOnce({
-        service: { serviceInstances: { edges: [{ node: { environmentId: 'rail-env-1' } }] } },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('rail-svc-db-1', 'rail-env-1'))
       .mockResolvedValueOnce({ variableCollectionUpsert: true })
       .mockResolvedValueOnce(volumeInventory('rail-env-1'))
       .mockRejectedValueOnce(new Error('connection closed after volume request'))
@@ -317,9 +307,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
       })
       .mockResolvedValueOnce({ project: { services: { edges: [] } } })
       .mockResolvedValueOnce({ serviceCreate: { id: 'rail-svc-db-1', name: 'postgres-db-staging' } })
-      .mockResolvedValueOnce({
-        service: { serviceInstances: { edges: [{ node: { environmentId: 'rail-env-1' } }] } },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('rail-svc-db-1', 'rail-env-1'))
       .mockResolvedValueOnce({ variableCollectionUpsert: true })
       .mockResolvedValueOnce(volumeInventory('rail-env-1'))
       .mockResolvedValueOnce({ volumeCreate: { id: 'acknowledged-volume' } })
@@ -354,9 +342,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
       })
       .mockResolvedValueOnce({ project: { services: { edges: [] } } })
       .mockResolvedValueOnce({ serviceCreate: { id: 'rail-svc-db-1', name: 'postgres-db-staging' } })
-      .mockResolvedValueOnce({
-        service: { serviceInstances: { edges: [{ node: { environmentId: 'rail-env-1' } }] } },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('rail-svc-db-1', 'rail-env-1'))
       .mockResolvedValueOnce({ variableCollectionUpsert: true })
       .mockResolvedValueOnce(volumeInventory('rail-env-1', [{
         instanceId: 'unrelated-instance',
@@ -397,9 +383,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
       })
       .mockResolvedValueOnce({ project: { services: { edges: [] } } })
       .mockResolvedValueOnce({ serviceCreate: { id: 'rail-svc-db-1', name: 'postgres-db-staging' } })
-      .mockResolvedValueOnce({
-        service: { serviceInstances: { edges: [{ node: { environmentId: 'rail-env-1' } }] } },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('rail-svc-db-1', 'rail-env-1'))
       .mockResolvedValueOnce({ variableCollectionUpsert: true })
       .mockResolvedValueOnce(volumeInventory('rail-env-1', [{
         instanceId: 'volume-instance-a',
@@ -440,13 +424,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
           },
         },
       })
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'rail-env-1' } }],
-          },
-        },
-      });
+      .mockResolvedValueOnce(serviceEnvironmentInstance('rail-svc-db-recovered', 'rail-env-1'));
 
     const adapter = new RailwayAdapter();
     (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
@@ -524,13 +502,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
           },
         },
       })
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'rail-env-production' } }],
-          },
-        },
-      });
+      .mockResolvedValueOnce({ serviceInstance: null });
     const adapter = new RailwayAdapter();
     (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
 
@@ -597,13 +569,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
           },
         },
       })
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'rail-env-1' } }],
-          },
-        },
-      });
+      .mockResolvedValueOnce(serviceEnvironmentInstance('rail-svc-db-recovered', 'rail-env-1'));
 
     const adapter = new RailwayAdapter();
     (adapter as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client = { request };
@@ -676,13 +642,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
         },
       })
       // ensureServiceInstanceForEnvironment
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'rail-env-1' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('rail-svc-db-existing', 'rail-env-1'))
       // fetchServiceVariables — bootstrap vars are present
       .mockResolvedValueOnce({
         variables: { POSTGRES_PASSWORD: 'already-set', DATABASE_URL: 'postgres://...' },
@@ -720,13 +680,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
         },
       })
       // ensureServiceInstanceForEnvironment
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'rail-env-1' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('rail-svc-db-existing', 'rail-env-1'))
       // fetchServiceVariables — POSTGRES_PASSWORD missing (crashlooping container)
       .mockResolvedValueOnce({
         variables: {},
@@ -772,13 +726,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
         },
       })
       // resolveServiceIdForEnvironment sees the matching service only in production.
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'rail-env-prod' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce({ serviceInstance: null })
       .mockResolvedValueOnce({
         serviceCreate: {
           id: 'rail-svc-db-staging',
@@ -786,13 +734,7 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
         },
       })
       // ensureServiceInstanceForEnvironment verifies the newly created service.
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'rail-env-staging' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('rail-svc-db-staging', 'rail-env-staging'))
       .mockResolvedValueOnce({
         variableCollectionUpsert: true,
       })
@@ -851,20 +793,8 @@ describe('RailwayAdapter datastore bootstrap vars', () => {
           },
         },
       })
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'rail-env-prod' } }],
-          },
-        },
-      })
-      .mockResolvedValueOnce({
-        service: {
-          serviceInstances: {
-            edges: [{ node: { environmentId: 'rail-env-staging' } }],
-          },
-        },
-      })
+      .mockResolvedValueOnce({ serviceInstance: null })
+      .mockResolvedValueOnce(serviceEnvironmentInstance('rail-svc-db-staging', 'rail-env-staging'))
       .mockResolvedValueOnce({
         variables: { POSTGRES_PASSWORD: 'already-set', DATABASE_URL: 'postgres://...' },
       });

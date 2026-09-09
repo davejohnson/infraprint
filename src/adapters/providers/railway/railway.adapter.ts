@@ -10,6 +10,8 @@ import type {
   ProviderCapabilities,
   DeploymentMutationOptions,
   TemporaryDatabaseAccess,
+  HostingServiceDeleteOptions,
+  HostingServiceDeleteScope,
 } from '../../../domain/ports/provider.port.js';
 import type { Environment } from '../../../domain/entities/environment.entity.js';
 import type { Service } from '../../../domain/entities/service.entity.js';
@@ -88,6 +90,11 @@ type DeletionVerification =
   | { deleted: true }
   | { deleted: false; error: string };
 
+type ServiceInstanceInventory =
+  | { state: 'complete'; environmentIds: string[] }
+  | { state: 'absent' }
+  | { state: 'unknown'; error: string };
+
 type RailwayDeploymentStatus = {
   status: string;
   staticUrl?: string;
@@ -113,6 +120,17 @@ export type RailwayVolumeResolution =
   | { success: true; state: 'absent' }
   | { success: true; state: 'present'; volumeId: string; pendingDeletion: boolean }
   | { success: false; error: string; volumeId?: string };
+
+export type RailwayServiceInstanceInspection =
+  | {
+      state: 'present';
+      instanceId: string;
+      serviceId: string;
+      environmentId: string;
+      sourceImage?: string;
+    }
+  | { state: 'absent' }
+  | { state: 'unknown'; error: string };
 
 interface RailwayVolumeInstance {
   instanceId: string;
@@ -2148,44 +2166,11 @@ export class RailwayAdapter implements
     serviceId: string,
     environmentId: string
   ): Promise<boolean> {
-    if (!this.client) {
-      throw new Error('Not connected. Call connect() first.');
+    const existence = await this.serviceEnvironmentInstanceExists(serviceId, environmentId);
+    if (existence.state === 'unknown') {
+      throw new Error(existence.error);
     }
-
-    const query = gql`
-      query GetServiceEnvironmentInstance($serviceId: String!) {
-        service(id: $serviceId) {
-          id
-          serviceInstances {
-            edges {
-              node {
-                environmentId
-              }
-            }
-          }
-        }
-      }
-    `;
-
-    const result = await this.client.request<unknown>(query, { serviceId });
-    if (!isRecord(result) || !('service' in result) || !isRecord(result.service)
-      || (result.service.id !== undefined && result.service.id !== serviceId)
-      || !isRecord(result.service.serviceInstances)
-      || !Array.isArray(result.service.serviceInstances.edges)) {
-      throw new Error(`Railway returned a partial or mismatched service-instance inventory for ${serviceId}.`);
-    }
-    const environmentIds: string[] = [];
-    for (const edge of result.service.serviceInstances.edges) {
-      if (!isRecord(edge) || !isRecord(edge.node)
-        || typeof edge.node.environmentId !== 'string' || edge.node.environmentId.length === 0) {
-        throw new Error(`Railway returned a partial service-instance identity for ${serviceId}.`);
-      }
-      environmentIds.push(edge.node.environmentId);
-    }
-    if (new Set(environmentIds).size !== environmentIds.length) {
-      throw new Error(`Railway returned duplicate environment instances for service ${serviceId}.`);
-    }
-    return environmentIds.includes(environmentId);
+    return existence.state === 'present';
   }
 
   private async ensureServiceInstanceForEnvironment(
@@ -2418,40 +2403,101 @@ export class RailwayAdapter implements
       };
     } catch (error) {
       if (this.isProviderConfirmedNotFound(error, 'environmentDelete')) {
-        return { success: true, alreadyAbsent: true };
+        const verification = await this.environmentExists(projectId, environmentId);
+        if (verification.state === 'absent') return { success: true, alreadyAbsent: true };
+        return {
+          success: false,
+          error: verification.state === 'unknown'
+            ? `environmentDelete.id: not-found acknowledgement could not be verified: ${verification.error}`
+            : `environmentDelete.id: not-found acknowledgement conflicted with a still-present environment (${environmentId})`,
+        };
       }
       return { success: false, error: `environmentDelete.id: ${this.describeError(error)}` };
     }
   }
 
-  async deleteService(serviceId: string): Promise<{ success: boolean; error?: string; alreadyAbsent?: boolean }> {
+  async deleteService(
+    serviceId: string,
+    target: HostingServiceDeleteScope,
+    options: HostingServiceDeleteOptions
+  ): Promise<{ success: boolean; error?: string; alreadyAbsent?: boolean }> {
     if (!this.client) {
       return { success: false, error: 'Not connected. Call connect() first.' };
     }
+    if (typeof serviceId !== 'string' || serviceId.trim().length === 0
+      || !target || !isRecord(target)
+      || target.scope !== 'environment'
+      || typeof target.projectId !== 'string' || target.projectId.trim().length === 0
+      || typeof target.environmentId !== 'string' || target.environmentId.trim().length === 0) {
+      return {
+        success: false,
+        error: `Railway service deletion requires an exact project and environment target for ${serviceId}; project-global deletion is not authorized.`,
+      };
+    }
+    if (!options || !isRecord(options) || typeof options.allowMutation !== 'boolean') {
+      return {
+        success: false,
+        error: `Railway service deletion requires an explicit mutation decision for ${serviceId}.`,
+      };
+    }
 
-    const existing = await this.serviceExists(serviceId);
+    const { projectId, environmentId } = target;
+    const existing = await this.serviceEnvironmentInstanceExists(serviceId, environmentId);
     if (existing.state === 'absent') {
       return { success: true, alreadyAbsent: true };
     }
     if (existing.state === 'unknown') {
       return {
         success: false,
-        error: `service absence is unknown (${serviceId}): ${existing.error}`,
+        error: `service instance absence is unknown (${serviceId} in ${environmentId}): ${existing.error}`,
+      };
+    }
+    if (!options.allowMutation) {
+      return {
+        success: false,
+        error: `Railway service ${serviceId} remains present, and another local binding forbids provider mutation.`,
+      };
+    }
+
+    const inventory = await this.serviceInstanceInventory(serviceId, projectId);
+    if (inventory.state === 'absent') {
+      return {
+        success: false,
+        error: `Railway returned conflicting service and service-instance evidence for ${serviceId}; deletion is blocked.`,
+      };
+    }
+    if (inventory.state === 'unknown') {
+      return {
+        success: false,
+        error: `service instance inventory is unknown (${serviceId}): ${inventory.error}`,
+      };
+    }
+    if (!inventory.environmentIds.includes(environmentId)) {
+      return {
+        success: false,
+        error: `Railway returned conflicting service-instance evidence for ${serviceId} in ${environmentId}; deletion is blocked.`,
+      };
+    }
+    const siblingEnvironmentIds = inventory.environmentIds.filter((id) => id !== environmentId);
+    if (siblingEnvironmentIds.length > 0) {
+      return {
+        success: false,
+        error: `Railway service ${serviceId} also has instance(s) in ${siblingEnvironmentIds.join(', ')}. Railway may delete non-fork sibling instances, so Hypervibe will not issue serviceDelete.`,
       };
     }
 
     try {
       const mutation = gql`
-        mutation DeleteService($id: String!) {
-          serviceDelete(id: $id)
+        mutation DeleteEnvironmentService($id: String!, $environmentId: String!) {
+          serviceDelete(id: $id, environmentId: $environmentId)
         }
       `;
-      const result = await this.client.request<Record<string, unknown>>(mutation, { id: serviceId });
+      const result = await this.client.request<Record<string, unknown>>(mutation, { id: serviceId, environmentId });
       const accepted = this.isDeleteAccepted(result, 'serviceDelete', serviceId);
       if (!accepted) {
         return { success: false, error: 'serviceDelete.id: delete mutation returned unsuccessful payload' };
       }
-      const verification = await this.waitUntilServiceDeleted(serviceId);
+      const verification = await this.waitUntilServiceInstanceDeleted(serviceId, environmentId);
       if (verification.deleted) {
         return { success: true };
       }
@@ -2461,7 +2507,14 @@ export class RailwayAdapter implements
       };
     } catch (error) {
       if (this.isProviderConfirmedNotFound(error, 'serviceDelete')) {
-        return { success: true, alreadyAbsent: true };
+        const verification = await this.serviceEnvironmentInstanceExists(serviceId, environmentId);
+        if (verification.state === 'absent') return { success: true, alreadyAbsent: true };
+        return {
+          success: false,
+          error: verification.state === 'unknown'
+            ? `serviceDelete.id: not-found acknowledgement could not be verified: ${verification.error}`
+            : `serviceDelete.id: not-found acknowledgement conflicted with a still-present service instance (${serviceId} in ${environmentId})`,
+        };
       }
       return { success: false, error: `serviceDelete.id: ${this.describeError(error)}` };
     }
@@ -2506,16 +2559,19 @@ export class RailwayAdapter implements
     };
   }
 
-  private async waitUntilServiceDeleted(serviceId: string): Promise<DeletionVerification> {
+  private async waitUntilServiceInstanceDeleted(
+    serviceId: string,
+    environmentId: string
+  ): Promise<DeletionVerification> {
     const attempts = Number(process.env.HYPERVIBE_RAILWAY_DELETE_ATTEMPTS ?? 40);
     const delayMs = Number(process.env.HYPERVIBE_RAILWAY_DELETE_DELAY_MS ?? 500);
     for (let attempt = 0; attempt < attempts; attempt++) {
-      const existence = await this.serviceExists(serviceId);
+      const existence = await this.serviceEnvironmentInstanceExists(serviceId, environmentId);
       if (existence.state === 'absent') return { deleted: true };
       if (existence.state === 'unknown') {
         return {
           deleted: false,
-          error: `service absence is unknown (${serviceId}): ${existence.error}`,
+          error: `service instance absence is unknown (${serviceId} in ${environmentId}): ${existence.error}`,
         };
       }
       if (attempt < attempts - 1) {
@@ -2524,7 +2580,7 @@ export class RailwayAdapter implements
     }
     return {
       deleted: false,
-      error: `service still exists after ${attempts} observation attempts (${serviceId})`,
+      error: `service instance still exists after ${attempts} observation attempts (${serviceId} in ${environmentId})`,
     };
   }
 
@@ -2555,74 +2611,187 @@ export class RailwayAdapter implements
     }
   }
 
-  private async serviceExists(serviceId: string): Promise<ResourceExistence> {
+  async inspectServiceInstance(
+    serviceId: string,
+    environmentId: string
+  ): Promise<RailwayServiceInstanceInspection> {
     if (!this.client) {
       return { state: 'unknown', error: 'Not connected. Call connect() first.' };
     }
+    if (typeof serviceId !== 'string' || !serviceId.trim()
+      || typeof environmentId !== 'string' || !environmentId.trim()) {
+      return { state: 'unknown', error: 'Railway service-instance inspection requires exact service and environment ids.' };
+    }
     try {
       const query = gql`
-        query GetService($id: String!) {
-          service(id: $id) {
+        query GetServiceEnvironmentInstance($serviceId: String!, $environmentId: String!) {
+          serviceInstance(serviceId: $serviceId, environmentId: $environmentId) {
             id
+            serviceId
+            environmentId
+            source {
+              image
+            }
           }
         }
       `;
-      const result = await this.client.request<unknown>(query, { id: serviceId });
-      if (!isRecord(result) || !('service' in result)) {
-        return { state: 'unknown', error: `Railway returned an invalid service existence response for ${serviceId}.` };
+      const result = await this.client.request<unknown>(query, { serviceId, environmentId });
+      if (!isRecord(result) || !('serviceInstance' in result)) {
+        return {
+          state: 'unknown',
+          error: `Railway returned an invalid service-instance existence response for ${serviceId}.`,
+        };
       }
-      if (result.service === null) return { state: 'absent' };
-      if (!isRecord(result.service) || result.service.id !== serviceId) {
-        return { state: 'unknown', error: `Railway returned a partial or mismatched service identity for ${serviceId}.` };
+      if (result.serviceInstance === null) return { state: 'absent' };
+      if (!isRecord(result.serviceInstance)
+        || typeof result.serviceInstance.id !== 'string'
+        || result.serviceInstance.id.length === 0
+        || result.serviceInstance.serviceId !== serviceId
+        || result.serviceInstance.environmentId !== environmentId) {
+        return {
+          state: 'unknown',
+          error: `Railway returned a partial service-instance identity for ${serviceId} in ${environmentId}.`,
+        };
       }
-      return { state: 'present' };
+      const source = result.serviceInstance.source;
+      if (source !== undefined && source !== null && !isRecord(source)) {
+        return {
+          state: 'unknown',
+          error: `Railway returned a malformed service-instance source for ${serviceId} in ${environmentId}.`,
+        };
+      }
+      const image = isRecord(source) ? source.image : undefined;
+      if (image !== undefined && image !== null && typeof image !== 'string') {
+        return {
+          state: 'unknown',
+          error: `Railway returned a malformed service-instance image for ${serviceId} in ${environmentId}.`,
+        };
+      }
+      return {
+        state: 'present',
+        instanceId: result.serviceInstance.id,
+        serviceId,
+        environmentId,
+        ...(typeof image === 'string' && image.trim() ? { sourceImage: image } : {}),
+      };
     } catch (error) {
-      if (this.isProviderConfirmedNotFound(error, 'service')) return { state: 'absent' };
+      if (this.isProviderConfirmedNotFound(error, 'serviceInstance')) return { state: 'absent' };
       return { state: 'unknown', error: this.describeError(error) };
     }
+  }
+
+  private async serviceEnvironmentInstanceExists(
+    serviceId: string,
+    environmentId: string
+  ): Promise<ResourceExistence> {
+    const inspected = await this.inspectServiceInstance(serviceId, environmentId);
+    return inspected.state === 'unknown'
+      ? inspected
+      : { state: inspected.state };
+  }
+
+  private async serviceInstanceInventory(
+    serviceId: string,
+    projectId: string
+  ): Promise<ServiceInstanceInventory> {
+    if (!this.client) {
+      return { state: 'unknown', error: 'Not connected. Call connect() first.' };
+    }
+    const environmentIds: string[] = [];
+    const instanceIds = new Set<string>();
+    const cursors = new Set<string>();
+    let after: string | null = null;
+    for (let page = 0; page < 100; page += 1) {
+      try {
+        const query = gql`
+          query GetServiceInstanceInventory($serviceId: String!, $after: String) {
+            service(id: $serviceId) {
+              id
+              projectId
+              serviceInstances(first: 100, after: $after) {
+                edges {
+                  node {
+                    id
+                    environmentId
+                  }
+                }
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+              }
+            }
+          }
+        `;
+        const result: unknown = await this.client.request<unknown>(query, { serviceId, after });
+        if (!isRecord(result) || !('service' in result)) {
+          return { state: 'unknown', error: 'Railway returned an invalid service inventory response.' };
+        }
+        if (result.service === null) return { state: 'absent' };
+        if (!isRecord(result.service)
+          || result.service.id !== serviceId
+          || result.service.projectId !== projectId
+          || !isRecord(result.service.serviceInstances)
+          || !Array.isArray(result.service.serviceInstances.edges)
+          || !isRecord(result.service.serviceInstances.pageInfo)
+          || typeof result.service.serviceInstances.pageInfo.hasNextPage !== 'boolean') {
+          return { state: 'unknown', error: 'Railway returned a partial or mismatched service-instance inventory.' };
+        }
+        for (const edge of result.service.serviceInstances.edges) {
+          if (!isRecord(edge) || !isRecord(edge.node)
+            || typeof edge.node.id !== 'string' || edge.node.id.length === 0
+            || typeof edge.node.environmentId !== 'string' || edge.node.environmentId.length === 0
+            || instanceIds.has(edge.node.id)
+            || environmentIds.includes(edge.node.environmentId)) {
+            return { state: 'unknown', error: 'Railway returned a partial or duplicate service-instance identity.' };
+          }
+          instanceIds.add(edge.node.id);
+          environmentIds.push(edge.node.environmentId);
+        }
+        if (!result.service.serviceInstances.pageInfo.hasNextPage) {
+          return { state: 'complete', environmentIds };
+        }
+        const endCursor: unknown = result.service.serviceInstances.pageInfo.endCursor;
+        if (typeof endCursor !== 'string' || endCursor.length === 0 || cursors.has(endCursor)) {
+          return { state: 'unknown', error: 'Railway returned an invalid or repeated service-instance pagination cursor.' };
+        }
+        cursors.add(endCursor);
+        after = endCursor;
+      } catch (error) {
+        if (this.isProviderConfirmedNotFound(error, 'service')) return { state: 'absent' };
+        return { state: 'unknown', error: this.describeError(error) };
+      }
+    }
+    return { state: 'unknown', error: 'Railway service-instance inventory exceeded the pagination safety limit.' };
   }
 
   private async environmentExists(projectId: string, environmentId: string): Promise<ResourceExistence> {
     if (!this.client) {
       return { state: 'unknown', error: 'Not connected. Call connect() first.' };
     }
+    if (typeof projectId !== 'string' || !projectId.trim()
+      || typeof environmentId !== 'string' || !environmentId.trim()) {
+      return { state: 'unknown', error: 'Railway environment inspection requires exact project and environment ids.' };
+    }
     try {
       const query = gql`
-        query GetProjectEnvironment($projectId: String!) {
-          project(id: $projectId) {
+        query GetEnvironment($environmentId: String!, $projectId: String!) {
+          environment(id: $environmentId, projectId: $projectId) {
             id
-            environments {
-              edges {
-                node { id }
-              }
-            }
           }
         }
       `;
-      const result = await this.client.request<unknown>(query, { projectId });
-      if (!isRecord(result) || !('project' in result)) {
-        return { state: 'unknown', error: `Railway returned an invalid environment existence response for project ${projectId}.` };
+      const result = await this.client.request<unknown>(query, { environmentId, projectId });
+      if (!isRecord(result) || !('environment' in result)) {
+        return { state: 'unknown', error: `Railway returned an invalid environment existence response for ${environmentId} in project ${projectId}.` };
       }
-      if (result.project === null) return { state: 'absent' };
-      if (!isRecord(result.project) || result.project.id !== projectId
-        || !isRecord(result.project.environments) || !Array.isArray(result.project.environments.edges)) {
-        return { state: 'unknown', error: `Railway returned a partial or mismatched environment inventory for project ${projectId}.` };
+      if (result.environment === null) return { state: 'absent' };
+      if (!isRecord(result.environment) || result.environment.id !== environmentId) {
+        return { state: 'unknown', error: `Railway returned a partial or mismatched environment identity for ${environmentId} in project ${projectId}.` };
       }
-      const ids: string[] = [];
-      for (const edge of result.project.environments.edges) {
-        if (!isRecord(edge) || !isRecord(edge.node)
-          || typeof edge.node.id !== 'string' || edge.node.id.length === 0) {
-          return { state: 'unknown', error: `Railway returned a partial environment identity for project ${projectId}.` };
-        }
-        ids.push(edge.node.id);
-      }
-      if (new Set(ids).size !== ids.length) {
-        return { state: 'unknown', error: `Railway returned duplicate environment identities for project ${projectId}.` };
-      }
-      const exists = ids.includes(environmentId);
-      return { state: exists ? 'present' : 'absent' };
+      return { state: 'present' };
     } catch (error) {
-      if (this.isProviderConfirmedNotFound(error, 'project')) return { state: 'absent' };
+      if (this.isProviderConfirmedNotFound(error, 'environment')) return { state: 'absent' };
       return { state: 'unknown', error: this.describeError(error) };
     }
   }
@@ -3032,6 +3201,7 @@ export class RailwayAdapter implements
             railwayServiceId,
             environmentId: railwayEnvId,
             createdService,
+            providerResourceName: providerServiceName,
             ...(runtimeRolloutRequired
               ? {
                   runtimeRolloutRequired: true,
@@ -3562,7 +3732,7 @@ export class RailwayAdapter implements
       );
     }
 
-    const sweepWarning = await this.sweepTaskServices(projectId);
+    const sweepWarning = await this.sweepTaskServices(projectId, environmentId);
     if (sweepWarning) {
       cleanupWarnings.push(sweepWarning);
     }
@@ -3830,7 +4000,11 @@ export class RailwayAdapter implements
     }
 
     try {
-      const deleted = await this.deleteService(taskServiceId);
+      const deleted = await this.deleteService(taskServiceId, {
+        scope: 'environment',
+        projectId,
+        environmentId,
+      }, { allowMutation: true });
       if (!deleted.success) {
         cleanupWarnings.push(`Temporary task service ${taskName} (${taskServiceId}) could not be deleted: ${deleted.error ?? 'unknown error'}. Delete it in Railway to avoid billing.`);
       }
@@ -3841,7 +4015,7 @@ export class RailwayAdapter implements
     return { ...outcome, ...(cleanupWarnings.length > 0 ? { cleanupWarning: cleanupWarnings.join(' ') } : {}) };
   }
 
-  private async sweepTaskServices(projectId: string): Promise<string | undefined> {
+  private async sweepTaskServices(projectId: string, environmentId: string): Promise<string | undefined> {
     try {
       const services = await this.listProjectServices(projectId, { throwOnFailure: true });
       const taskServices = services.filter((service) => service.name.startsWith('hv-task-'));
@@ -3849,7 +4023,11 @@ export class RailwayAdapter implements
 
       for (const service of taskServices) {
         try {
-          const deleted = await this.deleteService(service.id);
+          const deleted = await this.deleteService(service.id, {
+            scope: 'environment',
+            projectId,
+            environmentId,
+          }, { allowMutation: true });
           if (!deleted.success) {
             failures.push(`${service.name} (${service.id}): ${deleted.error ?? 'unknown error'}`);
           }
@@ -6178,7 +6356,7 @@ export class RailwayAdapter implements
             provider: 'railway',
             engine,
             externalId: node.id,
-            providerScope: { projectId },
+            providerScope: { projectId, environmentId },
             name: node.name,
             status: this.toObservedDatastoreStatus(instance.latestDeployment?.status),
           });
@@ -6837,7 +7015,7 @@ providerRegistry.register({
     selectors: {
       project: { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, collectionKey: 'projects' },
       environment: { mode: 'environment-forensics', required: ['project', 'env'], optional: ['scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true },
-      database: { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, scopeKeys: ['projectId'] },
+      database: { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, scopeKeys: ['projectId', 'environmentId'] },
       cache: { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, scopeKeys: ['projectId', 'environmentId'] },
       storage: { mode: 'provider-resource', optional: ['project', 'scope', 'id', 'name', 'limit'], mutuallyExclusive: [['id', 'name']], list: true, scopeKeys: ['projectId'] },
     },

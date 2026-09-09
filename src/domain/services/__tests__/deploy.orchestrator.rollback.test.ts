@@ -8,6 +8,8 @@ import { EnvironmentRepository } from '../../../adapters/db/repositories/environ
 import { ServiceRepository } from '../../../adapters/db/repositories/service.repository.js';
 import { DeployOrchestrator } from '../deploy.orchestrator.js';
 import type { IHostingAdapter } from '../../ports/hosting.port.js';
+import '../../../adapters/providers/railway/railway.adapter.js';
+import '../../../adapters/providers/gcp/cloudrun.adapter.js';
 
 describe('DeployOrchestrator local rollback', () => {
   let tempDir: string;
@@ -23,19 +25,87 @@ describe('DeployOrchestrator local rollback', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('restores prior environment bindings after a failed deploy rollback', async () => {
+  it.each([
+    {
+      provider: 'railway',
+      projectId: 'rail-new-project',
+      environmentId: 'rail-new-env',
+      expectedScope: {
+        scope: 'environment' as const,
+        projectId: 'rail-new-project',
+        environmentId: 'rail-new-env',
+      },
+      expectedError: undefined,
+      expectedRecoveryScope: undefined,
+    },
+    {
+      provider: 'cloudrun',
+      projectId: 'gcp-new-project',
+      environmentId: 'us-central1',
+      expectedScope: { scope: 'project' as const, projectId: 'gcp-new-project' },
+      expectedError: undefined,
+      expectedRecoveryScope: undefined,
+    },
+    {
+      provider: 'railway',
+      projectId: 'rail-new-project',
+      environmentId: 'rail-new-env',
+      providerResourceName: 'web-staging',
+      expectedScope: {
+        scope: 'environment' as const,
+        projectId: 'rail-new-project',
+        environmentId: 'rail-new-env',
+      },
+      deleteError: 'provider refused cleanup',
+      expectedError: 'provider refused cleanup',
+      expectedRecoveryScope: {
+        projectId: 'rail-new-project',
+        environmentId: 'rail-new-env',
+      },
+      expectedRecoveryResourceName: 'web-staging',
+    },
+    {
+      provider: 'railway',
+      projectId: 'rail-new-project',
+      environmentId: undefined,
+      expectedScope: undefined,
+      expectedError: 'no durable environment scope',
+      expectedRecoveryScope: { projectId: 'rail-new-project' },
+    },
+    {
+      provider: 'unregistered-hosting',
+      projectId: 'provider-project',
+      environmentId: 'provider-environment',
+      expectedScope: undefined,
+      expectedError: 'no declared hosting teardown boundary',
+      expectedRecoveryScope: {
+        projectId: 'provider-project',
+        environmentId: 'provider-environment',
+      },
+    },
+  ])('restores prior bindings and safely scopes $provider rollback', async ({
+    provider,
+    projectId,
+    environmentId,
+    providerResourceName,
+    expectedScope,
+    deleteError,
+    expectedError,
+    expectedRecoveryScope,
+    expectedRecoveryResourceName,
+  }) => {
     const projectRepo = new ProjectRepository();
     const envRepo = new EnvironmentRepository();
     const serviceRepo = new ServiceRepository();
 
-    const project = projectRepo.create({ name: 'rollback-project', defaultPlatform: 'railway' });
+    const project = projectRepo.create({ name: 'rollback-project', defaultPlatform: provider });
     const originalBindings = {
-      provider: 'railway',
-      projectId: 'rail-old-project',
-      environmentId: 'rail-old-env',
+      provider,
+      projectId: 'old-project',
+      environmentId: 'old-environment',
       services: {
         web: {
-          serviceId: 'rail-old-service',
+          serviceId: 'old-service',
           url: 'https://old.example.com',
         },
       },
@@ -50,9 +120,12 @@ describe('DeployOrchestrator local rollback', () => {
       name: 'web',
       buildConfig: { builder: 'nixpacks' },
     });
+    const deleteService = vi.fn(async () => deleteError
+      ? { success: false, error: deleteError }
+      : { success: true });
 
     const adapter: IHostingAdapter = {
-      name: 'railway',
+      name: provider,
       capabilities: {
         supportedBuilders: ['nixpacks'],
         supportsAutoWiring: true,
@@ -74,15 +147,15 @@ describe('DeployOrchestrator local rollback', () => {
           message: 'created',
           data: {
             created: true,
-            projectId: 'rail-new-project',
-            environmentId: 'rail-new-env',
+            projectId,
+            environmentId,
           },
         };
       },
       async deploy() {
         return {
           serviceId: 'deploy-run-1',
-          externalId: 'rail-new-service',
+          externalId: 'new-service',
           url: 'https://new.example.com',
           status: 'deploying',
           receipt: {
@@ -90,7 +163,8 @@ describe('DeployOrchestrator local rollback', () => {
             message: 'deploy started',
             data: {
               createdService: true,
-              environmentId: 'rail-new-env',
+              environmentId,
+              ...(providerResourceName ? { providerResourceName } : {}),
             },
           },
         };
@@ -104,9 +178,7 @@ describe('DeployOrchestrator local rollback', () => {
       async deleteProject() {
         return { success: true };
       },
-      async deleteService() {
-        return { success: true };
-      },
+      deleteService,
     };
 
     const orchestrator = new DeployOrchestrator();
@@ -119,7 +191,36 @@ describe('DeployOrchestrator local rollback', () => {
 
     expect(result.success).toBe(false);
     const restored = envRepo.findById(environment.id);
-    expect(restored?.platformBindings).toEqual(originalBindings);
+    expect(restored?.platformBindings).toEqual(expectedRecoveryScope
+      ? {
+          ...originalBindings,
+          serviceCreateRecovery: {
+            web: {
+              provider,
+              operation: 'create',
+              resourceName: expectedRecoveryResourceName ?? 'web',
+              providerScope: expectedRecoveryScope,
+              state: 'identified',
+              serviceId: 'new-service',
+              returnedName: expectedRecoveryResourceName ?? 'web',
+            },
+          },
+        }
+      : originalBindings);
+    if (expectedScope) {
+      expect(deleteService).toHaveBeenCalledWith(
+        'new-service',
+        expectedScope,
+        { allowMutation: true }
+      );
+    } else {
+      expect(deleteService).not.toHaveBeenCalled();
+    }
+    if (expectedError) {
+      expect(result.rollback?.failed).toEqual(expect.arrayContaining([
+        expect.objectContaining({ error: expect.stringContaining(expectedError!) }),
+      ]));
+    }
   });
 
   it('stores provider-neutral bindings for non-Railway deploys', async () => {
